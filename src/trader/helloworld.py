@@ -183,7 +183,7 @@ class Client:
         self._call("POST", f"/cancel-task/{task_id}")
 
     def submit(self, *, dataset_id: str, model_name: str,
-               steps: int = 4000, batch_size: int = 64,
+               steps: int = 20000, batch_size: int = 64,
                learning_rate: float = 0.01,
                hidden_dim: int = 64, depth: int = 2,
                node_id: str | None = None,
