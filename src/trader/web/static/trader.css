@@ -275,3 +275,154 @@ main {
   .top { flex-direction: column; align-items: stretch; }
   main { padding: 1.5rem 1rem 3rem; }
 }
+
+/* --- the analysis page ----------------------------------------------------
+   Colour means a call: green buys, red does not, grey is the honest most of
+   the time. Nothing else on this page is tinted, because a page that argues
+   for a decision has to keep its emphasis for the decision. */
+
+.nav { display: flex; gap: 1rem; }
+
+.nav a {
+  color: var(--text-muted);
+  text-decoration: none;
+  font-size: 0.875rem;
+  padding: 0.3rem 0;
+  border-bottom: 2px solid transparent;
+}
+
+.nav a:hover { color: var(--text); }
+.nav a.is-here { color: var(--text); border-bottom-color: var(--accent); }
+
+.a-panel {
+  margin-top: 1.25rem;
+  padding: 1.25rem;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface);
+}
+
+.a-panel h2 {
+  margin: 0 0 1rem;
+  font-size: 0.8125rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.analysis-meta { margin: 1.5rem 0 0; font-size: 0.8125rem; color: var(--text-faint); }
+
+/* --- the gate ---
+   Its border carries the state, because it decides everything below it. */
+
+.a-panel.trust { border-left: 3px solid var(--text-faint); }
+.trust.is-ok { border-left-color: var(--up); }
+.trust.is-bad { border-left-color: var(--warn); }
+
+.trust-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.5rem;
+}
+
+.trust-head h2 {
+  margin: 0;
+  font-size: 1rem;
+  text-transform: none;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+.trust-reason { margin: 0 0 1rem; font-size: 0.9375rem; color: var(--text-muted); }
+
+/* --- what it attends to --- */
+
+.influence { display: flex; flex-direction: column; gap: 0.5rem; }
+
+.influence-row {
+  display: grid;
+  grid-template-columns: 11rem 1fr 5rem;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.influence-name { font-size: 0.8125rem; color: var(--text-muted); }
+
+.influence-value {
+  font-size: 0.75rem;
+  text-align: right;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.influence .bar { width: 100%; height: 8px; }
+.bar-fill.is-down { background: var(--down); }
+
+/* --- the calls --- */
+
+.calls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 0.75rem;
+}
+
+.call {
+  padding: 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+}
+
+.call-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.call-symbol { font-family: var(--mono); font-weight: 600; }
+.call-asof { font-size: 0.75rem; color: var(--text-faint); }
+
+.call-verdict {
+  padding: 0.15rem 0.5rem;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-sm);
+  font-size: 0.6875rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--text-faint);
+}
+
+.call-verdict.is-buy { color: var(--up); border-color: rgba(52, 211, 153, 0.35); }
+.call-verdict.is-nobuy { color: var(--down); border-color: rgba(248, 113, 113, 0.35); }
+
+.call-numbers {
+  display: flex;
+  gap: 1rem;
+  margin-top: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.call-because {
+  margin: 0.65rem 0 0;
+  font-size: 0.8125rem;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.call-reasons {
+  margin: 0.6rem 0 0;
+  padding-left: 1.1rem;
+  font-size: 0.75rem;
+  line-height: 1.55;
+  color: var(--text-faint);
+}
+
+.call-reasons li { margin-bottom: 0.2rem; }

@@ -64,6 +64,36 @@ by side in the UI, because either one alone misleads.
 
 ---
 
+## The analysis page
+
+`/analysis` is the trading view: one call per symbol, with the argument for it.
+Three states, as you would expect — **Buy now**, **No buy**, **Still collecting
+data** — and one rule that decides between them.
+
+**Every call is gated on the model having earned an opinion.** Its accuracy has
+to beat the baseline out of time by more than two standard errors of a
+proportion measured over that many days. The bar is computed, not chosen: over
+400 days chance alone produces about five percentage points of apparent edge,
+over 4,000 about 1.5. Nothing is called unless the gap clears it.
+
+When it does not clear — which is every model this project has trained so far —
+every symbol reads *still collecting data*, whatever the probability says. That
+is the honest answer rather than a placeholder, and it is what the third state
+is for.
+
+Underneath, when the gate is open, the reasoning: which features moved today's
+answer and by how much, in words. Measured by ablation — set one input to its
+training average and see how far the probability moves. Because the scaler
+standardises to mean zero, "average" is exactly zero in scaled space, so it is a
+precise question rather than an approximation.
+
+The page also shows what the model attends to across the whole test period,
+which is how a network that has collapsed to one answer shows itself: every bar
+near zero. On the current model the largest influence is 0.008 — it is barely
+reading its inputs at all.
+
+---
+
 ## How the pieces fit
 
 ```

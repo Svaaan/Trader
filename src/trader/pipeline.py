@@ -26,6 +26,7 @@ import numpy as np
 
 from . import dataset as dataset_mod
 from . import evaluate as evaluate_mod
+from . import explain as explain_mod
 from . import features as features_mod
 from . import model as model_mod
 from . import prices as prices_mod
@@ -72,6 +73,8 @@ class Run:
     evaluation: dict = dataclasses.field(default_factory=dict)
     verdict: str = ""
     signals: list = dataclasses.field(default_factory=list)
+    trust: dict = dataclasses.field(default_factory=dict)
+    learnt: list = dataclasses.field(default_factory=list)
     error: str = ""
 
     def save(self) -> None:
@@ -263,8 +266,17 @@ def _process(run: Run) -> None:
     run.evaluation = result.to_dict()
     run.verdict = evaluate_mod.verdict(result)
 
+    # Whether anything below is worth printing. Decided once, from the
+    # out-of-time score, and every per-symbol call is gated on it.
+    trust = explain_mod.assess(run.evaluation)
+    run.trust = trust.to_dict()
+
+    # What the model attends to in general, which is how a network that has
+    # collapsed to one answer shows itself from the inside.
+    run.learnt = explain_mod.what_it_learnt(model, scaler, x_test)
+
     # --- and what it says about today ---
-    run.signals = _todays_signals(model, scaler, frames)
+    run.signals = _todays_signals(model, scaler, frames, trust)
 
 
 def _train_fraction(run: Run) -> float:
@@ -274,7 +286,7 @@ def _train_fraction(run: Run) -> float:
     return (train / total) if total else 0.8
 
 
-def _todays_signals(model, scaler, frames: dict) -> list[dict]:
+def _todays_signals(model, scaler, frames: dict, trust=None) -> list[dict]:
     """The most recent finished session, per symbol.
 
     This is the row with features and no label -- the one prediction exists for.
@@ -291,7 +303,21 @@ def _todays_signals(model, scaler, frames: dict) -> list[dict]:
             row = latest[features_mod.FEATURE_NAMES].to_numpy(dtype=np.float32)
             probability = float(model.probabilities(scaler.apply(row))[0, 1])
 
+            verdict, because = (explain_mod.rank(probability, trust)
+                                if trust is not None else (explain_mod.UNSURE, ""))
+
+            reasons = explain_mod.contributions(model, scaler, row)
+
             signals.append({
+                "verdict": verdict,
+                "because": because,
+                # The three that moved today's answer most, in words. Only ever
+                # read alongside the verdict, which is gated on the evidence.
+                "reasons": [
+                    {**item, "sentence": explain_mod.in_words(item)}
+                    for item in reasons[:3]
+                ],
+                "all_contributions": reasons,
                 "symbol": symbol,
                 "as_of": latest.index[-1].date().isoformat(),
                 "close": round(float(prices["close"].iloc[-1]), 4),

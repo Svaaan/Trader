@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Trader — analysis</title>
+    <link rel="stylesheet" href="/static/trader.css">
+</head>
+
+<body>
+    <header class="top">
+        <div class="brand">Trader</div>
+        <nav class="nav">
+            <a href="/">Runs</a>
+            <a href="/analysis" class="is-here">Analysis</a>
+        </nav>
+    </header>
+
+    <main>
+        <section class="intro">
+            <h1>What it thinks, and why</h1>
+            <p>
+                One call per symbol from the most recent finished model, with
+                the reasoning underneath it.
+            </p>
+            <p class="caveat">
+                Every call here is gated on the model having beaten the baseline
+                out of time by more than chance produces. When it has not — which
+                is the usual outcome — everything reads <strong>still collecting
+                data</strong> regardless of how confident the model sounds. That
+                is the honest answer, not a placeholder.
+            </p>
+        </section>
+
+        <div id="analysis">
+            <p class="empty">Loading…</p>
+        </div>
+    </main>
+
+    <script src="/static/analysis.js"></script>
+</body>
+
+</html>

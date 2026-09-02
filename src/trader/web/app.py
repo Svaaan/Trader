@@ -62,6 +62,52 @@ def index(request: Request):
     })
 
 
+@app.get("/analysis", response_class=HTMLResponse)
+def analysis(request: Request):
+    """The trading view: the call, and the argument for it.
+
+    Separate from the front page because it answers a different question. That
+    one asks whether the model is any good; this one asks what it thinks and
+    why. The order matters -- the verdicts here are gated on the answer there,
+    and a page that showed them without it would be the most misleading thing
+    in this project.
+    """
+    return templates.TemplateResponse("analysis.html", {"request": request})
+
+
+@app.get("/api/analysis")
+def api_analysis():
+    """The newest finished run, with its reasoning.
+
+    Only finished runs: a model still training has no opinion, and showing the
+    previous run's calls beside a "training" badge would invite reading stale
+    numbers as current ones.
+    """
+    done = [r for r in pipeline.list_runs() if r.status == "done"]
+    if not done:
+        return JSONResponse({"run": None,
+                             "why": "No finished model yet. Train one first."})
+
+    run = done[0]
+    return JSONResponse({
+        "run": {
+            "run_id": run.run_id,
+            "created": run.created,
+            "horizon": run.horizon,
+            "trust": run.trust,
+            "evaluation": run.evaluation,
+            "verdict": run.verdict,
+            "learnt": run.learnt,
+            "signals": run.signals,
+            "dataset": {
+                "test": (run.dataset or {}).get("test", {}),
+                "train": (run.dataset or {}).get("train", {}),
+                "cut_date": (run.dataset or {}).get("cut_date"),
+            },
+        },
+    })
+
+
 @app.get("/api/runs")
 def api_runs():
     """Every run, newest first. The page polls this."""
