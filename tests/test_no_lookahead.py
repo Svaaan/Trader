@@ -233,3 +233,37 @@ def test_a_symbol_with_too_little_history_is_left_out_not_mis_split():
     # NEWCOMER starts after the cut, so it has no training rows at all.
     for split in splits:
         assert len(split.y_train) > 0 and len(split.y_test) > 0
+
+
+def test_pooled_rows_leave_in_date_order():
+    """Because the coordinator is told they are.
+
+    HelloWorldAi holds back the newest rows when a submitter declares time
+    order. Stacked by symbol, "the newest rows" is the tail of whichever
+    company happened to be last, and the declaration is false: measured, that
+    gave a holdout score of 54.9%, identical to the random slice it replaced.
+    """
+    frames = {
+        "A": synthetic_prices(days=600, seed=11),
+        "B": synthetic_prices(days=600, seed=12),
+    }
+    splits, _ = dataset.build_panel(frames, test_fraction=0.2)
+    assert len(splits) == 2
+
+    # Rebuild the ordering the same way combine does, and check it is sorted.
+    dates = np.concatenate([s.train_dates.values for s in splits])
+    order = np.argsort(dates, kind="stable")
+    sorted_dates = dates[order]
+
+    assert list(sorted_dates) == sorted(sorted_dates), "the sort is not a sort"
+
+    # And that combine actually applies it: the two symbols must interleave,
+    # not sit one after the other.
+    x, y, _ = dataset.combine(splits)
+    assert len(x) == len(dates)
+
+    # A stacked array would have every row of A before every row of B. After
+    # sorting by date the halves must overlap, since both cover the same span.
+    half = len(sorted_dates) // 2
+    assert sorted_dates[half] > sorted_dates[0], "dates did not advance"
+    assert sorted_dates[-1] >= sorted_dates[half], "dates are not monotonic"

@@ -186,7 +186,8 @@ class Client:
                steps: int = 4000, batch_size: int = 64,
                learning_rate: float = 0.01,
                hidden_dim: int = 64, depth: int = 2,
-               node_id: str | None = None) -> str:
+               node_id: str | None = None,
+               time_ordered: bool = True) -> str:
         """Queue a job, on a named node when one has been chosen.
 
         Naming a node is not the default in HelloWorldAi and for good reason --
@@ -194,7 +195,13 @@ class Client:
         because auto-placement picks on a stale flag; see pick_node.
         """
         path = f"/submit-task/{node_id}" if node_id else "/submit-task"
+        # Everything this project sends is a price series, so the coordinator's
+        # verification should hold back the newest rows rather than a random
+        # slice. A random slice of a market grades the model on days it has both
+        # neighbours of, which is a much easier question than the one being
+        # asked -- measured at 54.2% against 51.7% for the same weights.
         body = self._call("POST", path, json_body={
+            "time_ordered": time_ordered,
             "model_name": model_name,
             "architecture": "mlp",          # rows of numbers to a class
             "dataset_id": dataset_id,

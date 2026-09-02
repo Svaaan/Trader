@@ -171,8 +171,25 @@ def combine(splits: Sequence[Split]) -> tuple[np.ndarray, np.ndarray, Scaler]:
     if not splits:
         raise ValueError("nothing to combine")
 
-    x_train = np.concatenate([s.x_train for s in splits])
-    y_train = np.concatenate([s.y_train for s in splits])
+    # Sorted by date, not stacked by symbol.
+    #
+    # Training does not care -- batches are drawn at random, so the order of the
+    # rows makes no difference to what is learned. The coordinator's holdout
+    # does care. Telling it the rows are in time order and then handing it all
+    # of Apple followed by all of SAP means "hold back the last 20%" holds back
+    # the tail of the last company rather than the most recent period, which is
+    # not the question anybody meant to ask.
+    #
+    # Measured: declaring time order on symbol-stacked rows gave a holdout score
+    # of 54.9%, no better than the random slice it replaced.
+    x_parts = np.concatenate([s.x_train for s in splits])
+    y_parts = np.concatenate([s.y_train for s in splits])
+    dates = np.concatenate([s.train_dates.values for s in splits])
+
+    # Stable, so rows sharing a date keep a deterministic order between runs.
+    order = np.argsort(dates, kind="stable")
+    x_train = x_parts[order]
+    y_train = y_parts[order]
 
     scaler = Scaler(
         mean=x_train.mean(axis=0),
