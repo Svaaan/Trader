@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Trader</title>
+    <link rel="stylesheet" href="/static/trader.css">
+</head>
+
+<body>
+    <header class="top">
+        <div class="brand">Trader</div>
+        <div class="top-right">
+            <span class="pill {% if coordinator_ok %}is-ok{% else %}is-bad{% endif %}"
+                  id="coordinatorPill">
+                {{ coordinator_detail }}
+            </span>
+            <button type="button" class="btn" id="startRun">Train a new model</button>
+        </div>
+    </header>
+
+    <main>
+        <section class="intro">
+            <h1>Direction signals, with the working shown</h1>
+            <p>
+                Features are built from daily closes, sent to HelloWorldAi to
+                train on a real GPU, and the finished model is fetched back and
+                scored here on the last stretch of history it was never given.
+            </p>
+            <p class="caveat">
+                This produces an opinion about direction and nothing else. It
+                places no orders and holds no broker credentials. Predicting
+                daily moves is close to a coin flip, and the numbers below are
+                laid out so you can see whether this one is any better than that
+                — including when it is not.
+            </p>
+            <p class="watchlist">
+                Watching:
+                {% for symbol in watchlist %}<code>{{ symbol }}</code>{% endfor %}
+            </p>
+        </section>
+
+        <div id="runs" class="runs">
+            <p class="empty">Loading…</p>
+        </div>
+    </main>
+
+    <script src="/static/trader.js"></script>
+</body>
+
+</html>

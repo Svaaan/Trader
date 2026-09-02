@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# The submitter key is the account: anyone holding it can see these jobs and
+# download the models. env/.env.example shows the shape without the value.
+env/.env
+
+# Fetched prices, submitted runs and downloaded models. All reproducible, and
+# the price cache is a few megabytes of somebody else's data.
+data/

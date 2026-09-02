@@ -1,0 +1,26 @@
+# What the Trader needs, and nothing else.
+#
+# Deliberately no torch. The model HelloWorldAi returns is a small feedforward
+# network, and its manifest describes the layers explicitly -- Linear, ReLU,
+# Linear -- so running it is a few matrix multiplications. numpy does that in
+# twenty lines you can read, instead of a two-gigabyte dependency and a CUDA
+# version to match. See src/trader/model.py.
+
+# --- market data ---
+yfinance==0.2.66
+pandas==2.3.3
+numpy==2.3.4
+
+# --- talking to HelloWorldAi ---
+httpx==0.28.1
+
+# --- reading the weights it sends back ---
+safetensors==0.6.2
+
+# --- the UI ---
+fastapi==0.115.12
+uvicorn==0.34.0
+jinja2==3.1.6
+
+# --- configuration ---
+python-dotenv==1.0.1
