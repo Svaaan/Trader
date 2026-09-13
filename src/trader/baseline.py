@@ -43,10 +43,13 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
 
+from . import arrays as arrays_mod
+from .arrays import CPU, GPU
 from . import dataset as dataset_mod
 from . import evaluate as evaluate_mod
 
@@ -59,22 +62,55 @@ logger = logging.getLogger(__name__)
 # with nine models and nothing to compare them to.
 LOCAL_STEP_BUDGET = 36_000
 
+# Where the GPU starts to win, measured rather than assumed. Training the same
+# 7,233-parameter network at batch 64, on this machine:
+#
+#     models      cpu       gpu    gpu s/model
+#          1     1.1s     12.5s         12.53s
+#          4     3.4s     12.4s          3.10s
+#         16    13.3s     13.2s          0.82s
+#         64    95.7s     15.0s          0.23s
+#
+# The card's time is flat -- it is waiting between kernel launches, not
+# computing -- so every model after the first is nearly free, while the CPU pays
+# for each one. Below sixteen the launches cost more than the arithmetic saves.
+#
+# This is why the answer to "use the GPU" is "train many models at once" rather
+# than "train one model faster". One model on the card is ten times slower.
+GPU_MODEL_CROSSOVER = 16
+
+# And the same question for the logistic fit, which is one big matmul rather
+# than many small ones. Measured, 600 passes:
+#
+#     rows        cpu      gpu
+#      3,000     0.12s    1.23s    <- transfer and warm-up dominate
+#     20,000     0.76s    0.35s
+#    428,100    23.36s    2.30s
+#
+# Routing on "is there a card" rather than "is the problem big enough" made the
+# test suite take nine minutes instead of one, because every small fit paid a
+# transfer it could not earn back. Size is the question, not availability.
+GPU_ROW_CROSSOVER = 20_000
+
 
 # --- the models ------------------------------------------------------------
 
-def _add_bias(x: np.ndarray) -> np.ndarray:
-    return np.concatenate([x, np.ones((len(x), 1), dtype=x.dtype)], axis=1)
+def _add_bias(x, xp=np):
+    return xp.concatenate([x, xp.ones((len(x), 1), dtype=x.dtype)], axis=1)
 
 
-def _sigmoid(z: np.ndarray) -> np.ndarray:
-    # Split by sign so neither branch overflows: exp of a large positive number
-    # is inf, and inf/inf is nan, which propagates silently through everything.
-    out = np.empty_like(z)
-    positive = z >= 0
-    out[positive] = 1.0 / (1.0 + np.exp(-z[positive]))
-    exp_z = np.exp(z[~positive])
-    out[~positive] = exp_z / (1.0 + exp_z)
-    return out
+def _sigmoid(z, xp=np):
+    """Numerically stable, and written so it runs on either array module.
+
+    Boolean-mask assignment is slow on a GPU and fine on a CPU, so this uses
+    `where` on the clipped input instead: same arithmetic, no branch, no
+    scatter. exp of a large positive number is inf and inf/inf is nan, which
+    propagates silently through everything, so the clip is doing real work.
+    """
+    clipped = xp.clip(z, -60.0, 60.0)
+    return xp.where(clipped >= 0,
+                    1.0 / (1.0 + xp.exp(-clipped)),
+                    xp.exp(clipped) / (1.0 + xp.exp(clipped)))
 
 
 @dataclasses.dataclass
@@ -87,20 +123,50 @@ class Logistic:
         return _sigmoid(_add_bias(np.asarray(x, dtype=np.float64)) @ self.weights)
 
 
+
 def fit_logistic(x: np.ndarray, y: np.ndarray, *, epochs: int = 600,
-                 lr: float = 0.5, l2: float = 1e-4) -> Logistic:
-    """Full-batch gradient descent. The objective is convex, so this is enough."""
-    features = _add_bias(np.asarray(x, dtype=np.float64))
-    target = np.asarray(y, dtype=np.float64)
-    weights = np.zeros(features.shape[1])
+                 lr: float = 0.5, l2: float = 1e-4,
+                 device: str | None = None) -> Logistic:
+    """Full-batch gradient descent. The objective is convex, so this is enough.
+
+    This is the slowest thing in the project and the best case for a card: six
+    hundred passes over the whole training matrix, which on a wide panel is
+    600 x (428,000 x 47) twice per pass. Measured at 21.7 seconds on the CPU,
+    and walk-forward runs it six times.
+
+    It is also the safest thing to move, because there is no randomness in it at
+    all -- the weights start at zero and the objective is convex, so CPU and GPU
+    reach the same answer rather than two answers that have to be argued about.
+    Measured: 20.8 seconds on the CPU, 3.6 on the card, weights agreeing to
+    2e-17.
+    """
+    if device is None:
+        # Unlike the MLP, this is a handful of enormous matmuls rather than
+        # thousands of tiny ones, so the card wins -- but only once there is
+        # enough matrix to pay for moving it there.
+        device = (GPU if len(x) >= GPU_ROW_CROSSOVER and arrays_mod.available()
+                  else CPU)
+    module = arrays_mod.xp(device)
+
+    features = _add_bias(module.asarray(x, dtype=module.float64), module)
+    target = module.asarray(y, dtype=module.float64)
+    weights = module.zeros(features.shape[1], dtype=module.float64)
+
+    # The penalty skips the bias. Built once as a mask rather than by slicing
+    # each pass, because in-place slice assignment is the one numpy idiom that
+    # does not carry cleanly to a device array.
+    penalised = module.ones(features.shape[1], dtype=module.float64)
+    penalised[-1] = 0.0
 
     for _ in range(epochs):
-        error = _sigmoid(features @ weights) - target
+        error = _sigmoid(features @ weights, module) - target
         gradient = features.T @ error / len(features)
-        gradient[:-1] += l2 * weights[:-1]          # the bias is not penalised
-        weights -= lr * gradient
+        gradient = gradient + l2 * weights * penalised
+        weights = weights - lr * gradient
 
-    return Logistic(weights=weights)
+    # Back to numpy on the way out: everything downstream is pandas, safetensors
+    # and scoring, none of which knows what a device array is.
+    return Logistic(weights=arrays_mod.to_cpu(weights))
 
 
 @dataclasses.dataclass
@@ -165,15 +231,18 @@ def network_health(network: MLP, x: np.ndarray, sample: int = 20000) -> dict:
     }
 
 
-def _cross_entropy(probabilities: np.ndarray, target: np.ndarray) -> float:
-    safe = np.clip(probabilities, 1e-12, 1 - 1e-12)
-    return float(-(target * np.log(safe) + (1 - target) * np.log(1 - safe)).mean())
+def _cross_entropy(probabilities, target, xp=np) -> float:
+    safe = xp.clip(probabilities, 1e-12, 1 - 1e-12)
+    loss = -(target * xp.log(safe) + (1 - target) * xp.log(1 - safe)).mean()
+    # A scalar, on the host, so the training loop can compare it to a float.
+    return float(arrays_mod.to_cpu(loss))
 
 
 def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
             steps: int = 4000, batch: int = 64, lr: float = 0.001,
             seed: int = 0, validation: float = 0.15,
-            patience: int = 8, check_every: int = 1000) -> MLP:
+            patience: int = 8, check_every: int = 1000,
+            device: str | None = None) -> MLP:
     """A small ReLU network trained with Adam, in numpy.
 
     The learning rate is Adam's own default and was not always. At 0.01 this
@@ -219,7 +288,24 @@ def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
     arithmetic step readable, and a control that needed two gigabytes of CUDA to
     run would not be much of a control.
     """
+    # The random parts stay on numpy on purpose -- the initial weights and the
+    # shuffling order. CuPy's generator produces a different stream for the same
+    # seed, so drawing them on the device would make a GPU run and a CPU run of
+    # the same seed two different experiments, and the noise floor would be
+    # measuring the backend as much as the seed. Drawn here, transferred once,
+    # identical either way.
+    # One network at batch 64 belongs on the CPU and the measurements are not
+    # close: 7.4 seconds here against 67 on the card, because twenty thousand
+    # steps of thirty kernel launches each cost more than the arithmetic saves.
+    #
+    # This has to be an explicit default rather than "auto", which resolves to
+    # the card whenever one exists. Leaving it on auto made a single unit test
+    # take 133 seconds instead of 8, and it would have made every ordinary run
+    # slower on the machine that had just been given a GPU to speed it up.
+    # `fit_mlp_ensemble` is where a card earns its place.
+    module = arrays_mod.xp(device or CPU)
     rng = np.random.default_rng(seed)
+
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1, 1)
 
@@ -236,13 +322,22 @@ def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
     sizes = [x_fit.shape[1]] + [hidden] * depth + [1]
     layers = []
     for a, b in zip(sizes[:-1], sizes[1:]):
-        # He initialisation, which is what ReLU wants.
-        layers.append([rng.normal(0.0, np.sqrt(2.0 / a), (a, b)), np.zeros(b)])
+        # He initialisation, which is what ReLU wants. Drawn on numpy, then
+        # moved, so the starting point does not depend on where it runs.
+        layers.append([module.asarray(rng.normal(0.0, np.sqrt(2.0 / a), (a, b))),
+                       module.zeros(b, dtype=module.float64)])
 
-    moment1 = [[np.zeros_like(w), np.zeros_like(b)] for w, b in layers]
-    moment2 = [[np.zeros_like(w), np.zeros_like(b)] for w, b in layers]
+    # Everything the training loop touches lives on the device for the duration.
+    x_fit = module.asarray(x_fit)
+    y_fit = module.asarray(y_fit)
+    if x_val is not None:
+        x_val = module.asarray(x_val)
+        y_val = module.asarray(y_val)
 
-    order = rng.permutation(len(x_fit))
+    moment1 = [[module.zeros_like(w), module.zeros_like(b)] for w, b in layers]
+    moment2 = [[module.zeros_like(w), module.zeros_like(b)] for w, b in layers]
+
+    order = module.asarray(rng.permutation(len(x_fit)))
     cursor = 0
 
     best_loss, best_layers, best_step, stale = np.inf, None, 0, 0
@@ -252,7 +347,7 @@ def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
         # without replacement within a pass keeps the gradient estimates less
         # correlated than drawing independently every time.
         if cursor + batch > len(order):
-            order = rng.permutation(len(x_fit))
+            order = module.asarray(rng.permutation(len(x_fit)))
             cursor = 0
         index = order[cursor:cursor + batch]
         cursor += batch
@@ -263,10 +358,10 @@ def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
         for depth_index, (weight, bias) in enumerate(layers):
             z = activations[-1] @ weight + bias
             activations.append(z if depth_index == len(layers) - 1
-                               else np.maximum(z, 0.0))
+                               else module.maximum(z, 0.0))
 
         # Cross-entropy through a sigmoid differentiates to exactly this.
-        delta = (_sigmoid(activations[-1]) - yb) / len(xb)
+        delta = (_sigmoid(activations[-1], module) - yb) / len(xb)
 
         for depth_index in range(len(layers) - 1, -1, -1):
             weight, bias = layers[depth_index]
@@ -286,12 +381,17 @@ def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
                     0.999 * moment2[depth_index][slot] + 0.001 * grad * grad)
                 corrected1 = moment1[depth_index][slot] / (1 - 0.9 ** step)
                 corrected2 = moment2[depth_index][slot] / (1 - 0.999 ** step)
-                param -= lr * corrected1 / (np.sqrt(corrected2) + 1e-8)
+                param -= lr * corrected1 / (module.sqrt(corrected2) + 1e-8)
 
         # --- stop when it stops helping ---------------------------------
         if x_val is not None and (step % check_every == 0 or step == steps):
-            candidate = MLP(layers=layers)
-            loss = _cross_entropy(candidate.probabilities(x_val), y_val.ravel())
+            activation = x_val
+            for depth_index, (weight, bias) in enumerate(layers):
+                activation = activation @ weight + bias
+                if depth_index < len(layers) - 1:
+                    activation = module.maximum(activation, 0.0)
+            loss = _cross_entropy(_sigmoid(activation.ravel(), module),
+                                  y_val.ravel(), module)
 
             if loss < best_loss - 1e-6:
                 best_loss, best_step, stale = loss, step, 0
@@ -308,6 +408,9 @@ def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
     # The weights that scored best, not the ones it happened to end on.
     if best_layers is not None:
         layers = best_layers
+
+    # Home before anything downstream sees them.
+    layers = [(arrays_mod.to_cpu(w), arrays_mod.to_cpu(b)) for w, b in layers]
 
     return MLP(layers=layers,
                stopped_at=best_step or steps,
@@ -332,7 +435,7 @@ def _score(probabilities, splits, scaler, train_up_share, cost) -> dict:
     result = evaluate_mod.evaluate(
         probabilities, test.y, test.returns, test.dates, test.symbols,
         executable_returns=test.executable,
-        train_up_share=train_up_share, cost=cost)
+        train_up_share=train_up_share, cost=cost, horizon=test.horizon)
     return result.to_dict()
 
 
@@ -358,6 +461,10 @@ def run_controls(splits, feature_names, *, hidden: int = 64, depth: int = 2,
 
     out: dict = {"train_up_share": round(train_up_share, 4),
                  "train_rows": int(len(y_train)),
+                 # Where the arithmetic actually ran. Two runs whose numbers
+                 # differ are only comparable if this matches, and a card that
+                 # silently fell back to the CPU is worth knowing about.
+                 "device": arrays_mod.device_name(),
                  "hyperparameters": {"hidden": hidden, "depth": depth,
                                      "steps": steps, "batch": batch}}
 
@@ -380,10 +487,16 @@ def run_controls(splits, feature_names, *, hidden: int = 64, depth: int = 2,
     out["local_steps"] = local_steps
     out["local_step_share"] = round(local_steps / max(steps, 1), 3)
 
+    # The seeds are trained together rather than one after another. At three
+    # models that is a small win on the CPU; the reason it is written this way
+    # is that a search over dozens of configurations is the same call with a
+    # longer list, and there it is the difference between a queue and one pass.
+    models = fit_mlp_ensemble(x_train, y_train, seeds=list(range(seeds)),
+                              hidden=hidden, depth=depth, steps=local_steps,
+                              batch=batch)
+
     accuracies = []
-    for seed in range(seeds):
-        model = fit_mlp(x_train, y_train, hidden=hidden, depth=depth,
-                        steps=local_steps, batch=batch, seed=seed)
+    for seed, model in enumerate(models):
         scored = _score(model.probabilities(x_test), splits, scaler,
                         train_up_share, cost)
         accuracies.append(scored["accuracy"])
@@ -486,11 +599,178 @@ def walk_forward(frames: dict, spec, *, folds: int = 6,
 def _truncate(split, stop: pd.Timestamp):
     """Keep only the test rows before `stop`, for one walk-forward fold."""
     keep = split.test_dates < pd.Timestamp(stop)
-    return dataset_mod.Split(
-        symbol=split.symbol,
-        x_train=split.x_train, y_train=split.y_train,
+    # Replaced rather than rebuilt field by field, so that a field added to
+    # Split later -- as the horizon was -- survives the fold instead of quietly
+    # falling back to its default.
+    return dataclasses.replace(
+        split,
         x_test=split.x_test[keep], y_test=split.y_test[keep],
-        train_dates=split.train_dates, test_dates=split.test_dates[keep],
+        test_dates=split.test_dates[keep],
         forward_returns_test=split.forward_returns_test[keep],
         executable_returns_test=split.executable_returns_test[keep],
     )
+
+
+# --- many models at once ----------------------------------------------------
+
+def fit_mlp_ensemble(x: np.ndarray, y: np.ndarray, *, seeds: Sequence[int],
+                     hidden: int = 64, depth: int = 2, steps: int = 4000,
+                     batch: int = 64, lr: float = 0.001,
+                     validation: float = 0.15, patience: int = 8,
+                     check_every: int = 1000,
+                     device: str | None = None) -> list:
+    """Train several networks simultaneously, as one batched computation.
+
+    This is the only shape of this problem a GPU is actually good at, and the
+    measurements say so plainly. One network at batch 64 is 20,000 steps of
+    about thirty kernel launches each, and the launches cost more than the
+    arithmetic: on this machine a single `fit_mlp` takes 7.4 seconds on the CPU
+    and 67 on the card. The card is not slow, it is idle -- waiting between
+    tiny instructions.
+
+    Give it a leading model axis and nothing changes except the amount of work
+    per launch. Every network gets its own initialisation, its own shuffle and
+    its own minibatch; the forward pass becomes one batched matmul of
+    (models, batch, in) by (models, in, out); the launch count stays where it
+    was. Thirty-two models cost barely more than one.
+
+    That is what makes an hour of searching worth running. A hundred
+    configurations trained one after another is a queue; trained together it is
+    one pass, and the difference is the whole reason to have a card in this
+    project at all.
+
+    Returns one MLP per seed, in the order given, each already back on the host.
+    """
+    count = len(seeds)
+    if device is None:
+        # Routed on the measured crossover, not on whether a card exists.
+        device = (GPU if count >= GPU_MODEL_CROSSOVER and arrays_mod.available()
+                  else CPU)
+    module = arrays_mod.xp(device)
+    if not count:
+        return []
+
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64).reshape(-1, 1)
+
+    holdout = int(len(x) * max(min(validation, 0.5), 0.0))
+    if holdout > 50:
+        x_fit, y_fit = x[:-holdout], y[:-holdout]
+        x_val, y_val = module.asarray(x[-holdout:]), module.asarray(y[-holdout:])
+    else:
+        x_fit, y_fit, x_val, y_val = x, y, None, None
+
+    generators = [np.random.default_rng(seed) for seed in seeds]
+    sizes = [x_fit.shape[1]] + [hidden] * depth + [1]
+
+    # One stack per layer: (models, in, out). Initialised per model on numpy so
+    # a seed means the same thing here as it does in fit_mlp.
+    layers = []
+    for a, b in zip(sizes[:-1], sizes[1:]):
+        weights = np.stack([g.normal(0.0, np.sqrt(2.0 / a), (a, b))
+                            for g in generators])
+        layers.append([module.asarray(weights),
+                       module.zeros((count, 1, b), dtype=module.float64)])
+
+    x_fit_d = module.asarray(x_fit)
+    y_fit_d = module.asarray(y_fit)
+
+    moment1 = [[module.zeros_like(w), module.zeros_like(b)] for w, b in layers]
+    moment2 = [[module.zeros_like(w), module.zeros_like(b)] for w, b in layers]
+
+    orders = [g.permutation(len(x_fit)) for g in generators]
+    cursor = 0
+
+    best_loss = np.full(count, np.inf)
+    best_layers = [None] * count
+    best_step = np.zeros(count, dtype=int)
+    stale = np.zeros(count, dtype=int)
+
+    for step in range(1, max(steps, 1) + 1):
+        if cursor + batch > len(x_fit):
+            orders = [g.permutation(len(x_fit)) for g in generators]
+            cursor = 0
+        # (models, batch) indices -> (models, batch, features)
+        index = module.asarray(
+            np.stack([o[cursor:cursor + batch] for o in orders]))
+        cursor += batch
+
+        xb = x_fit_d[index]
+        yb = y_fit_d[index]
+
+        activations = [xb]
+        for depth_index, (weight, bias) in enumerate(layers):
+            z = module.matmul(activations[-1], weight) + bias
+            activations.append(z if depth_index == len(layers) - 1
+                               else module.maximum(z, 0.0))
+
+        delta = (_sigmoid(activations[-1], module) - yb) / batch
+
+        for depth_index in range(len(layers) - 1, -1, -1):
+            weight, bias = layers[depth_index]
+            previous = activations[depth_index]
+
+            grad_w = module.matmul(module.swapaxes(previous, 1, 2), delta)
+            grad_b = delta.sum(axis=1, keepdims=True)
+
+            if depth_index > 0:
+                delta = (module.matmul(delta, module.swapaxes(weight, 1, 2))
+                         * (activations[depth_index] > 0))
+
+            for slot, (grad, param) in enumerate(
+                    ((grad_w, weight), (grad_b, bias))):
+                moment1[depth_index][slot] = (
+                    0.9 * moment1[depth_index][slot] + 0.1 * grad)
+                moment2[depth_index][slot] = (
+                    0.999 * moment2[depth_index][slot] + 0.001 * grad * grad)
+                corrected1 = moment1[depth_index][slot] / (1 - 0.9 ** step)
+                corrected2 = moment2[depth_index][slot] / (1 - 0.999 ** step)
+                param -= lr * corrected1 / (module.sqrt(corrected2) + 1e-8)
+
+        # --- stop each model when it stops helping, independently ---------
+        if x_val is not None and (step % check_every == 0 or step == steps):
+            activation = module.broadcast_to(
+                x_val, (count,) + x_val.shape).copy()
+            for depth_index, (weight, bias) in enumerate(layers):
+                activation = module.matmul(activation, weight) + bias
+                if depth_index < len(layers) - 1:
+                    activation = module.maximum(activation, 0.0)
+
+            probabilities = _sigmoid(activation[..., 0], module)
+            safe = module.clip(probabilities, 1e-12, 1 - 1e-12)
+            target = y_val.ravel()
+            losses = arrays_mod.to_cpu(
+                -(target * module.log(safe)
+                  + (1 - target) * module.log(1 - safe)).mean(axis=1))
+
+            for model in range(count):
+                if losses[model] < best_loss[model] - 1e-6:
+                    best_loss[model] = losses[model]
+                    best_step[model] = step
+                    stale[model] = 0
+                    best_layers[model] = [
+                        (arrays_mod.to_cpu(w[model]).copy(),
+                         arrays_mod.to_cpu(b[model]).reshape(-1).copy())
+                        for w, b in layers]
+                else:
+                    stale[model] += 1
+
+            # Only stop when every model has given up; the batched step costs
+            # the same whether one model still needs it or all of them do.
+            if (stale >= patience).all():
+                logger.info("Ensemble stopped at %d steps; best losses %s",
+                            step, np.round(best_loss, 5).tolist())
+                break
+
+    out = []
+    for model in range(count):
+        chosen = best_layers[model]
+        if chosen is None:
+            chosen = [(arrays_mod.to_cpu(w[model]).copy(),
+                       arrays_mod.to_cpu(b[model]).reshape(-1).copy())
+                      for w, b in layers]
+        out.append(MLP(layers=chosen,
+                       stopped_at=int(best_step[model]) or steps,
+                       validation_loss=(None if not np.isfinite(best_loss[model])
+                                        else round(float(best_loss[model]), 6))))
+    return out

@@ -366,3 +366,96 @@ def test_the_verdict_names_the_overnight_gap_when_that_is_the_story():
     result.edge = 0.03
 
     assert "overnight gap" in evaluate.verdict(result)
+
+
+# --- overlapping holding windows ---------------------------------------------
+#
+# Past one session, consecutive rows share most of the same move. A model whose
+# positions persist -- and they do, because the features behind them change
+# slowly -- is graded on nearly the same return again and again, and every
+# statistic that counts those rows as independent reads high. Measured on noise
+# before the fix: a t-statistic of 2 cleared in 39% of runs at h=5 and 53% at
+# h=20, against the 5% it promises.
+
+def sticky_noise(rng, horizon, days=500, names=10, keep=0.9):
+    """The daily portfolio series of a model with no skill and sticky views."""
+    daily = rng.normal(0.0, 0.01, size=(days + horizon, names))
+    forward = np.stack([daily[t:t + horizon].sum(axis=0) for t in range(days)])
+
+    view = np.empty((days, names))
+    view[0] = rng.choice([-1.0, 1.0], names)
+    for t in range(1, days):
+        redraw = rng.random(names) > keep
+        view[t] = np.where(redraw, rng.choice([-1.0, 1.0], names), view[t - 1])
+
+    return pd.Series((view * forward).mean(axis=1))
+
+
+def false_pass_rate(horizon, *, told, trials=300, seed=0):
+    rng = np.random.default_rng(seed)
+    passes = 0
+    for _ in range(trials):
+        series = sticky_noise(rng, horizon)
+        passes += abs(evaluate._tstat(series, told)) > 2.0
+    return passes / trials
+
+
+def test_the_overlap_problem_is_real_before_the_correction():
+    """Without this the next test could pass on data that never overlapped."""
+    assert false_pass_rate(5, told=1) > 0.25
+
+
+def test_a_skill_free_model_no_longer_clears_two_at_long_horizons():
+    assert false_pass_rate(5, told=5) < 0.10
+    assert false_pass_rate(20, told=20) < 0.10
+
+
+def test_nothing_changes_at_one_session():
+    """Every number a one-day run has ever printed stays what it was."""
+    rng = np.random.default_rng(1)
+    series = sticky_noise(rng, 1)
+    assert evaluate._overlap(series, 1) == 1.0
+    assert evaluate._tstat(series, 1) == pytest.approx(
+        series.mean() / (series.std() / np.sqrt(len(series))))
+
+
+def test_the_correction_never_claims_overlap_added_information():
+    rng = np.random.default_rng(2)
+    for _ in range(50):
+        assert evaluate._overlap(pd.Series(rng.normal(size=40)), 10) >= 1.0
+
+
+def test_a_year_of_five_day_holds_is_fifty_periods_not_two_hundred():
+    rng = np.random.default_rng(3)
+    series = pd.Series(rng.normal(0.002, 0.02, 400))
+    assert evaluate._sharpe(series, 5) == pytest.approx(
+        evaluate._sharpe(series, 1) / np.sqrt(5))
+
+
+def test_the_horizon_reaches_every_statistic_that_needs_it():
+    """Through evaluate, not just the helpers: a Sharpe that dropped by the
+    square root of five while the t-statistic and effective rows stayed put
+    would mean one call site had been missed."""
+    rng = np.random.default_rng(4)
+    days, names, horizon = 400, 8, 5
+    daily = rng.normal(0.0, 0.01, size=(days + horizon, names))
+    forward = np.stack([daily[t:t + horizon].sum(axis=0) for t in range(days)])
+    view = np.empty((days, names))
+    view[0] = rng.random(names)
+    for t in range(1, days):
+        view[t] = np.where(rng.random(names) > 0.9, rng.random(names), view[t - 1])
+
+    calendar = pd.bdate_range("2020-01-01", periods=days)
+    args = (view.ravel(), (forward.ravel() > 0).astype(int), forward.ravel(),
+            np.repeat(calendar, names),
+            np.tile([f"S{i}" for i in range(names)], days))
+
+    naive = evaluate.evaluate(*args, train_up_share=0.5, cost=0.0)
+    told = evaluate.evaluate(*args, train_up_share=0.5, cost=0.0, horizon=horizon)
+
+    assert told.executable_sharpe == pytest.approx(
+        naive.executable_sharpe / np.sqrt(horizon), abs=2e-3)
+    assert abs(told.executable_tstat) <= abs(naive.executable_tstat)
+    assert told.effective_rows < naive.effective_rows
+    assert told.executable_daily == pytest.approx(
+        naive.executable_daily / horizon, abs=1e-6)

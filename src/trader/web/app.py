@@ -36,6 +36,7 @@ import logging
 import os
 import threading
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, BackgroundTasks
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -45,6 +46,7 @@ from starlette.requests import Request
 
 from .. import context as context_mod
 from .. import news as news_mod
+from .. import paper as paper_mod
 from .. import pipeline
 from .. import trainer as trainer_mod
 from ..helloworld import Client
@@ -52,6 +54,15 @@ from ..helloworld import Client
 logger = logging.getLogger(__name__)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Load the environment here rather than relying on whoever started the process.
+# `run.py` does this before importing uvicorn, but the app can also be launched
+# straight through `uvicorn trader.web.app:app` -- from an editor, a launch
+# config, or a process manager -- and then it could not. The symptom was silent
+# and confusing: every run submitted from the page failed with "No submitter
+# key" while the same run from the command line worked, because only one of the
+# two entry points had read env/.env.
+load_dotenv(os.path.join(HERE, "..", "..", "..", "env", ".env"))
 app = FastAPI(title="Trader")
 
 STATIC_DIR = os.path.join(HERE, "static")
@@ -177,6 +188,47 @@ def api_analysis():
     })
 
 
+@app.get("/pnl", response_class=HTMLResponse)
+def pnl(request: Request):
+    """The forward paper record: what it would have done, and what it cost.
+
+    Its own page because it answers a question neither of the others can. The
+    front page asks whether the model scored well on history it was held out
+    from; this asks what happened after the prediction was made, which is the
+    one measurement in the project that cannot be mined.
+    """
+    return templates.TemplateResponse("pnl.html",
+                                      {"request": request, "v": _static_version()})
+
+
+@app.get("/api/pnl")
+def api_pnl():
+    """The equity curve, the statistics, and whether live matches the backtest."""
+    state = paper_mod.account()
+    run = _newest_done()
+
+    return JSONResponse({
+        "account": state,
+        "divergence": paper_mod.divergence(state, run.evaluation if run else {}),
+        "backtest": {
+            "run_id": run.run_id if run else None,
+            "executable_sharpe": (run.evaluation or {}).get("executable_sharpe")
+            if run else None,
+            "executable_annualised": (run.evaluation or {}).get(
+                "executable_annualised") if run else None,
+            "gate_open": bool((run.trust or {}).get("trusted")) if run else False,
+        },
+        "cost_per_side": paper_mod.COST_PER_SIDE,
+    })
+
+
+@app.post("/api/pnl/settle")
+def api_pnl_settle(background: BackgroundTasks):
+    """Fill anything whose session has happened. Safe to call repeatedly."""
+    background.add_task(pipeline.settle_paper)
+    return {"status": "settling"}
+
+
 @app.get("/api/runs")
 def api_runs():
     """Every run, newest first. The page polls this."""
@@ -186,6 +238,12 @@ def api_runs():
             "run_id": r.run_id,
             "created": r.created,
             "status": r.status,
+            # What it is doing right now. Without it a run that is working and
+            # a run that died look identical for minutes at a time.
+            "progress": r.progress,
+            "silent_for": round(r.silent_for),
+            "backend": r.backend,
+            "remote_error": r.remote_error,
             "task_id": r.task_id,
             "watchlist": r.watchlist,
             "horizon": r.horizon,

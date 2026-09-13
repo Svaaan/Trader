@@ -192,7 +192,8 @@ def _portfolio(positions: pd.DataFrame, returns: pd.DataFrame,
     return net, gross, turnover, changes
 
 
-def _effective_rows(correct: np.ndarray, dates, symbols) -> tuple:
+def _effective_rows(correct: np.ndarray, dates, symbols,
+                   horizon: int = 1) -> tuple:
     """How many independent observations 4,000 correlated rows are really worth.
 
     Ten symbols on the same day are not ten independent verdicts on the model.
@@ -231,35 +232,93 @@ def _effective_rows(correct: np.ndarray, dates, symbols) -> tuple:
     # which would be claiming the panel carries more information than it has.
     design = max(1.0 + (width - 1.0) * max(rho, 0.0), 1.0)
 
+    # And the rows are not independent across time either, once labels overlap.
+    # The two corrections multiply: the cross-sectional one is already inside
+    # the variance of the daily mean, and the ratio below is only what
+    # consecutive days add to it. On noise with sticky positions the accuracy
+    # hurdle fell to chance in 44% of runs at h=5 and 72% at h=20 without this,
+    # and 19% and 26% with it -- against 16% at h=1, where there is no overlap
+    # and the remainder is a different problem (the baseline is measured on the
+    # same noisy rows, and the standard error in explain.trust ignores that).
+    design *= _overlap(panel.mean(axis=1), horizon)
+
     return int(round(rows / design)), design, rho
 
 
-def _drawdown(daily: pd.Series) -> float:
-    """Worst peak-to-trough fall of the compounded series."""
+def _overlap(series, horizon: int = 1) -> float:
+    """How much overlapping holding windows inflate the variance of a mean.
+
+    At a horizon of h sessions, consecutive rows share h - 1 days of the same
+    move, so a position that persists -- and a real model's positions do, because
+    the features behind them change slowly -- is graded on nearly the same return
+    again and again. Counting those as independent observations is the error.
+    Measured on pure noise with positions as sticky as a real model's, a
+    t-statistic of 2 was cleared in 39% of runs at h=5 and 53% at h=20, against
+    the 5% it promises. At h=1 there is nothing to overlap and it held at 5%.
+
+    Returned as long-run variance over plain variance, with autocovariances up to
+    lag h - 1 at equal weight (Hansen-Hodrick). Overlap produces exactly that
+    moving-average structure, and on the same test equal weights came back to
+    3%, 4% and 8%, where the tapering weights of Newey-West stayed at 7% and 10%.
+    Floored at one: equal weights can dip below it on a short series, and a
+    correction claiming overlap had added information would be worse than none.
+    """
+    values = np.asarray(series, dtype=np.float64).ravel()
+    values = values[np.isfinite(values)]
+    lags = min(int(horizon) - 1, len(values) - 2)
+    if lags < 1:
+        return 1.0
+
+    centred = values - values.mean()
+    plain = float(centred @ centred)
+    if plain <= 0.0:
+        return 1.0
+
+    shared = sum(float(centred[k:] @ centred[:-k]) for k in range(1, lags + 1))
+    return max((plain + 2.0 * shared) / plain, 1.0)
+
+
+def _drawdown(daily: pd.Series, horizon: int = 1) -> float:
+    """Worst peak-to-trough fall of the compounded series.
+
+    Past one session the rows overlap, and compounding them compounds the same
+    days h times over. Every h-th row is a book that rebalances every h
+    sessions, which is an account that could exist.
+    """
+    daily = daily.iloc[::max(int(horizon), 1)]
     if daily.empty:
         return 0.0
     equity = (1.0 + daily).cumprod()
     return float((equity / equity.cummax() - 1.0).min())
 
 
-def _sharpe(daily: pd.Series) -> float:
+def _sharpe(daily: pd.Series, horizon: int = 1) -> float:
+    """Annualised. A row holds h sessions, so a year is 252 / h of them, not 252.
+
+    Annualising h-session returns as though they were daily inflates the ratio
+    by the square root of h, which at a twenty-day horizon is a factor of 4.5 --
+    and a search that varies the horizon would climb straight up that slope.
+    """
     spread = float(daily.std())
     if not spread or math.isnan(spread):
         return 0.0
-    return float(daily.mean() / spread * math.sqrt(TRADING_DAYS))
+    return float(daily.mean() / spread
+                 * math.sqrt(TRADING_DAYS / max(int(horizon), 1)))
 
 
-def _tstat(daily: pd.Series) -> float:
+def _tstat(daily: pd.Series, horizon: int = 1) -> float:
     spread = float(daily.std())
     if not spread or math.isnan(spread) or len(daily) < 2:
         return 0.0
-    return float(daily.mean() / (spread / math.sqrt(len(daily))))
+    naive = daily.mean() / (spread / math.sqrt(len(daily)))
+    return float(naive / math.sqrt(_overlap(daily, horizon)))
 
 
 def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
              executable_returns=None,
              train_up_share: float | None = None,
-             cost: float = DEFAULT_COST) -> Evaluation:
+             cost: float = DEFAULT_COST,
+             horizon: int = 1) -> Evaluation:
     """Score predictions against what actually happened next.
 
     `probabilities` is P(up) per row; `actual` the realised 1/0 label;
@@ -272,7 +331,13 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
     held. Pass it. Without it the executable figures fall back to the graded
     ones, which is the assumption that a close-to-close backtest is tradeable --
     the assumption this argument exists to stop anybody making silently.
+
+    `horizon` is how many sessions each row holds. Pass it whenever it is not
+    one: past one session the rows overlap, and every figure that treats them as
+    a daily series -- Sharpe, t-statistic, drawdown, effective rows -- reads high
+    by up to the square root of it if it is left out.
     """
+    horizon = max(int(horizon), 1)
     probabilities = np.asarray(probabilities, dtype=np.float64).ravel()
     actual = np.asarray(actual).ravel()
     forward_returns = np.asarray(forward_returns, dtype=np.float64).ravel()
@@ -325,8 +390,9 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
                                                columns=positions.columns)
         executable_net, _, _, _ = _portfolio(positions, reachable, cost)
 
-    cost_drag = float((1.0 + gross.mean()) ** TRADING_DAYS
-                      - (1.0 + net.mean()) ** TRADING_DAYS)
+    periods = TRADING_DAYS / horizon
+    cost_drag = float((1.0 + gross.mean()) ** periods
+                      - (1.0 + net.mean()) ** periods)
 
     # Per-row cost charged on that symbol's own change in position, for the
     # same reason the headline is: a flat charge per row bills a position that
@@ -353,13 +419,15 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
         if series.empty:
             return 0.0
         total = float((1.0 + series).prod())
-        years = len(series) / TRADING_DAYS
+        # Overlapping h-session rows compound each day h times, so n of them
+        # carry n * h sessions of growth, not n.
+        years = len(series) * horizon / TRADING_DAYS
         return float(total ** (1.0 / years) - 1.0) if years > 0 else 0.0
 
-    effective, design, rho = _effective_rows(correct, dates, symbols)
+    effective, design, rho = _effective_rows(correct, dates, symbols, horizon)
 
-    graded_sharpe = _sharpe(net)
-    reachable_sharpe = _sharpe(executable_net)
+    graded_sharpe = _sharpe(net, horizon)
+    reachable_sharpe = _sharpe(executable_net, horizon)
 
     return Evaluation(
         rows=len(probabilities),
@@ -375,23 +443,23 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
         edge=round(accuracy - baseline, 4),
         up_rate=round(float(predicted.mean()), 4),
         by_confidence=buckets,
-        strategy_daily=round(float(net.mean()), 6),
+        strategy_daily=round(float(net.mean()) / horizon, 6),
         strategy_annualised=round(annualise(net), 4),
-        strategy_sharpe=round(_sharpe(net), 3),
-        strategy_tstat=round(_tstat(net), 3),
-        strategy_max_drawdown=round(_drawdown(net), 4),
-        hold_daily=round(float(hold.mean()), 6),
+        strategy_sharpe=round(graded_sharpe, 3),
+        strategy_tstat=round(_tstat(net, horizon), 3),
+        strategy_max_drawdown=round(_drawdown(net, horizon), 4),
+        hold_daily=round(float(hold.mean()) / horizon, 6),
         hold_annualised=round(annualise(hold), 4),
-        hold_sharpe=round(_sharpe(hold), 3),
+        hold_sharpe=round(_sharpe(hold, horizon), 3),
         turnover_daily=round(float(turnover.mean()), 4),
         position_changes=changes,
         cost_per_trade=cost,
         cost_drag_annualised=round(cost_drag, 4),
-        executable_daily=round(float(executable_net.mean()), 6),
+        executable_daily=round(float(executable_net.mean()) / horizon, 6),
         executable_annualised=round(annualise(executable_net), 4),
         executable_sharpe=round(reachable_sharpe, 3),
-        executable_tstat=round(_tstat(executable_net), 3),
-        executable_max_drawdown=round(_drawdown(executable_net), 4),
+        executable_tstat=round(_tstat(executable_net, horizon), 3),
+        executable_max_drawdown=round(_drawdown(executable_net, horizon), 4),
         execution_gap=round(graded_sharpe - reachable_sharpe, 3),
     )
 

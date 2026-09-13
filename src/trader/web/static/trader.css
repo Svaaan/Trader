@@ -635,3 +635,41 @@ main {
 /* A stale signal is the one failure a daily tool cannot afford to state
    quietly, so the date stops being a label and becomes a warning. */
 .call-asof.is-stale { color: var(--warn); font-weight: 600; }
+
+/* --- the paper record ------------------------------------------------------
+
+   Drawn deliberately plainly. This page spends most of its words telling you
+   not to read too much into a short record, and a page that looked like a
+   trading terminal would undo that before anybody got to the text. */
+
+.verdict.is-thin {
+  color: var(--text-muted);
+  border-left: 3px solid var(--warn);
+  padding-left: 12px;
+}
+
+.sparkline {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 120px;
+  margin: 18px 0 6px;
+  padding: 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+.spark {
+  flex: 1 1 auto;
+  min-width: 2px;
+  background: var(--up);
+  border-radius: 1px 1px 0 0;
+  opacity: 0.8;
+}
+
+.spark.is-down { background: var(--down); }
+.spark:hover { opacity: 1; }
+
+.table tr.is-ok td:first-child { color: var(--up); }
+.table tr.is-bad td:first-child { color: var(--down); }

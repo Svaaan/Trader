@@ -125,6 +125,10 @@ class Split:
     # than instead of it, because the pair is what says whether the strategy
     # exists. See labels.executable_return.
     executable_returns_test: np.ndarray
+    # Sessions each row holds. Carried by the data rather than passed alongside
+    # it, because every statistic past one session has to know, and a keyword
+    # threaded through six call sites is a keyword one of them forgets.
+    horizon: int = 1
 
     @property
     def rows(self) -> int:
@@ -307,7 +311,7 @@ def choose_cut_date(assembled: dict, label_frame: pd.DataFrame, *,
 def build_one(symbol: str, frame: pd.DataFrame, label: pd.Series,
               graded: pd.Series, executable: pd.Series, *,
               cut_date: pd.Timestamp, feature_names: Sequence[str],
-              embargo: int = 1) -> Split:
+              embargo: int = 1, horizon: int = 1) -> Split:
     """Features, labels and a chronological split for a single symbol.
 
     Two return series, not one: what the label describes (close to close) and
@@ -346,6 +350,7 @@ def build_one(symbol: str, frame: pd.DataFrame, label: pd.Series,
         train_dates=dates[:train_end], test_dates=dates[cut:],
         forward_returns_test=returns[cut:],
         executable_returns_test=reachable[cut:],
+        horizon=horizon,
     )
 
 
@@ -409,7 +414,7 @@ def split_at(prepared: Prepared, cut_date: pd.Timestamp) -> tuple[list, dict]:
                 symbol, assembled[symbol], label_frame[symbol],
                 graded_frame[symbol], executable_frame[symbol],
                 cut_date=cut_date, feature_names=feature_names,
-                embargo=spec.embargo))
+                embargo=spec.embargo, horizon=spec.horizon))
         except ValueError as exc:
             # Left out rather than split somewhere else, which would put it back
             # in the overlap the single cut date exists to prevent. Named, so
@@ -508,6 +513,7 @@ class TestSet:
     executable: np.ndarray          # open(t+1) -> close(t+h), what can be held
     dates: pd.DatetimeIndex
     symbols: np.ndarray
+    horizon: int = 1                # sessions each row holds; evaluate needs it
 
     def __len__(self) -> int:
         return len(self.y)
@@ -527,6 +533,10 @@ def test_matrix(splits: Sequence[Split], scaler: Scaler) -> TestSet:
     dates = np.concatenate([s.test_dates.values for s in splits])
     symbols = np.concatenate([np.full(len(s.y_test), s.symbol) for s in splits])
 
+    horizons = {s.horizon for s in splits}
+    if len(horizons) != 1:
+        raise ValueError(f"splits disagree about their horizon: {sorted(horizons)}")
+
     order = np.argsort(dates, kind="stable")
     return TestSet(
         x=scaler.apply(x[order]).astype(np.float32),
@@ -535,6 +545,7 @@ def test_matrix(splits: Sequence[Split], scaler: Scaler) -> TestSet:
         executable=reachable[order],
         dates=pd.DatetimeIndex(dates[order]),
         symbols=symbols[order],
+        horizon=horizons.pop(),
     )
 
 

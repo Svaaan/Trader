@@ -20,6 +20,7 @@ cp env/.env.example env/.env      # then put a submitter key in it
 
 python train.py                   # train here AND on HelloWorldAi, then compare
 python train.py --backend local   # here only: ~30s, no network, no key needed
+python search.py run --horizon 1,5   # try configurations; the test set stays sealed
 python run.py                     # the UI, on http://127.0.0.1:8600
 python watch.py --news            # collect finished models, grow the news store
 ```
@@ -117,6 +118,60 @@ Both series are demeaned the same way for a relative target, so the comparison
 between them is a comparison of windows and not of conventions. Old runs without
 the field fall back to the graded number, which is the optimistic assumption
 this argument exists to stop anybody making silently.
+
+---
+
+## The paper ledger: the one measurement that cannot be mined
+
+`/pnl` is a forward paper account — $500, filled at the first open after each
+signal, closed at that session's close, 5bp charged each way. No orders are
+placed and no broker is involved.
+
+Everything else in this project is a backtest, and a backtest can be mined. This
+cannot, because when each line is written **the outcome has not happened yet**.
+That one property is worth more than any amount of careful splitting.
+
+It is also fragile in exactly one way, so there is a rule:
+
+> **The model never reads the ledger.** It is a scorecard, never an input.
+
+A system that tunes itself on its own paper results turns the only un-mineable
+measurement in the project into another training set — and you would spend
+months of calendar time producing a number with the same flaw as the backtest,
+except now you would believe it more because it came from "live" trading.
+`dataset.py`, `features.py` and `labels.py` cannot import `paper.py`, and there
+is a test that fails if they ever do.
+
+What the system *may* do with its own results is **notice**: `divergence()`
+compares the live Sharpe against what the backtest predicted and says whether
+they have come apart, in standard errors. That is the honest version of "self
+improving" — it tells you the model has stopped working, which is the thing
+worth knowing, without letting it fit to the answer.
+
+### Why it does not back its best five ideas
+
+The obvious design — pick the most confident names and concentrate — was
+measured on this panel, and it is backwards:
+
+| top N | positions/day | close→close | | **open→close (real)** | |
+|---|---|---|---|---|---|
+| | | ann | Sharpe | **ann** | **Sharpe** |
+| 1 | 2 | **+40.9%** | 1.13 | **−7.2%** | −0.15 |
+| 5 | 10 | +26.0% | 1.38 | **−7.3%** | −0.48 |
+| 10 | 20 | +30.6% | 1.94 | −1.2% | −0.05 |
+| 119 | 238 | +17.0% | 2.98 | **+5.1%** | **1.14** |
+
+Backing the top 5 shows **+26% a year** close-to-close and **−7.3%** over the
+window an order can reach. The most confident calls are precisely the ones whose
+edge sits in the overnight gap, so concentrating on them concentrates on the
+part that is already gone by the open. Sharpe climbs monotonically with breadth
+in *both* columns.
+
+So `top_n` defaults to None — the whole book — and setting it is a decision the
+P&L page will then show you the consequences of.
+
+The ledger records even while the gate is shut, marked `shadow`. A forward
+record of a model with no edge is exactly how you learn it still has none.
 
 ---
 
@@ -494,6 +549,75 @@ I checked the gate rather than trusting it: 2,000 Monte Carlo trials of
 skill-less models at up-rates from 0.50 to 0.995 opened it in 0.0–0.1% of cases.
 The conservatism comes from the majority-class baseline being genuinely hard to
 beat — a varying no-skill model loses to it by about 1.6 points on average.
+That check was run at a one-day horizon, and it did not cover longer ones —
+which is where the next section found a hole.
+
+---
+
+## Searching without spending the test set
+
+A model trains in seconds now, so trying three hundred configurations is an
+afternoon. What that afternoon spends is not compute, it is the test set: every
+configuration scored against it is another question asked of the same rows, and
+the best of three hundred answers is mostly the luckiest.
+
+```bash
+python search.py run --macro on,off --horizon 1,5,20 --note "does macro help at longer holds"
+python search.py board                       # leaders on validation, and the bar they must clear
+python search.py commit 7 --why "best validation Sharpe; simplest of the top three"
+python search.py open                        # the sealed period, once
+```
+
+The panel is cut in three. The last 20% is sealed; of what is left, the last
+20% is validation. `run` fits on the first part and scores on validation, with
+the sealed rows truncated out before any model sees them — the search cannot
+reach them by construction, and a test checks that. Every trial is appended to
+`data/search/trials.jsonl`, and only validation numbers are ever written there.
+
+`open` refuses until one configuration has been **committed in writing, with a
+reason**. Deciding before looking is the difference between a test and a
+search. A second opening is allowed — forbidding it would just mean deleting a
+file — but it needs `--again`, it is counted, and the reading says plainly that
+it is no longer a test.
+
+**The trial count sets the bar.** Looking `n` times and keeping the best means
+at least one false pass with probability 1 − 0.95ⁿ: 19% at four trials, 99% by
+ninety. `board` and `open` both apply a Šidák correction and print what an edge
+has to clear given how many times you have looked, sized by effective rows
+rather than raw ones.
+
+### The first dry run, and the bug it found
+
+Four configurations on the ten-symbol core panel, in a throwaway ledger. The
+winner — macro on, five-day horizon — scored **+2.5 points of edge, Sharpe
++2.52, t +3.05** on validation, and the board said it had earned a commit. On
+the sealed period it scored **+0.13 points** and a negative Sharpe. Four tries
+had been enough to find noise dressed as a strategy.
+
+That was the seal doing its job. But a validation t of 3 on a signal that
+vanished was worth explaining, and the explanation was not luck alone.
+
+**Every statistic treated overlapping holding windows as independent days.** At
+a five-day horizon, consecutive rows share four days of the same move, and a
+real model's positions persist because the features behind them change slowly —
+so it is graded on nearly the same return again and again. Measured on pure
+noise with sticky positions, a model with no skill at all cleared t = 2 in
+**36% of runs at five days and 56% at twenty**, against the 5% the threshold
+promises. At one day it held at 5%, which is why nothing before had caught it.
+Sharpe was separately annualised as though a five-day return were a daily one,
+inflating it by √5. A search that varies the horizon would have climbed that
+slope and called it a finding.
+
+Now the rows carry their horizon (`Split.horizon`, set once from the spec), and
+`evaluate` uses it: Sharpe is annualised over 252 / h periods, the t-statistic
+and effective rows are corrected for overlap with Hansen–Hodrick long-run
+variance at lag h − 1, and drawdown compounds a book that actually rebalances
+every h sessions. The same noise test now gives **6.7% at five days and 6.3% at
+twenty**. At one day every number is identical to before.
+
+Rerun with the fix, the same winner reads Sharpe +1.13 and t +2.11, the
+accuracy bar rises from +2.07 to +2.88 points, and **the board rejects it
+before the test set is opened** — which is the order this is meant to happen in.
 
 ---
 
@@ -584,8 +708,9 @@ helloworld.py upload -> submit -> poll -> download
    |
 model.py      numpy forward pass; no torch, no GPU, no black box
 evaluate.py   accuracy vs a training-period baseline, turnover-based costs,
-   |          Sharpe, t, drawdown, effective sample size
-explain.py    the five-hurdle gate, and per-day attribution underneath it
+   |          Sharpe, t, drawdown, effective sample size -- all horizon-aware
+explain.py    the six-hurdle gate, and per-day attribution underneath it
+search.py     train / validation / sealed test, a trial ledger, commit-then-open
 context.py    prose and citations, downstream of everything, gated
 web/          the UI; watch.py does the collecting unattended
 ```
@@ -611,6 +736,19 @@ universe is wide enough for the groups to be large.
 survives every statistical test in the project and still loses money after
 costs. Nothing here is tradeable; that is the finding, not a caveat.
 
+**The accuracy hurdle is still slightly generous.** Its standard error counts
+the noise in the accuracy but not in the baseline, which is measured on the same
+test rows. In the noise tests above, a skill-less model at one day cleared the
+accuracy check several times more often than the roughly 2% that two standard
+errors, one-sided, should allow.
+The other hurdles — noise floor, walk-forward agreement, return t-statistic —
+still stand behind it, which is why it has never opened the gate, but it is not
+the bar it claims to be.
+
+**Costs past one session are approximate.** Turnover is still charged day to
+day on overlapping positions, where a book that rebalances every h sessions
+would trade less often and by more each time.
+
 **Only the local controls have been run at width.** The numbers above come from
 the logistic and MLP controls on 238 symbols. No HelloWorldAi model has yet been
 trained on a panel that size — the step count that panel earns is about twenty
@@ -624,7 +762,7 @@ times the old default, which is a real request of somebody else's GPU.
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-144 tests. The look-ahead ones test the property rather than the implementation
+204 tests. The look-ahead ones test the property rather than the implementation
 — features computed on a truncated history must match the full one — and there
 is a test that deliberately introduces a centred rolling window to confirm the
 property test can still fail. The macro, cross-sectional and event blocks each
@@ -636,5 +774,7 @@ Several are regression tests for the bugs listed above: the pinned cut date, the
 RSI warm-up, per-trade costs, the withheld small-bucket accuracy, the
 training-period baseline, the append-only news store, the noise floor, and the
 sigmoid-to-softmax conversion that would have sharpened every probability by up
-to 0.14 without raising anything, and the executable return that turns an
-untradeable backtest into the number the gate reads.
+to 0.14 without raising anything, the executable return that turns an
+untradeable backtest into the number the gate reads, and the overlap correction
+— which checks both that a skill-less model at five days used to clear t = 2
+more than a quarter of the time, and that it no longer does.

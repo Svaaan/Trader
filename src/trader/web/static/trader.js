@@ -42,6 +42,22 @@ function statusPill(status) {
   return el("span", `pill ${tone}`, label);
 }
 
+function progressLine(run) {
+  // A run spends minutes between the numbers being requested and the numbers
+  // existing. Saying what it is doing is the difference between waiting and
+  // wondering whether it has died.
+  if (!run.progress || run.status === "done" || run.status === "failed") {
+    return null;
+  }
+  const silent = run.silent_for || 0;
+  const line = el("p", silent > 300 ? "note is-bad" : "note",
+    silent > 300
+      ? `${run.progress} — nothing for ${Math.round(silent / 60)} minutes, `
+        + "which usually means the process running it is gone"
+      : run.progress + "…");
+  return line;
+}
+
 function figure(label, value, hint) {
   const box = el("div", "figure");
   box.appendChild(el("div", "figure-label", label));
@@ -276,6 +292,17 @@ function runCard(run) {
 
   if (run.error) {
     card.appendChild(el("p", "error", run.error));
+  }
+
+  const progress = progressLine(run);
+  if (progress) card.appendChild(progress);
+
+  // A `both` run whose remote half could not be reached still has a local
+  // model and is worth reading; the reason the other half is missing belongs
+  // on the card rather than only in a log nobody opens.
+  if (run.remote_error) {
+    card.appendChild(el("p", "warn",
+      `Trained here only — HelloWorldAi was not reachable: ${run.remote_error}`));
   }
 
   [datasetPanel(run), verificationPanel(run), evaluationPanel(run),

@@ -441,3 +441,114 @@ def test_nothing_is_uploaded_when_no_node_is_alive(runs_dir, panel_prices,
                    client=client, run_controls=False)
 
     assert client.uploaded is None, "pushed a dataset at a network with no nodes"
+
+
+# --- saying what it is doing, and admitting when it stopped -----------------
+
+def test_a_run_reports_progress_before_it_has_any_numbers(runs_dir,
+                                                          panel_prices,
+                                                          offline_spec,
+                                                          monkeypatch):
+    """The page used to show four zeros for five minutes.
+
+    `run.json` was written once at creation and then not again until the
+    controls had finished, so a working run and a dead one looked identical.
+    """
+    seen = []
+    real_save = pipeline.Run.save
+
+    def watching(self, progress=None):
+        if progress:
+            seen.append((progress, (self.dataset or {}).get("train", {}).get("rows")))
+        return real_save(self, progress)
+
+    monkeypatch.setattr(pipeline.Run, "save", watching)
+    pipeline.start(list(panel_prices), spec=offline_spec, backend="local",
+                   client=StubClient(), run_controls=False)
+
+    stages = [p for p, _ in seen]
+    assert any("fetching prices" in s for s in stages)
+    assert any("building features" in s for s in stages)
+    assert any("training rows" in s for s in stages)
+    assert any("training here" in s for s in stages)
+    # And the row count is known before the last stage, not only at the end.
+    rows_at = [rows for p, rows in seen if "training rows" in p]
+    assert rows_at and rows_at[0]
+
+
+def test_every_save_stamps_a_heartbeat(runs_dir, panel_prices, offline_spec):
+    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="local",
+                         client=StubClient(), run_controls=False)
+    assert run.heartbeat
+    assert run.silent_for < 60
+
+
+def test_an_abandoned_run_is_marked_failed(runs_dir):
+    """Kill the process mid-run and the run used to say "Building dataset"
+    forever -- `collect` skips it because it has no task id to poll."""
+    import datetime as dt
+
+    stale = dt.datetime.now(dt.timezone.utc) - dt.timedelta(
+        seconds=pipeline.STALE_RUN_SECONDS + 120)
+    directory = os.path.join(str(runs_dir), "20260101-000000")
+    os.makedirs(directory)
+    with open(os.path.join(directory, pipeline.STATE_FILE), "w",
+              encoding="utf-8") as handle:
+        json.dump({"run_id": "20260101-000000", "created": "2026-01-01T00:00:00",
+                   "watchlist": ["AAA"], "horizon": 1, "status": "building",
+                   "progress": "building features for 238 symbols",
+                   "heartbeat": stale.isoformat(timespec="seconds")}, handle)
+
+    run = pipeline.list_runs()[0]
+    assert run.status == "failed"
+    assert "Abandoned" in run.error
+    assert "building features" in run.error
+    # And it stays failed across a reload rather than being re-judged.
+    assert pipeline.Run.load("20260101-000000").status == "failed"
+
+
+def test_a_run_that_is_still_working_is_left_alone(runs_dir):
+    import datetime as dt
+
+    recent = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=30)
+    directory = os.path.join(str(runs_dir), "20260101-000001")
+    os.makedirs(directory)
+    with open(os.path.join(directory, pipeline.STATE_FILE), "w",
+              encoding="utf-8") as handle:
+        json.dump({"run_id": "20260101-000001", "created": "2026-01-01T00:00:00",
+                   "watchlist": ["AAA"], "horizon": 1, "status": "building",
+                   "heartbeat": recent.isoformat(timespec="seconds")}, handle)
+
+    assert pipeline.list_runs()[0].status == "building"
+
+
+def test_a_submitted_run_is_never_reconciled_away(runs_dir):
+    """It has a job on somebody else's machine; only `collect` decides."""
+    import datetime as dt
+
+    stale = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)
+    directory = os.path.join(str(runs_dir), "20260101-000002")
+    os.makedirs(directory)
+    with open(os.path.join(directory, pipeline.STATE_FILE), "w",
+              encoding="utf-8") as handle:
+        json.dump({"run_id": "20260101-000002", "created": "2026-01-01T00:00:00",
+                   "watchlist": ["AAA"], "horizon": 1, "status": "training",
+                   "task_id": "task-abc",
+                   "heartbeat": stale.isoformat(timespec="seconds")}, handle)
+
+    assert pipeline.list_runs()[0].status == "training"
+
+
+def test_the_app_loads_its_own_environment():
+    """Started through uvicorn directly, the page could not reach HelloWorldAi.
+
+    `run.py` read env/.env; a launch config running `uvicorn trader.web.app:app`
+    did not, so every run started from the button failed with "No submitter
+    key" while the identical run from the command line worked.
+    """
+    import importlib
+
+    import trader.web.app as web_app
+
+    source = importlib.resources.files  # noqa: F841  (import guard only)
+    assert "load_dotenv" in open(web_app.__file__, encoding="utf-8").read()

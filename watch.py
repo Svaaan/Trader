@@ -83,6 +83,24 @@ def collect_models() -> int:
     return finished
 
 
+def settle_paper() -> None:
+    """Fill any paper entry whose session has now happened.
+
+    On the same timer as everything else. The ledger records an intent in the
+    evening and the price it is filled at does not exist until the next open,
+    so something has to come back later and close the loop.
+    """
+    try:
+        result = pipeline.settle_paper()
+    except Exception:                               # noqa: BLE001
+        logger.exception("paper settlement failed, continuing")
+        return
+
+    if result.get("settled"):
+        logger.info("paper: settled %d day(s), %d still pending",
+                    result["settled"], result.get("pending", 0))
+
+
 def collect_news() -> None:
     """One append-only pass over the store."""
     try:
@@ -100,8 +118,11 @@ def collect_news() -> None:
         logger.debug("news: nothing new (%d stored)", state["items"])
 
 
-def one_pass(*, models: bool = True, news: bool = False) -> int:
+def one_pass(*, models: bool = True, news: bool = False,
+             paper: bool = True) -> int:
     finished = collect_models() if models else 0
+    if paper:
+        settle_paper()
     if news:
         collect_news()
     return finished
@@ -117,6 +138,8 @@ def main() -> int:
                         help="also append to the point-in-time news store")
     parser.add_argument("--news-only", action="store_true",
                         help="only the news store; no coordinator calls")
+    parser.add_argument("--no-paper", action="store_true",
+                        help="skip settling the paper ledger")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -129,7 +152,7 @@ def main() -> int:
     news = args.news or args.news_only
 
     if args.once:
-        one_pass(models=models, news=news)
+        one_pass(models=models, news=news, paper=not args.no_paper)
         return 0
 
     what = " and ".join(filter(None, ["finished models" if models else "",
@@ -138,7 +161,7 @@ def main() -> int:
     try:
         while True:
             try:
-                one_pass(models=models, news=news)
+                one_pass(models=models, news=news, paper=not args.no_paper)
             except Exception:                       # noqa: BLE001
                 # A network blip should not end the watch; the next pass will
                 # pick up whatever this one missed.

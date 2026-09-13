@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Trader — P&amp;L</title>
+    <link rel="stylesheet" href="/static/trader.css?v={{ v }}">
+</head>
+
+<body>
+    <header class="top">
+        <div class="brand">Trader</div>
+        <nav class="nav">
+            <a href="/">Runs</a>
+            <a href="/pnl" class="is-here">P&amp;L</a>
+            <a href="/analysis">Analysis</a>
+        </nav>
+        <div class="top-right">
+            <button type="button" class="btn" id="settle">Settle what has happened</button>
+        </div>
+    </header>
+
+    <main>
+        <section class="intro">
+            <h1>What it would have done</h1>
+            <p>
+                A paper account, filled at the first open after each signal and
+                closed at that session's close. No orders are placed anywhere and
+                no broker is involved — this is a record, not a trade.
+            </p>
+            <p class="caveat">
+                This is the only measurement here that <strong>cannot be
+                mined</strong>: when each line was written the outcome had not
+                happened yet. That is worth more than any backtest, and it is
+                fragile in exactly one way — so the model never reads this
+                ledger. It is a scorecard, never an input. The moment a system
+                tunes itself on its own paper results, they stop being a forward
+                test and become another training set.
+            </p>
+        </section>
+
+        <div id="pnl">
+            <p class="empty">Loading…</p>
+        </div>
+    </main>
+
+    <script src="/static/pnl.js?v={{ v }}"></script>
+</body>
+
+</html>

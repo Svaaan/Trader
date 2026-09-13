@@ -48,6 +48,7 @@ from . import features as features_mod
 from . import labels as labels_mod
 from . import model as model_mod
 from . import news as news_mod
+from . import paper as paper_mod
 from . import prices as prices_mod
 from . import trainer as trainer_mod
 from . import universe as universe_mod
@@ -158,17 +159,49 @@ class Run:
     # Why the remote half did not happen, when the local half still did. Kept
     # separate from `error`, which means the whole run failed.
     remote_error: str = ""
+    # What it is doing right now, and when it last said so. A run used to save
+    # once at creation and then not again until the controls had finished, so
+    # for five minutes the page showed "Building dataset" over four zeros --
+    # indistinguishable from a process that had died. Both fields are written
+    # at every stage; `heartbeat` is also what tells a later reader that a run
+    # is genuinely working rather than abandoned.
+    progress: str = ""
+    heartbeat: str = ""
     verdict: str = ""
     signals: list = dataclasses.field(default_factory=list)
     trust: dict = dataclasses.field(default_factory=dict)
     learnt: list = dataclasses.field(default_factory=list)
     error: str = ""
 
-    def save(self) -> None:
+    def save(self, progress: str | None = None) -> None:
+        """Write the run to disk, stamping what it is doing and when.
+
+        Called at every stage rather than only at the end. The cost is a few
+        kilobytes; the benefit is that the page can show what is happening and
+        that an abandoned run can be told from a working one.
+        """
+        if progress is not None:
+            self.progress = progress
+        self.heartbeat = dt.datetime.now(dt.timezone.utc).isoformat(
+            timespec="seconds")
+
         directory = _run_dir(self.run_id)
         os.makedirs(directory, exist_ok=True)
         with open(os.path.join(directory, STATE_FILE), "w", encoding="utf-8") as fh:
             json.dump(dataclasses.asdict(self), fh, indent=2)
+
+    @property
+    def silent_for(self) -> float:
+        """Seconds since this run last said anything, or 0 if it never did."""
+        if not self.heartbeat:
+            return 0.0
+        try:
+            last = dt.datetime.fromisoformat(self.heartbeat)
+        except ValueError:
+            return 0.0
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=dt.timezone.utc)
+        return (dt.datetime.now(dt.timezone.utc) - last).total_seconds()
 
     @classmethod
     def load(cls, run_id: str) -> "Run":
@@ -211,6 +244,45 @@ class Run:
         return pd.Timestamp(raw) if raw else None
 
 
+# How long a run may go without saying anything before it is presumed dead.
+# Every stage of `start` stamps a heartbeat, and the longest single stage -- the
+# walk-forward on a wide panel -- is about four minutes, so fifteen is generous
+# enough never to condemn a working run and short enough to clear the list.
+STALE_RUN_SECONDS = 15 * 60
+
+
+def reconcile(runs: list) -> list:
+    """Mark abandoned runs as failed instead of leaving them mid-sentence.
+
+    A run whose process was killed -- the server restarted, the machine slept,
+    a Ctrl-C during the panel build -- keeps whatever status it had written
+    last, and `collect` will not touch it because it has no task id to poll. So
+    it sits in the list saying "Building dataset" forever, indistinguishable
+    from one that is genuinely working. Measured: restarting the preview server
+    mid-run left exactly that, permanently.
+
+    Only runs with no task id are reconciled here. One that reached HelloWorldAi
+    has a job that may well outlive this process, and `collect` is what decides
+    its fate.
+    """
+    for run in runs:
+        if run.status in ("done", "failed") or run.task_id:
+            continue
+        if run.silent_for <= STALE_RUN_SECONDS:
+            continue
+
+        run.status = "failed"
+        run.error = (
+            f"Abandoned. Nothing was written for "
+            f"{run.silent_for / 60:.0f} minutes while it was "
+            f"{run.progress or 'starting'}, so the process that was running it "
+            f"is gone. Nothing was submitted anywhere; start another.")
+        logger.warning("Run %s looks abandoned; marking it failed", run.run_id)
+        run.save()
+
+    return runs
+
+
 def list_runs() -> list:
     """Newest first. A directory that will not parse is skipped, not fatal."""
     root = _runs_root()
@@ -223,7 +295,8 @@ def list_runs() -> list:
             runs.append(Run.load(name))
         except Exception as exc:                        # noqa: BLE001
             logger.warning("Ignoring unreadable run %s: %s", name, exc)
-    return runs
+
+    return reconcile(runs)
 
 
 # --- sending ---------------------------------------------------------------
@@ -278,19 +351,23 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
               created=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
               watchlist=symbols, horizon=horizon, spec=spec.to_dict(),
               backend=backend)
-    run.save()
+    run.save(f"queued: {len(symbols)} symbols")
 
     try:
+        run.save(f"fetching prices for {len(symbols)} symbols")
         frames = prices_mod.load_many(symbols, period=period)
         if not frames:
             raise ValueError("no price history could be fetched for any symbol")
 
+        run.save(f"building features for {len(frames)} symbols")
         splits, cut, report = dataset_mod.build_panel(frames, spec)
         x_train, y_train, scaler = dataset_mod.combine(
             splits, report["feature_names"])
 
         description = dataset_mod.describe(splits, scaler, spec, report, cut)
         run.dataset = description
+        # The row counts exist now, so the page can stop showing zeros.
+        run.save(f"{len(splits)} symbols, {len(y_train):,} training rows")
 
         # Now that the rows exist, work out how much training they deserve.
         training_steps = steps if steps is not None else steps_for(len(y_train))
@@ -305,12 +382,14 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
         # place to discover that the step count is wrong for the panel size.
         if run_controls:
             try:
+                run.save("running the controls (majority, logistic, MLP)")
                 run.controls = baseline_mod.run_controls(
                     splits, report["feature_names"], hidden=64, depth=2,
                     steps=training_steps, batch=BATCH_SIZE)
+                run.save(f"walking forward over {folds} windows")
                 run.walk_forward = baseline_mod.walk_forward(
                     frames, spec, folds=folds)
-                run.save()
+                run.save("controls done")
             except Exception as exc:                    # noqa: BLE001
                 logger.warning("Controls failed, continuing: %s", exc)
                 run.controls = {"error": str(exc)}
@@ -327,6 +406,7 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
         # hour the remote job spends queued, and means a broken round trip is
         # visible as a gap rather than as an absence.
         if run.wants_local:
+            run.save(f"training here: {training_steps:,} steps at most")
             bundle = trainer_mod.train_local(
                 x_train, y_train, report["feature_names"], hyper)
             with open(run.local_bundle_path, "wb") as handle:
@@ -344,6 +424,7 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
         submitted = False
         if run.wants_remote:
             try:
+                run.save("looking for a live HelloWorldAi node")
                 # Ask before uploading. The dataset is eighty megabytes on a
                 # wide panel, and pushing it to a coordinator with nothing
                 # behind it wastes the upload and the time.
@@ -389,9 +470,13 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
             # Score the local model now. When a remote job is queued this is
             # what makes the page readable during the wait; when the remote
             # half failed or was not asked for, it is the run.
+            run.save("scoring out of time")
             _process(run)
             run.status = "training" if submitted else "done"
+            run.progress = ("waiting for HelloWorldAi" if submitted
+                            else "finished")
             if not submitted:
+                record_paper(run)
                 logger.info("Run %s finished locally: %s", run_id, run.verdict)
         elif submitted:
             run.status = "training"
@@ -453,6 +538,7 @@ def collect(run: Run, *, client: Client | None = None) -> Run:
 
         _process(run)
         run.status = "done"
+        record_paper(run)
 
     except Exception as exc:                            # noqa: BLE001
         run.status = "failed"
@@ -528,7 +614,7 @@ def _process(run: Run) -> None:
         result = evaluate_mod.evaluate(
             probabilities, test.y, test.returns, test.dates, test.symbols,
             executable_returns=test.executable,
-            train_up_share=train_up_share)
+            train_up_share=train_up_share, horizon=test.horizon)
         return model, result
 
     # --- the local reference, when there is one ---
@@ -649,6 +735,32 @@ def _todays_signals(model, scaler, frames: dict, spec, trust=None) -> list:
 
 
 # --- the news store --------------------------------------------------------
+
+def record_paper(run: Run, *, top_n: int | None = None) -> dict | None:
+    """Write what this run intends to do into the forward ledger.
+
+    Called once a run is done. Deliberately after scoring and deliberately
+    one-way: `paper` is never imported by anything that builds a feature, and
+    nothing here reads the ledger back. See paper.py for why that seam matters
+    more than it looks.
+    """
+    try:
+        return paper_mod.record_intent(run, top_n=top_n)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("Could not record paper intent: %s", exc)
+        return None
+
+
+def settle_paper(watchlist: Sequence[str] | None = None) -> dict:
+    """Fill and mark every paper entry whose session has now happened."""
+    symbols = universe_mod.resolve(watchlist) if watchlist else default_watchlist()
+    try:
+        frames = prices_mod.load_many(symbols, period="2y")
+        return paper_mod.settle(frames)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("Could not settle the paper ledger: %s", exc)
+        return {"settled": 0, "pending": 0, "error": str(exc)}
+
 
 def collect_news(watchlist: Sequence[str] | None = None) -> dict:
     """One append-only pass over the news store. Called by the watcher.

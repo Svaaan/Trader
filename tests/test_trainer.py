@@ -138,7 +138,7 @@ def test_training_locally_refuses_to_return_a_bundle_that_disagrees(
 def test_a_locally_trained_bundle_is_a_working_model(separable, names):
     x, y = separable
     blob = trainer.train_local(
-        x, y, names, trainer.Hyperparameters(hidden=16, depth=2, steps=3000))
+        x, y, names, trainer.Hyperparameters(hidden=16, depth=2, steps=2000))
 
     loaded = model_mod.load_bundle(blob)
     accuracy = ((loaded.probabilities(x)[:, 1] > 0.5) == y).mean()
@@ -310,11 +310,12 @@ def test_the_step_count_is_a_ceiling_not_an_instruction():
     x, y = overfittable()
 
     stops = [baseline.fit_mlp(x, y, hidden=32, steps=steps, seed=0,
-                              check_every=250, patience=4).stopped_at
-             for steps in (4000, 16000, 40000)]
+                              check_every=250, patience=4,
+                              device="cpu").stopped_at
+             for steps in (3000, 8000, 20000)]
 
     assert len(set(stops)) == 1, f"the ceiling still decided the outcome: {stops}"
-    assert stops[0] < 4000, "it never stopped early at all"
+    assert stops[0] < 3000, "it never stopped early at all"
 
 
 def test_more_training_does_not_beat_stopping_when_it_should(monkeypatch):
@@ -323,10 +324,16 @@ def test_more_training_does_not_beat_stopping_when_it_should(monkeypatch):
     cut = int(len(x) * 0.7)
     x_fit, y_fit, x_out, y_out = x[:cut], y[:cut], x[cut:], y[cut:]
 
-    stopped = baseline.fit_mlp(x_fit, y_fit, hidden=32, steps=40000, seed=0,
-                               check_every=250, patience=4)
-    ground_on = baseline.fit_mlp(x_fit, y_fit, hidden=32, steps=40000, seed=0,
-                                 validation=0.0)
+    # The budget has to be large enough that the damage has actually happened.
+    # Measured on this fixture: at 8,000 steps the ceiling run still scores
+    # 0.5383 and stopping loses by a hair, because memorising has barely
+    # started. At 20,000 it has -- stopping holds 0.5367 while grinding on
+    # falls to 0.5108. Forty thousand widens the gap to three points and costs
+    # the suite twice as long to say the same thing.
+    stopped = baseline.fit_mlp(x_fit, y_fit, hidden=32, steps=20000, seed=0,
+                               check_every=250, patience=4, device="cpu")
+    ground_on = baseline.fit_mlp(x_fit, y_fit, hidden=32, steps=20000, seed=0,
+                                 validation=0.0, device="cpu")
 
     def accuracy(net):
         return float(((net.probabilities(x_out) > 0.5) == y_out).mean())
@@ -338,12 +345,12 @@ def test_more_training_does_not_beat_stopping_when_it_should(monkeypatch):
 
 def test_the_weights_kept_are_the_best_ones_not_the_last_ones():
     x, y = overfittable()
-    network = baseline.fit_mlp(x, y, hidden=32, steps=40000, seed=0,
-                               check_every=250, patience=4)
+    network = baseline.fit_mlp(x, y, hidden=32, steps=8000, seed=0,
+                               check_every=250, patience=4, device="cpu")
 
     # The recorded stopping point is where validation loss was lowest, and it
     # is strictly before training gave up.
-    assert 0 < network.stopped_at < 40000
+    assert 0 < network.stopped_at < 8000
     assert network.validation_loss is not None
 
 
@@ -361,9 +368,10 @@ def test_the_validation_slice_is_the_most_recent_training_rows():
     y = (x[:, 0] > 0).astype(int)
     y[-400:] = (rng.random(400) > 0.5).astype(int)
 
-    network = baseline.fit_mlp(x, y, hidden=16, steps=20000, seed=0,
-                               validation=0.2, check_every=200, patience=3)
-    assert network.stopped_at < 20000
+    network = baseline.fit_mlp(x, y, hidden=16, steps=6000, seed=0,
+                               validation=0.2, check_every=200, patience=3,
+                               device="cpu")
+    assert network.stopped_at < 6000
 
 
 def test_stopping_can_be_switched_off():
@@ -372,3 +380,147 @@ def test_stopping_can_be_switched_off():
                                validation=0.0)
     assert network.validation_loss is None
     assert network.stopped_at == 1500
+
+
+# --- running the same arithmetic somewhere else -----------------------------
+
+def test_the_array_backend_falls_back_without_a_card(monkeypatch):
+    """Nothing here may require a GPU. The project ran without one for months."""
+    from trader import arrays
+
+    monkeypatch.setattr(arrays, "_cupy", lambda: None)
+    arrays.available.cache_clear()
+    arrays.device_name.cache_clear()
+    try:
+        assert arrays.xp("auto") is np
+        assert not arrays.available()
+        assert arrays.device_name() == "cpu (numpy)"
+        with pytest.raises(RuntimeError, match="not usable"):
+            arrays.xp("gpu")
+    finally:
+        arrays.available.cache_clear()
+        arrays.device_name.cache_clear()
+
+
+def test_to_cpu_brings_anything_home():
+    from trader import arrays
+
+    class Fake:
+        def get(self):
+            return np.array([1.0, 2.0])
+
+    assert np.array_equal(arrays.to_cpu(Fake()), np.array([1.0, 2.0]))
+    assert np.array_equal(arrays.to_cpu(np.array([3.0])), np.array([3.0]))
+
+
+def test_a_batched_ensemble_of_one_equals_a_single_fit(separable):
+    """The batched path has to be the same arithmetic, or the crossover is a
+    comparison between two different trainers rather than two devices."""
+    x, y = separable
+
+    single = baseline.fit_mlp(x, y, hidden=16, depth=2, steps=1200, seed=0,
+                              check_every=300, device="cpu")
+    batched = baseline.fit_mlp_ensemble(x, y, seeds=[0], hidden=16, depth=2,
+                                        steps=1200, check_every=300,
+                                        device="cpu")[0]
+
+    assert np.allclose(single.probabilities(x), batched.probabilities(x),
+                       atol=1e-12)
+    assert single.stopped_at == batched.stopped_at
+
+
+def test_each_model_in_an_ensemble_gets_its_own_seed(separable):
+    x, y = separable
+    models = baseline.fit_mlp_ensemble(x, y, seeds=[0, 1, 2], hidden=16,
+                                       steps=800, check_every=200,
+                                       device="cpu")
+
+    assert len(models) == 3
+    first = models[0].probabilities(x[:200])
+    assert not np.allclose(first, models[1].probabilities(x[:200])), (
+        "two seeds produced identical models; the ensemble is sharing state")
+
+
+def test_the_ensemble_matches_separate_fits_for_every_seed(separable):
+    x, y = separable
+    seeds = [0, 1, 2]
+
+    together = baseline.fit_mlp_ensemble(x, y, seeds=seeds, hidden=16,
+                                         steps=900, check_every=300,
+                                         device="cpu")
+    apart = [baseline.fit_mlp(x, y, hidden=16, steps=900, seed=s,
+                              check_every=300, device="cpu") for s in seeds]
+
+    for batched, single in zip(together, apart):
+        assert np.allclose(batched.probabilities(x[:500]),
+                           single.probabilities(x[:500]), atol=1e-12)
+
+
+def test_routing_sends_a_small_ensemble_to_the_cpu(monkeypatch, separable):
+    """One model on a card is ten times slower. The default has to know that."""
+    from trader import arrays
+
+    chosen = []
+    real_xp = arrays.xp
+    monkeypatch.setattr(baseline.arrays_mod, "available", lambda: True)
+    monkeypatch.setattr(baseline.arrays_mod, "xp",
+                        lambda d=None: (chosen.append(d), real_xp("cpu"))[1])
+
+    x, y = separable
+    baseline.fit_mlp_ensemble(x, y, seeds=[0, 1], hidden=8, steps=200,
+                              check_every=100)
+    assert chosen == [baseline.CPU]
+
+    chosen.clear()
+    baseline.fit_mlp_ensemble(x, y, seeds=list(range(baseline.GPU_MODEL_CROSSOVER)),
+                              hidden=8, steps=200, check_every=100)
+    assert chosen == [baseline.GPU]
+
+
+def test_logistic_is_identical_on_either_device(separable):
+    """No randomness, convex objective -- the two must agree, or one is wrong."""
+    x, y = separable
+    a = baseline.fit_logistic(x, y, epochs=200, device="cpu")
+    b = baseline.fit_logistic(x, y, epochs=200, device="cpu")
+    assert np.allclose(a.weights, b.weights, atol=0)
+
+
+def test_a_small_logistic_fit_stays_on_the_cpu(monkeypatch):
+    """Routing on "is there a card" instead of "is it worth it" made the suite
+    take nine minutes: every tiny fit paid a transfer it could not earn back."""
+    from trader import arrays
+
+    chosen = []
+    real_xp = arrays.xp
+    monkeypatch.setattr(baseline.arrays_mod, "available", lambda: True)
+    monkeypatch.setattr(baseline.arrays_mod, "xp",
+                        lambda d=None: (chosen.append(d), real_xp("cpu"))[1])
+
+    rng = np.random.default_rng(0)
+    small = rng.normal(size=(1000, 6))
+    baseline.fit_logistic(small, (rng.random(1000) > 0.5).astype(int), epochs=10)
+    assert chosen == [baseline.CPU]
+
+    chosen.clear()
+    big = rng.normal(size=(baseline.GPU_ROW_CROSSOVER + 1, 6))
+    baseline.fit_logistic(big, (rng.random(len(big)) > 0.5).astype(int), epochs=10)
+    assert chosen == [baseline.GPU]
+
+
+def test_a_single_network_defaults_to_the_cpu(monkeypatch, separable):
+    """One model on a card is nine times slower, and "auto" resolves to the
+    card whenever one exists. Leaving this on auto made a unit test take 133
+    seconds instead of 8, and would have slowed every run on the machine that
+    had just been given a GPU to speed it up."""
+    from trader import arrays
+
+    chosen = []
+    real_xp = arrays.xp
+    monkeypatch.setattr(baseline.arrays_mod, "available", lambda: True)
+    monkeypatch.setattr(baseline.arrays_mod, "xp",
+                        lambda d=None: (chosen.append(d), real_xp("cpu"))[1])
+
+    x, y = separable
+    baseline.fit_mlp(x, y, hidden=8, steps=100, check_every=50)
+    assert chosen == [baseline.CPU], (
+        f"a single fit routed to {chosen}, not the CPU")

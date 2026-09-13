@@ -34,6 +34,27 @@ jinja2==3.1.6
 # --- configuration ---
 python-dotenv==1.0.1
 
+# --- optional: run the arithmetic on a GPU ---
+#
+# CuPy is numpy's API on CUDA, so src/trader/arrays.py swaps the array module
+# and the same lines run on the card. Deliberately CuPy rather than torch: the
+# argument for "no torch" was always about keeping every operation readable,
+# not about hardware, and a numpy-shaped backend keeps that.
+#
+# Worth knowing what it buys, measured on an RTX 3070 at batch 64:
+#
+#     fit_logistic (one big matmul, 600 passes)   20.8s -> 3.6s
+#     one MLP  (20,000 tiny steps)                 7.4s -> 67s     <- slower
+#     64 MLPs together                            95.7s -> 15.0s
+#
+# A card is idle on one small network and transformative on many, so the
+# routing in baseline.py sends a single fit to the CPU and an ensemble of
+# sixteen or more to the GPU. Everything falls back to numpy without it.
+#
+#   pip install "cupy-cuda13x[ctk]"      # match your driver's CUDA version
+#
+# cupy-cuda13x==14.2.0
+
 # --- optional: prose in the background panel ---
 #
 # Without this, and without ANTHROPIC_API_KEY, the background panels still show
