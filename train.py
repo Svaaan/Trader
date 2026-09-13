@@ -74,9 +74,21 @@ def report(run) -> None:
         print(f"    accuracy {evaluation['accuracy']:.4f} against "
               f"{evaluation['baseline_accuracy']:.4f}  "
               f"edge {evaluation['edge']:+.4f}")
-        print(f"    sharpe {evaluation['strategy_sharpe']:+.2f}  "
-              f"t {evaluation['strategy_tstat']:+.2f}  "
-              f"annualised {evaluation['strategy_annualised']:+.1%}")
+        # Two holding windows. The first is what the label describes and what
+        # no order can reach; the second is what an order can reach. Printed
+        # together because on this panel they disagree completely.
+        print(f"    close -> close  sharpe {evaluation['strategy_sharpe']:+.2f}"
+              f"  t {evaluation['strategy_tstat']:+.2f}"
+              f"  annualised {evaluation['strategy_annualised']:+7.1%}"
+              f"   <- not tradeable")
+        if evaluation.get("executable_sharpe") is not None:
+            print(f"    open  -> close  "
+                  f"sharpe {evaluation['executable_sharpe']:+.2f}"
+                  f"  t {evaluation['executable_tstat']:+.2f}"
+                  f"  annualised {evaluation['executable_annualised']:+7.1%}"
+                  f"   <- what the gate reads")
+            print(f"    execution gap {evaluation['execution_gap']:+.2f} sharpe,"
+                  f" lost to the overnight move")
 
     if run.comparison:
         print(f"\n  the two backends: {run.comparison['reading']}")

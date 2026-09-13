@@ -328,9 +328,11 @@ class Majority:
 # --- running them ----------------------------------------------------------
 
 def _score(probabilities, splits, scaler, train_up_share, cost) -> dict:
-    (x, y, returns, dates), symbols = dataset_mod.test_matrix(splits, scaler)
-    result = evaluate_mod.evaluate(probabilities, y, returns, dates, symbols,
-                                   train_up_share=train_up_share, cost=cost)
+    test = dataset_mod.test_matrix(splits, scaler)
+    result = evaluate_mod.evaluate(
+        probabilities, test.y, test.returns, test.dates, test.symbols,
+        executable_returns=test.executable,
+        train_up_share=train_up_share, cost=cost)
     return result.to_dict()
 
 
@@ -351,7 +353,7 @@ def run_controls(splits, feature_names, *, hidden: int = 64, depth: int = 2,
     means anything.
     """
     x_train, y_train, scaler = dataset_mod.combine(splits, feature_names)
-    (x_test, _, _, _), _ = dataset_mod.test_matrix(splits, scaler)
+    x_test = dataset_mod.test_matrix(splits, scaler).x
     train_up_share = float(y_train.mean())
 
     out: dict = {"train_up_share": round(train_up_share, 4),
@@ -444,7 +446,7 @@ def walk_forward(frames: dict, spec, *, folds: int = 6,
 
             x_train, y_train, scaler = dataset_mod.combine(
                 splits, prepared.feature_names)
-            (x_test, _, _, _), _ = dataset_mod.test_matrix(splits, scaler)
+            x_test = dataset_mod.test_matrix(splits, scaler).x
 
             fitted = (fit_logistic(x_train, y_train) if model == "logistic"
                       else fit_mlp(x_train, y_train, seed=0))
@@ -461,6 +463,7 @@ def walk_forward(frames: dict, spec, *, folds: int = 6,
                 "baseline": scored["baseline_accuracy"],
                 "edge": scored["edge"],
                 "sharpe": scored["strategy_sharpe"],
+                "executable_sharpe": scored.get("executable_sharpe"),
                 "annualised": scored["strategy_annualised"],
             })
         except Exception as exc:                        # noqa: BLE001
@@ -489,4 +492,5 @@ def _truncate(split, stop: pd.Timestamp):
         x_test=split.x_test[keep], y_test=split.y_test[keep],
         train_dates=split.train_dates, test_dates=split.test_dates[keep],
         forward_returns_test=split.forward_returns_test[keep],
+        executable_returns_test=split.executable_returns_test[keep],
     )

@@ -16,6 +16,15 @@ minimum sample per bucket, because "100% accurate on its five most confident
 days" is the single most misleading line a page like this can print, and this
 one printed it.
 
+**Money over a window that could actually be held.** The label runs close to
+close, and the features that predict it are computed from that close -- so
+nothing can be positioned in time to collect it. Every return figure therefore
+comes in two versions: the graded one, which is what the label describes, and
+the executable one, open(t+1) to close(t+h), which is what an order could reach.
+On this project's panel they disagree about whether the strategy exists at all:
+Sharpe +1.67 graded, -0.40 executable, because the entire gross edge is the
+overnight gap. The gate reads the second.
+
 **Money, after costs that reflect the trades actually made.** The earlier
 version charged a round trip on every row. The model held long on 99% of days
 and changed position 113 times in 4,187 rows, so it was charged 4,187 round
@@ -90,6 +99,23 @@ class Evaluation:
     position_changes: int
     cost_per_trade: float
     cost_drag_annualised: float
+
+    # --- and the same money, over the window anybody could actually hold ---
+    #
+    # Everything above is close(t) -> close(t+h), which is what the label
+    # describes and what no order can capture: the signal is computed from a
+    # close nobody knows until the session has ended. These are open(t+1) ->
+    # close(t+h) -- enter at the first price that exists after the signal does.
+    #
+    # They are not a footnote. On this project's panel the graded series has a
+    # daily Sharpe of +1.67 and the executable one has -0.40, because the entire
+    # gross edge sits in the overnight gap. The gate reads these.
+    executable_daily: float
+    executable_annualised: float
+    executable_sharpe: float
+    executable_tstat: float
+    executable_max_drawdown: float
+    execution_gap: float            # graded Sharpe minus executable Sharpe
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -231,6 +257,7 @@ def _tstat(daily: pd.Series) -> float:
 
 
 def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
+             executable_returns=None,
              train_up_share: float | None = None,
              cost: float = DEFAULT_COST) -> Evaluation:
     """Score predictions against what actually happened next.
@@ -240,6 +267,11 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
     the target was relative, so that a market-neutral model is not credited with
     drift it never predicted. `dates` and `symbols` are what make a portfolio
     out of a pile of rows, and without them turnover cannot be known.
+
+    `executable_returns` is the same rows over the window that could actually be
+    held. Pass it. Without it the executable figures fall back to the graded
+    ones, which is the assumption that a close-to-close backtest is tradeable --
+    the assumption this argument exists to stop anybody making silently.
     """
     probabilities = np.asarray(probabilities, dtype=np.float64).ravel()
     actual = np.asarray(actual).ravel()
@@ -281,6 +313,18 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
     net, gross, turnover, changes = _portfolio(positions, returns, cost)
     hold = returns.mean(axis=1).fillna(0.0)
 
+    # The same book, held over the window that exists after the signal does.
+    if executable_returns is None:
+        executable_net = net
+    else:
+        reachable = pd.DataFrame({
+            "date": dates, "symbol": symbols,
+            "ret": np.asarray(executable_returns, dtype=np.float64).ravel(),
+        }).pivot_table(index="date", columns="symbol", values="ret",
+                       aggfunc="last").reindex(index=positions.index,
+                                               columns=positions.columns)
+        executable_net, _, _, _ = _portfolio(positions, reachable, cost)
+
     cost_drag = float((1.0 + gross.mean()) ** TRADING_DAYS
                       - (1.0 + net.mean()) ** TRADING_DAYS)
 
@@ -314,6 +358,9 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
 
     effective, design, rho = _effective_rows(correct, dates, symbols)
 
+    graded_sharpe = _sharpe(net)
+    reachable_sharpe = _sharpe(executable_net)
+
     return Evaluation(
         rows=len(probabilities),
         days=int(len(positions.index)),
@@ -340,6 +387,12 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
         position_changes=changes,
         cost_per_trade=cost,
         cost_drag_annualised=round(cost_drag, 4),
+        executable_daily=round(float(executable_net.mean()), 6),
+        executable_annualised=round(annualise(executable_net), 4),
+        executable_sharpe=round(reachable_sharpe, 3),
+        executable_tstat=round(_tstat(executable_net), 3),
+        executable_max_drawdown=round(_drawdown(executable_net), 4),
+        execution_gap=round(graded_sharpe - reachable_sharpe, 3),
     )
 
 
@@ -368,13 +421,25 @@ def verdict(evaluation: Evaluation) -> str:
                 f"range chance produces over a period this length. Not evidence "
                 f"of an edge.")
 
-    if evaluation.strategy_tstat < 2.0:
-        return (f"{evaluation.edge:+.1%} over the baseline, but the return has a "
-                f"t-statistic of {evaluation.strategy_tstat:.1f}. Being right "
-                f"more often has not turned into money you could distinguish "
-                f"from luck.")
+    if evaluation.executable_tstat < 2.0:
+        # The executable number, because the graded one describes a trade that
+        # cannot be placed. Both are quoted when they disagree, since the gap
+        # is the finding rather than a caveat on it.
+        if evaluation.execution_gap > 0.5:
+            return (f"{evaluation.edge:+.1%} over the baseline, and close to "
+                    f"close that is Sharpe {evaluation.strategy_sharpe:.2f} -- "
+                    f"but held from the first open after the signal exists it "
+                    f"is {evaluation.executable_sharpe:.2f}, t "
+                    f"{evaluation.executable_tstat:.1f}. The edge is in the "
+                    f"overnight gap, which is gone by the time anybody could "
+                    f"trade on it.")
+        return (f"{evaluation.edge:+.1%} over the baseline, but held from the "
+                f"first open after the signal its return has a t-statistic of "
+                f"{evaluation.executable_tstat:.1f}. Being right more often has "
+                f"not turned into money you could distinguish from luck.")
 
     return (f"{evaluation.edge:+.1%} over the baseline on {evaluation.days} days "
-            f"it never saw, Sharpe {evaluation.strategy_sharpe:.2f}, t "
-            f"{evaluation.strategy_tstat:.1f}. Worth another look, on a "
-            f"different period, before believing it.")
+            f"it never saw, and Sharpe {evaluation.executable_sharpe:.2f} (t "
+            f"{evaluation.executable_tstat:.1f}) over a window somebody could "
+            f"actually hold. Worth another look, on a different period, before "
+            f"believing it.")

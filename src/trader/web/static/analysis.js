@@ -92,6 +92,43 @@ function trustPanel(run) {
           + `being right about the next.`));
   }
 
+  // The two holding windows, side by side, whenever they disagree. This is
+  // the difference between a backtest and a trade.
+  if (evaluation.executable_sharpe !== undefined
+      && evaluation.executable_sharpe !== null) {
+    const money = el("table", "compare");
+    const header = el("tr");
+    ["Held", "Sharpe", "t", "Annualised"].forEach((label) => {
+      header.appendChild(el("th", null, label));
+    });
+    money.appendChild(header);
+
+    [["close(t) → close(t+1) — what the label means",
+      evaluation.strategy_sharpe, evaluation.strategy_tstat,
+      evaluation.strategy_annualised, false],
+     ["open(t+1) → close(t+1) — what an order reaches",
+      evaluation.executable_sharpe, evaluation.executable_tstat,
+      evaluation.executable_annualised, true],
+    ].forEach(([label, sharpe, tstat, ann, isSubject]) => {
+      const row = el("tr", isSubject ? "is-subject" : null);
+      row.appendChild(el("td", null, label));
+      row.appendChild(el("td", null, num(sharpe)));
+      row.appendChild(el("td", null, num(tstat)));
+      row.appendChild(el("td", null, pct(ann)));
+      money.appendChild(row);
+    });
+    panel.appendChild(money);
+
+    if (Math.abs(evaluation.execution_gap || 0) > 0.2) {
+      panel.appendChild(el("p", "warn",
+        `${num(evaluation.execution_gap)} of Sharpe separates the two. The `
+        + "features are computed from a close, so nothing can be positioned at "
+        + "that close on the strength of it — the gap is the overnight move, "
+        + "and it belongs to whoever was already holding. The gate reads the "
+        + "second row."));
+    }
+  }
+
   // Every hurdle, passed or not. A gate that says no without saying which
   // question it failed teaches nobody anything.
   const checks = trust.checks || [];
@@ -395,7 +432,13 @@ function signalCard(signal, gateOpen) {
   const head = el("div", "call-head");
   const left = el("div");
   left.appendChild(el("span", "call-symbol", signal.symbol));
-  left.appendChild(el("span", "call-asof", ` as of ${signal.as_of}`));
+  // A date reads as a label; "11 days old" reads as the problem it is.
+  const stale = signal.stale_days;
+  left.appendChild(el("span",
+    stale !== undefined && stale > 4 ? "call-asof is-stale" : "call-asof",
+    stale !== undefined && stale > 4
+      ? ` as of ${signal.as_of} — ${stale} days old`
+      : ` as of ${signal.as_of}`));
   head.appendChild(left);
   head.appendChild(el("span", `call-verdict ${verdict.tone}`, verdict.label));
   card.appendChild(head);

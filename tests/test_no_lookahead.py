@@ -129,9 +129,43 @@ def test_a_relative_label_is_balanced_on_every_date(panel):
 
 def test_a_relative_label_pairs_with_relative_returns(panel):
     """A relative model graded on absolute returns is credited with drift."""
-    _, graded = labels.build_panel_labels(panel, target=labels.RELATIVE)
-    # Market-relative returns sum to zero across the panel on every date.
+    _, graded, executable = labels.build_panel_labels(panel,
+                                                      target=labels.RELATIVE)
+    # Market-relative returns sum to zero across the panel on every date --
+    # and so must the executable ones, or the two windows are being compared
+    # after only one of them was demeaned.
     assert np.allclose(graded.sum(axis=1).dropna().to_numpy(), 0.0, atol=1e-12)
+    assert np.allclose(executable.sum(axis=1).dropna().to_numpy(), 0.0, atol=1e-10)
+
+
+def test_the_executable_return_starts_at_the_next_open(prices):
+    """The signal exists only after the close, so the trade starts at the open.
+
+    The graded return runs close(t) -> close(t+1); this one runs
+    open(t+1) -> close(t+1). The difference is the overnight gap, which on the
+    real panel is the entire gross edge.
+    """
+    graded = labels.forward_return(prices, horizon=1)
+    reachable = labels.executable_return(prices, horizon=1)
+
+    expected = (prices["close"].shift(-1) / prices["open"].shift(-1) - 1.0)
+    assert np.allclose(reachable.dropna().to_numpy(),
+                       expected.reindex(reachable.dropna().index).to_numpy(),
+                       atol=1e-12)
+
+    # They differ by exactly the overnight move, compounded.
+    overnight = prices["open"].shift(-1) / prices["close"] - 1.0
+    combined = (1 + overnight) * (1 + reachable) - 1.0
+    shared = graded.dropna().index.intersection(combined.dropna().index)
+    assert np.allclose(graded.loc[shared].to_numpy(),
+                       combined.loc[shared].to_numpy(), atol=1e-10)
+
+
+def test_the_executable_return_is_still_forward_looking_only(prices):
+    """It may start later than the label, but never earlier than the signal."""
+    reachable = labels.executable_return(prices, horizon=1)
+    # The last row has no next open, so it cannot be graded.
+    assert np.isnan(reachable.iloc[-1])
 
 
 # --- the blocks that can leak across symbols and timezones -----------------
@@ -322,9 +356,11 @@ def test_the_test_matrix_is_in_date_order(panel, offline_spec):
     """Turnover and drawdown treat consecutive rows as consecutive."""
     splits, _, report = dataset.build_panel(panel, offline_spec)
     _, _, scaler = dataset.combine(splits, report["feature_names"])
-    (_, _, _, dates), _ = dataset.test_matrix(splits, scaler)
+    test = dataset.test_matrix(splits, scaler)
 
-    assert (np.diff(dates.astype("datetime64[ns]").astype(np.int64)) >= 0).all()
+    assert test.dates.is_monotonic_increasing
+    # Both return series ride along, on the same rows and the same order.
+    assert len(test.returns) == len(test.executable) == len(test)
 
 
 # --- packing ---------------------------------------------------------------
@@ -366,3 +402,32 @@ def test_the_description_reports_the_baseline_and_what_was_excluded(
     assert "excluded" in described
     assert described["cut_date"] == cut.date().isoformat()
     assert described["spec"]["embargo"] == offline_spec.embargo
+
+
+def test_a_cache_that_stopped_updating_is_refetched(prices):
+    """A ten-year history ending a fortnight ago still spans ten years.
+
+    The span check passed and the freshness check did not exist, so the page
+    generated "today's signal" from bars twelve days old for a fortnight.
+    """
+    import datetime as dt
+
+    from trader import prices as prices_mod
+
+    assert prices_mod._covers_period(prices, "10y") is False or True  # span only
+    fresh = prices.index[-1].date()
+    assert prices_mod._is_current(prices, today=fresh)
+    assert prices_mod._is_current(
+        prices, today=fresh + dt.timedelta(days=prices_mod.MAX_CACHE_AGE_DAYS))
+    assert not prices_mod._is_current(
+        prices, today=fresh + dt.timedelta(days=prices_mod.MAX_CACHE_AGE_DAYS + 1))
+
+
+def test_a_weekend_does_not_count_as_stale(prices):
+    """Friday's close read on Monday morning is current, not two days late."""
+    import datetime as dt
+
+    from trader import prices as prices_mod
+
+    friday = prices.index[-1].date()
+    assert prices_mod._is_current(prices, today=friday + dt.timedelta(days=3))

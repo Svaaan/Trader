@@ -120,6 +120,11 @@ class Split:
     train_dates: pd.DatetimeIndex
     test_dates: pd.DatetimeIndex
     forward_returns_test: np.ndarray
+    # The same rows measured over the window somebody could actually hold --
+    # open(t+1) to close(t+horizon). Carried beside the graded return rather
+    # than instead of it, because the pair is what says whether the strategy
+    # exists. See labels.executable_return.
+    executable_returns_test: np.ndarray
 
     @property
     def rows(self) -> int:
@@ -300,17 +305,27 @@ def choose_cut_date(assembled: dict, label_frame: pd.DataFrame, *,
 
 
 def build_one(symbol: str, frame: pd.DataFrame, label: pd.Series,
-              graded: pd.Series, *, cut_date: pd.Timestamp,
-              feature_names: Sequence[str], embargo: int = 1) -> Split:
-    """Features, labels and a chronological split for a single symbol."""
+              graded: pd.Series, executable: pd.Series, *,
+              cut_date: pd.Timestamp, feature_names: Sequence[str],
+              embargo: int = 1) -> Split:
+    """Features, labels and a chronological split for a single symbol.
+
+    Two return series, not one: what the label describes (close to close) and
+    what could actually be held (open after the signal, to the same exit). They
+    are joined together so a row survives only if both exist -- grading a model
+    on rows where one window is missing and the other is not would make the
+    comparison between them a comparison of different rows.
+    """
     joined = frame.join(label.rename("label"), how="inner") \
-                  .join(graded.rename("graded"), how="inner").dropna()
+                  .join(graded.rename("graded"), how="inner") \
+                  .join(executable.rename("executable"), how="inner").dropna()
     if joined.empty:
         raise ValueError(f"{symbol}: no rows survive feature and label alignment")
 
     x = joined[list(feature_names)].to_numpy(dtype=np.float32)
     y = joined["label"].to_numpy(dtype=np.int64)
     returns = joined["graded"].to_numpy(dtype=np.float32)
+    reachable = joined["executable"].to_numpy(dtype=np.float32)
     dates = pd.DatetimeIndex(joined.index)
 
     cut = int((dates < cut_date).sum())
@@ -330,6 +345,7 @@ def build_one(symbol: str, frame: pd.DataFrame, label: pd.Series,
         x_test=x[cut:], y_test=y[cut:],
         train_dates=dates[:train_end], test_dates=dates[cut:],
         forward_returns_test=returns[cut:],
+        executable_returns_test=reachable[cut:],
     )
 
 
@@ -344,6 +360,7 @@ class Prepared:
     assembled: dict
     label_frame: pd.DataFrame
     graded_frame: pd.DataFrame
+    executable_frame: pd.DataFrame
     feature_names: list
     report: dict
     spec: Spec
@@ -358,15 +375,16 @@ def prepare(frames: dict, spec: Spec | None = None, *,
 
     assembled, feature_names, report = assemble(frames, spec, refresh=refresh)
 
-    label_frame, graded_frame = labels_mod.build_panel_labels(
+    label_frame, graded_frame, executable_frame = labels_mod.build_panel_labels(
         {s: frames[s] for s in assembled},
         horizon=spec.horizon, target=spec.target,
         threshold=spec.threshold, neutral_band=spec.neutral_band)
 
     report["requested"] = sorted(frames)
     return Prepared(assembled=assembled, label_frame=label_frame,
-                    graded_frame=graded_frame, feature_names=feature_names,
-                    report=report, spec=spec)
+                    graded_frame=graded_frame,
+                    executable_frame=executable_frame,
+                    feature_names=feature_names, report=report, spec=spec)
 
 
 def split_at(prepared: Prepared, cut_date: pd.Timestamp) -> tuple[list, dict]:
@@ -375,6 +393,7 @@ def split_at(prepared: Prepared, cut_date: pd.Timestamp) -> tuple[list, dict]:
     assembled = prepared.assembled
     label_frame = prepared.label_frame
     graded_frame = prepared.graded_frame
+    executable_frame = prepared.executable_frame
     feature_names = prepared.feature_names
     report = dict(prepared.report)
     frames = assembled
@@ -388,8 +407,9 @@ def split_at(prepared: Prepared, cut_date: pd.Timestamp) -> tuple[list, dict]:
         try:
             splits.append(build_one(
                 symbol, assembled[symbol], label_frame[symbol],
-                graded_frame[symbol], cut_date=cut_date,
-                feature_names=feature_names, embargo=spec.embargo))
+                graded_frame[symbol], executable_frame[symbol],
+                cut_date=cut_date, feature_names=feature_names,
+                embargo=spec.embargo))
         except ValueError as exc:
             # Left out rather than split somewhere else, which would put it back
             # in the overlap the single cut date exists to prevent. Named, so
@@ -473,8 +493,27 @@ def combine(splits: Sequence[Split],
     return scaler.apply(x_train).astype(np.float32), y_train, scaler
 
 
-def test_matrix(splits: Sequence[Split], scaler: Scaler
-                ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+@dataclasses.dataclass
+class TestSet:
+    """The pooled test rows, named rather than positional.
+
+    This was a tuple of four and then a tuple of a tuple of four and a fifth,
+    which is the shape an argument list takes just before somebody passes the
+    returns where the dates go. Six things with names cost nothing.
+    """
+
+    x: np.ndarray
+    y: np.ndarray
+    returns: np.ndarray             # close(t) -> close(t+h), what the label means
+    executable: np.ndarray          # open(t+1) -> close(t+h), what can be held
+    dates: pd.DatetimeIndex
+    symbols: np.ndarray
+
+    def __len__(self) -> int:
+        return len(self.y)
+
+
+def test_matrix(splits: Sequence[Split], scaler: Scaler) -> TestSet:
     """The pooled test set, scaled, in date order, with its dates.
 
     Date order rather than symbol order, because everything that reads this --
@@ -484,12 +523,19 @@ def test_matrix(splits: Sequence[Split], scaler: Scaler
     x = np.concatenate([s.x_test for s in splits])
     y = np.concatenate([s.y_test for s in splits])
     returns = np.concatenate([s.forward_returns_test for s in splits])
+    reachable = np.concatenate([s.executable_returns_test for s in splits])
     dates = np.concatenate([s.test_dates.values for s in splits])
     symbols = np.concatenate([np.full(len(s.y_test), s.symbol) for s in splits])
 
     order = np.argsort(dates, kind="stable")
-    return (scaler.apply(x[order]).astype(np.float32), y[order],
-            returns[order], dates[order]), symbols[order]
+    return TestSet(
+        x=scaler.apply(x[order]).astype(np.float32),
+        y=y[order],
+        returns=returns[order],
+        executable=reachable[order],
+        dates=pd.DatetimeIndex(dates[order]),
+        symbols=symbols[order],
+    )
 
 
 def pack_for_helloworld(x: np.ndarray, y: np.ndarray) -> bytes:

@@ -631,3 +631,7 @@ main {
   border-radius: var(--r-sm);
   background: var(--surface);
 }
+
+/* A stale signal is the one failure a daily tool cannot afford to state
+   quietly, so the date stops being a label and becomes a warning. */
+.call-asof.is-stale { color: var(--warn); font-weight: 600; }

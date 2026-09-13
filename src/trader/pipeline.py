@@ -155,6 +155,9 @@ class Run:
     local_evaluation: dict = dataclasses.field(default_factory=dict)
     local_verdict: str = ""
     comparison: dict = dataclasses.field(default_factory=dict)
+    # Why the remote half did not happen, when the local half still did. Kept
+    # separate from `error`, which means the whole run failed.
+    remote_error: str = ""
     verdict: str = ""
     signals: list = dataclasses.field(default_factory=list)
     trust: dict = dataclasses.field(default_factory=dict)
@@ -331,44 +334,66 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
             logger.info("Run %s: trained locally (%d bytes)", run_id, len(bundle))
 
         # --- and send it, if asked -----------------------------------------
+        #
+        # In its own try. A `both` run that trained here successfully and then
+        # could not reach the coordinator has a finished model, and throwing it
+        # away because somebody else's network is down is the wrong trade --
+        # especially since the remote half is the optional one. Measured the
+        # hard way: every node had been silent for eight to eleven days, the
+        # submit returned 503, and a perfectly good local run was discarded.
+        submitted = False
         if run.wants_remote:
-            blob = dataset_mod.pack_for_helloworld(x_train, y_train)
-            description["bytes_sent"] = len(blob)
-
-            artifact_id = client.upload_dataset(blob)
-
-            # Choose the machine rather than letting the coordinator choose on
-            # a flag that goes stale -- see Client.pick_node. None falls back to
-            # its placement, which is right when every node is reporting
-            # normally.
-            node_id = client.pick_node()
-            description["node_id"] = node_id
-
-            run.task_id = client.submit(
-                dataset_id=artifact_id,
-                model_name=f"trader-{run_id}",
-                steps=training_steps,
-                batch_size=BATCH_SIZE,
-                hidden_dim=64,
-                depth=2,
-                node_id=node_id,
-            )
-            run.status = "training"
-            logger.info("Run %s submitted as %s", run_id, run.task_id)
-
-        # A local-only run has nothing to wait for, so it finishes here.
-        if run.wants_local and not run.wants_remote:
-            _process(run)
-            run.status = "done"
-            logger.info("Run %s finished locally: %s", run_id, run.verdict)
-        elif run.wants_local:
-            # Score the local model now so the page is readable while the
-            # remote job queues. `collect` re-scores both together when it
-            # lands, which is where the comparison gets made.
             try:
-                _process(run)
+                # Ask before uploading. The dataset is eighty megabytes on a
+                # wide panel, and pushing it to a coordinator with nothing
+                # behind it wastes the upload and the time.
+                live = client.live_nodes()
+                if not live:
+                    raise HelloWorldError(
+                        "no node has reported a heartbeat recently, so there "
+                        "is nothing to train on")
+
+                blob = dataset_mod.pack_for_helloworld(x_train, y_train)
+                description["bytes_sent"] = len(blob)
+
+                artifact_id = client.upload_dataset(blob)
+
+                # Choose the machine rather than letting the coordinator choose
+                # on a flag that goes stale -- see Client.pick_node. None falls
+                # back to its placement, which is right when every node is
+                # reporting normally.
+                node_id = client.pick_node()
+                description["node_id"] = node_id
+
+                run.task_id = client.submit(
+                    dataset_id=artifact_id,
+                    model_name=f"trader-{run_id}",
+                    steps=training_steps,
+                    batch_size=BATCH_SIZE,
+                    hidden_dim=64,
+                    depth=2,
+                    node_id=node_id,
+                )
+                submitted = True
+                logger.info("Run %s submitted as %s", run_id, run.task_id)
+
             except Exception as exc:                    # noqa: BLE001
-                logger.warning("Could not score the local model yet: %s", exc)
+                run.remote_error = str(exc)
+                if not run.wants_local:
+                    raise
+                logger.warning(
+                    "Run %s could not reach HelloWorldAi (%s); keeping the "
+                    "local model", run_id, exc)
+
+        if run.wants_local:
+            # Score the local model now. When a remote job is queued this is
+            # what makes the page readable during the wait; when the remote
+            # half failed or was not asked for, it is the run.
+            _process(run)
+            run.status = "training" if submitted else "done"
+            if not submitted:
+                logger.info("Run %s finished locally: %s", run_id, run.verdict)
+        elif submitted:
             run.status = "training"
 
     except Exception as exc:                            # noqa: BLE001
@@ -493,15 +518,16 @@ def _process(run: Run) -> None:
             raise ValueError("none of the trained symbols could be rebuilt")
 
     # --- the honest score: rows that were never sent anywhere ---
-    (x_test, y_test, returns, dates), symbols = dataset_mod.test_matrix(
-        splits, scaler)
+    test = dataset_mod.test_matrix(splits, scaler)
+    x_test = test.x
     train_up_share = (run.dataset.get("train") or {}).get("up_share")
 
     def score(path: str) -> tuple:
         model = model_mod.load_bundle_file(path)
-        probabilities = model.probabilities(x_test)[:, 1]
+        probabilities = model.probabilities(test.x)[:, 1]
         result = evaluate_mod.evaluate(
-            probabilities, y_test, returns, dates, symbols,
+            probabilities, test.y, test.returns, test.dates, test.symbols,
+            executable_returns=test.executable,
             train_up_share=train_up_share)
         return model, result
 
@@ -601,6 +627,11 @@ def _todays_signals(model, scaler, frames: dict, spec, trust=None) -> list:
                 "all_contributions": reasons,
                 "symbol": symbol,
                 "as_of": latest.index[-1].date().isoformat(),
+                # How old the bar this was computed from actually is. A daily
+                # signal built on a twelve-day-old close is not a signal, and
+                # `as_of` alone was too quiet about it -- it read as a label
+                # rather than as a warning.
+                "stale_days": (dt.date.today() - latest.index[-1].date()).days,
                 "close": (round(float(prices["close"].iloc[-1]), 4)
                           if prices is not None and len(prices) else None),
                 "probability_up": round(probability, 4),

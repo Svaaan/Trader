@@ -123,11 +123,23 @@ def pack_bundle(layers, feature_names, *, class_names=("down", "up")) -> bytes:
         "trained_by": "trader-local",
     }
 
+    from safetensors.numpy import save
+
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        from safetensors.numpy import save
-        archive.writestr(model_mod.WEIGHTS_NAME, save(state))
-        archive.writestr(model_mod.CONFIG_NAME, json.dumps(manifest, indent=2))
+        for name, payload in ((model_mod.WEIGHTS_NAME, save(state)),
+                              (model_mod.CONFIG_NAME,
+                               json.dumps(manifest, indent=2).encode("utf-8"))):
+            # A fixed timestamp, because `writestr` otherwise stamps the clock
+            # into the archive and two identical trainings a second apart
+            # produce different bytes. The same weights should give the same
+            # artifact -- that is what makes a bundle comparable to another one
+            # rather than merely similar to it.
+            entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            entry.external_attr = 0o644 << 16
+            archive.writestr(entry, payload)
+
     return buffer.getvalue()
 
 

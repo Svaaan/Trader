@@ -324,7 +324,8 @@ def test_the_controls_record_the_hyperparameters_they_used():
         x_test=x[400:], y_test=y[400:],
         train_dates=pd.bdate_range("2020-01-01", periods=400),
         test_dates=pd.bdate_range("2021-08-01", periods=100),
-        forward_returns_test=rng.normal(0, 0.01, 100))]
+        forward_returns_test=rng.normal(0, 0.01, 100),
+        executable_returns_test=rng.normal(0, 0.01, 100))]
 
     out = baseline.run_controls(splits, [f"f{i}" for i in range(4)],
                                 steps=250, seeds=1)

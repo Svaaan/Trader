@@ -78,6 +78,48 @@ smaller than the gap between a model and itself.
 
 ---
 
+## The number that decides it: what an order could actually reach
+
+The features on day *t* are computed from day *t*'s close. Nobody knows that
+close until the session has ended, so nobody can be positioned **at** it on the
+strength of it. The earliest an order can go in is the next open.
+
+But the label runs close to close. So the thing the whole harness was grading is
+a trade that cannot be placed.
+
+Decomposing the gross P&L of the logistic control by holding window — same rows,
+same positions, same demeaning, only the window differs:
+
+| window | gross P&L per row | |
+|---|---|---|
+| close(t) → close(t+1) — **what the label means** | **+2.96 bp** | daily Sharpe **+1.67** |
+| ↳ the overnight gap alone | **+3.84 bp** | *more than all of it* |
+| ↳ open(t+1) → close(t+1) — **what an order reaches** | **−0.80 bp** | Sharpe **−0.40** |
+
+The entire gross edge is the overnight gap, and the gap belongs to whoever was
+already holding. By the open it has happened; what remains is negative **before
+costs**. Zero commission would not save this.
+
+That reframes the earlier finding. "Accurate but unprofitable after costs" was
+true and too kind. The deeper problem is that the quantity being measured was
+never reachable — and the most encouraging number in the project, a daily Sharpe
+of +1.67, is the one that describes it.
+
+So every evaluation now reports both windows, `labels.executable_return`
+computes the second, and **the gate reads the executable one**. The verdict says
+so in as many words when they disagree:
+
+> +0.8% over the baseline, and close to close that is Sharpe +1.67 — but held
+> from the first open after the signal exists it is −0.40, t −1.4. The edge is in
+> the overnight gap, which is gone by the time anybody could trade on it.
+
+Both series are demeaned the same way for a relative target, so the comparison
+between them is a comparison of windows and not of conventions. Old runs without
+the field fall back to the graded number, which is the optimistic assumption
+this argument exists to stop anybody making silently.
+
+---
+
 ## Two trainers, and why that is the point
 
 Training happens in one of three places, and the useful one is both:
@@ -582,7 +624,7 @@ times the old default, which is a real request of somebody else's GPU.
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-122 tests. The look-ahead ones test the property rather than the implementation
+144 tests. The look-ahead ones test the property rather than the implementation
 — features computed on a truncated history must match the full one — and there
 is a test that deliberately introduces a centred rolling window to confirm the
 property test can still fail. The macro, cross-sectional and event blocks each
@@ -594,4 +636,5 @@ Several are regression tests for the bugs listed above: the pinned cut date, the
 RSI warm-up, per-trade costs, the withheld small-bucket accuracy, the
 training-period baseline, the append-only news store, the noise floor, and the
 sigmoid-to-softmax conversion that would have sharpened every probability by up
-to 0.14 without raising anything.
+to 0.14 without raising anything, and the executable return that turns an
+untradeable backtest into the number the gate reads.

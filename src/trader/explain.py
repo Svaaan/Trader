@@ -71,8 +71,10 @@ MIN_DAYS = 120
 # How much of the walk-forward has to agree before a single window is believed.
 MIN_FOLD_AGREEMENT = 0.7
 
-# And how far the money has to be from zero. Same two-standard-errors bar the
-# accuracy hurdles use, applied to the thing somebody would actually act on.
+# And how far the money has to be from zero -- measured over the window that
+# could actually be held, not the one the label describes. Same two-standard-
+# errors bar the accuracy hurdles use, applied to the thing somebody would
+# actually act on.
 #
 # This hurdle exists because the others were not enough, which was found by
 # running them. On the 238-symbol relative panel the logistic control clears
@@ -209,19 +211,38 @@ def assess(evaluation: dict, *, controls: dict | None = None,
         record("consistent_across_time", True,
                "No walk-forward was run, so consistency over time is untested.")
 
-    # --- and does being right actually pay? -------------------------------
-    tstat = float(evaluation.get("strategy_tstat") or 0.0)
-    sharpe = float(evaluation.get("strategy_sharpe") or 0.0)
+    # --- and does being right actually pay, in a window you could hold? ----
+    #
+    # The executable series, not the graded one. The graded series runs close to
+    # close and the signal is computed from that close, so nothing can be
+    # positioned in time to collect it. Measured on this panel the two disagree
+    # completely -- graded Sharpe +1.67, executable -0.40 -- because the whole
+    # gross edge is the overnight gap. Gating on the graded number would open
+    # the page over a trade nobody can place.
+    tstat = float(evaluation.get("executable_tstat")
+                  if evaluation.get("executable_tstat") is not None
+                  else evaluation.get("strategy_tstat") or 0.0)
+    sharpe = float(evaluation.get("executable_sharpe")
+                   if evaluation.get("executable_sharpe") is not None
+                   else evaluation.get("strategy_sharpe") or 0.0)
+    gap = evaluation.get("execution_gap")
+
     pays = tstat >= MIN_RETURN_TSTAT
-    record("makes_money", pays,
-           f"After costs the strategy returns a t-statistic of {tstat:.2f} "
-           f"(Sharpe {sharpe:.2f}); {MIN_RETURN_TSTAT:.0f} is the bar.")
+    detail = (f"Held from the first open after the signal, the strategy returns "
+              f"a t-statistic of {tstat:.2f} (Sharpe {sharpe:.2f}); "
+              f"{MIN_RETURN_TSTAT:.0f} is the bar.")
+    if gap:
+        detail += (f" The close-to-close version scores {gap:+.2f} Sharpe "
+                   f"higher and cannot be traded.")
+    record("makes_money", pays, detail)
+
     if not pays:
         return refuse(
-            f"It is more accurate than the baseline, but after costs its "
-            f"return has a t-statistic of {tstat:.2f}. Being right more often "
-            f"is not the same as making money -- a model right about small "
-            f"moves and wrong about large ones is exactly this.")
+            f"It is more accurate than the baseline, but held from the first "
+            f"open after the signal exists its return has a t-statistic of "
+            f"{tstat:.2f}. Being right more often is not the same as making "
+            f"money, and a close-to-close backtest is not a trade anybody can "
+            f"place.")
 
     return Trust(True,
                  f"{edge * 100:.2f} points above the baseline over {effective:,} "

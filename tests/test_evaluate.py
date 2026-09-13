@@ -276,3 +276,93 @@ def test_mismatched_inputs_are_refused():
     with pytest.raises(ValueError):
         evaluate.evaluate([0.5, 0.5], [1], [0.01, 0.01],
                           pd.bdate_range("2024-01-01", periods=2), ["A", "B"])
+
+
+# --- the window that could actually be held --------------------------------
+
+def test_the_executable_return_is_reported_separately():
+    """Two windows, same rows, same positions -- only the holding differs."""
+    days = 300
+    positions = [[1, 1]] * days
+    graded = [[0.004, 0.004]] * days        # the label's close-to-close move
+    probs, labels, ret, dates, syms = panel_inputs(positions, graded)
+    # All of the move happens overnight: nothing is left after the open.
+    reachable = np.zeros_like(ret)
+
+    result = evaluate.evaluate(probs, labels, ret, dates, syms,
+                               executable_returns=reachable,
+                               train_up_share=0.6, cost=0.0)
+
+    assert result.strategy_daily > 0.003
+    assert result.executable_daily == pytest.approx(0.0, abs=1e-9)
+    assert result.execution_gap > 0
+
+
+def overnight_edge(days=400, seed=0):
+    """A book that profits close-to-close and earns nothing after the open.
+
+    Long AAA, short BBB, every day. The graded return rewards exactly that
+    with noise on top; the executable return is pure noise. This is the shape
+    of the real finding -- gross edge entirely inside the overnight gap.
+    """
+    rng = np.random.default_rng(seed)
+    positions = [[1, -1]] * days
+    graded = [[0.004 + rng.normal(0, 0.006), -0.004 + rng.normal(0, 0.006)]
+              for _ in range(days)]
+    probs, labels, ret, dates, syms = panel_inputs(positions, graded)
+    return probs, labels, ret, dates, syms, rng.normal(0, 0.01, len(ret))
+
+
+def test_an_edge_that_lives_overnight_is_caught_by_the_gate():
+    """The regression test for the finding this whole feature exists for.
+
+    Close to close the strategy looks excellent. Held from the first open after
+    the signal it earns nothing. The gate has to refuse it.
+    """
+    from trader import explain
+
+    days = 400
+    probs, labels, ret, dates, syms, reachable = overnight_edge(days)
+
+    result = evaluate.evaluate(probs, labels, ret, dates, syms,
+                               executable_returns=reachable,
+                               train_up_share=0.5, cost=0.0)
+
+    assert result.strategy_tstat > 3, "the graded version should look good"
+    assert result.executable_tstat < 2, "the reachable version should not"
+    assert result.execution_gap > 0.5
+
+    trust = explain.assess(
+        {**result.to_dict(), "effective_rows": 4000, "days": days,
+         "accuracy": 0.56, "baseline_accuracy": 0.50, "up_rate": 0.5},
+        controls={"noise_floor": {"spread": 0.004}},
+        walk_forward={"folds_positive": 6, "folds_run": 6})
+
+    assert not trust.trusted
+    money = next(c for c in trust.checks if c["name"] == "makes_money")
+    assert not money["passed"]
+    assert "first open" in trust.reason
+
+
+def test_omitting_the_executable_series_falls_back_rather_than_crashing():
+    """Old callers still work; they just get the optimistic answer."""
+    days = 200
+    positions = [[1, 1]] * days
+    returns = [[0.001, 0.001]] * days
+
+    result = evaluate.evaluate(*panel_inputs(positions, returns),
+                               train_up_share=0.6)
+
+    assert result.executable_daily == result.strategy_daily
+    assert result.execution_gap == 0.0
+
+
+def test_the_verdict_names_the_overnight_gap_when_that_is_the_story():
+    probs, labels, ret, dates, syms, reachable = overnight_edge()
+
+    result = evaluate.evaluate(probs, labels, ret, dates, syms,
+                               executable_returns=reachable,
+                               train_up_share=0.5, cost=0.0)
+    result.edge = 0.03
+
+    assert "overnight gap" in evaluate.verdict(result)

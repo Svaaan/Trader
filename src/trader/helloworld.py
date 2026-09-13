@@ -179,6 +179,36 @@ class Client:
             logger.info("Chose %s (heard from %.0fs ago)", best, best_age)
         return best
 
+    def live_nodes(self, *, max_silence_seconds: int = 300) -> list:
+        """Nodes that have actually spoken recently.
+
+        Asked before uploading a dataset, because on a wide panel that is eighty
+        megabytes and there is no point pushing it at a network with nothing
+        behind it. `isConnected` is not enough -- it is not reconciled against
+        the heartbeat, which is the whole reason pick_node exists.
+        """
+        import datetime as dt
+
+        now = dt.datetime.now(dt.timezone.utc)
+        live = []
+
+        for node in self.nodes():
+            if not node.get("isAvailable"):
+                continue
+            stamp = node.get("last_heartbeat")
+            if not stamp:
+                continue
+            try:
+                seen = dt.datetime.fromisoformat(str(stamp))
+                if seen.tzinfo is None:
+                    seen = seen.replace(tzinfo=dt.timezone.utc)
+            except ValueError:
+                continue
+            if (now - seen).total_seconds() <= max_silence_seconds:
+                live.append(node)
+
+        return live
+
     def cancel(self, task_id: str) -> None:
         self._call("POST", f"/cancel-task/{task_id}")
 

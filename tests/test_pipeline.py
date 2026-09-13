@@ -37,6 +37,9 @@ class StubClient:
         self.uploaded = blob
         return "artifact-1"
 
+    def live_nodes(self, **kwargs):
+        return [{"node_id": "node-1"}]
+
     def pick_node(self):
         return "node-1"
 
@@ -385,3 +388,56 @@ def test_an_unknown_backend_is_refused(runs_dir, panel_prices, offline_spec):
     with pytest.raises(ValueError, match="backend must be"):
         pipeline.start(list(panel_prices), spec=offline_spec,
                        backend="somewhere-else", client=StubClient())
+
+
+def test_a_remote_failure_does_not_discard_a_good_local_model(runs_dir,
+                                                              panel_prices,
+                                                              offline_spec):
+    """Measured the hard way: every HelloWorldAi node had been silent for
+    eight to eleven days, the submit returned 503, and a local run that had
+    already trained and scored was thrown away with it."""
+    class Unreachable(StubClient):
+        def live_nodes(self, **kwargs):
+            return []
+
+    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="both",
+                         client=Unreachable(), run_controls=False)
+
+    assert run.status == "done", "a usable local model was discarded"
+    assert run.primary == "local"
+    assert run.has_local_model
+    assert run.evaluation["rows"] > 0
+    assert run.signals
+    # The reason is recorded, and it is not the same field as a failed run.
+    assert "heartbeat" in run.remote_error
+    assert not run.error
+
+
+def test_a_remote_only_run_still_fails_when_the_network_is_down(runs_dir,
+                                                                panel_prices,
+                                                                offline_spec):
+    """There is nothing to fall back to, so it must not pretend otherwise."""
+    class Unreachable(StubClient):
+        def live_nodes(self, **kwargs):
+            return []
+
+    run = pipeline.start(list(panel_prices), spec=offline_spec,
+                         backend="helloworld", client=Unreachable(),
+                         run_controls=False)
+
+    assert run.status == "failed"
+    assert run.error
+
+
+def test_nothing_is_uploaded_when_no_node_is_alive(runs_dir, panel_prices,
+                                                   offline_spec):
+    """The dataset is eighty megabytes on a wide panel."""
+    class Watching(StubClient):
+        def live_nodes(self, **kwargs):
+            return []
+
+    client = Watching()
+    pipeline.start(list(panel_prices), spec=offline_spec, backend="both",
+                   client=client, run_controls=False)
+
+    assert client.uploaded is None, "pushed a dataset at a network with no nodes"

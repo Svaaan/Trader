@@ -19,6 +19,13 @@ Measured here, repeatedly: up-rate 0.98, accuracy equal to the class balance,
 every feature influence under 0.01. The model was not failing to learn. It had
 learned the only thing reliably there, which is the drift.
 
+There is a second distinction here that matters as much and is easier to miss:
+the return the label *describes* is not the return anybody can *hold*. The label
+runs close to close, and a signal built from today's close cannot be acted on
+until the next open. `forward_return` is the first; `executable_return` is the
+second; every evaluation reports both because on this panel they disagree about
+whether there is a strategy at all.
+
 **Relative direction** -- will this name finish in the top half of its peers --
 removes the drift by construction. The classes are 50/50 on every single date,
 so no constant answer can score above chance, and the market factor that
@@ -83,9 +90,45 @@ def forward_return(prices: pd.DataFrame, *, horizon: int = 1) -> pd.Series:
     Kept because evaluation needs the size of a move, not just its sign: a
     strategy that is right about small moves and wrong about large ones loses
     money while looking accurate.
+
+    Close to close, which is what the label describes and **not** what anybody
+    could hold -- see `executable_return`.
     """
     close = prices["close"]
     return (close.shift(-horizon) / close - 1.0).rename("forward_return")
+
+
+def executable_return(prices: pd.DataFrame, *, horizon: int = 1) -> pd.Series:
+    """The part of that move somebody could actually have captured.
+
+    The features on day t are computed from day t's close. Nobody knows that
+    close until the session has ended, so nobody can be positioned *at* it on
+    the strength of it. The earliest a signal derived from today's close can be
+    acted on is the next open.
+
+    So this measures open(t+1) -> close(t+horizon): enter at the first price
+    available after the signal exists, exit where the label does.
+
+    The difference between this and `forward_return` is the overnight gap, and
+    on this project's own panel the gap is not a rounding error -- it is the
+    entire gross edge. Measured, per row, on the logistic control:
+
+        close(t) -> close(t+1)    +2.96 bp   daily Sharpe +1.67
+          the overnight gap       +3.84 bp   (more than all of it)
+          open(t+1) -> close      -0.80 bp   daily Sharpe -0.40
+
+    A backtest graded on the first line describes a trade nobody can place. The
+    third line is the one that decides whether there is a strategy, which is why
+    evaluate.py reports both and the gate reads this one.
+    """
+    if horizon < 1:
+        raise ValueError("horizon must be at least 1 session")
+
+    # shift(-1) on the open: the next session's opening price, known the instant
+    # that session begins and not before.
+    entry = prices["open"].shift(-1)
+    exit_price = prices["close"].shift(-horizon)
+    return (exit_price / entry - 1.0).rename("executable_return")
 
 
 # --- the whole panel at once -----------------------------------------------
@@ -98,6 +141,14 @@ def forward_return_panel(frames: dict, *, horizon: int = 1) -> pd.DataFrame:
     """Every symbol's forward return, on one date index."""
     return pd.DataFrame({
         symbol: forward_return(prices, horizon=horizon)
+        for symbol, prices in frames.items()
+    }).sort_index()
+
+
+def executable_return_panel(frames: dict, *, horizon: int = 1) -> pd.DataFrame:
+    """The same, for the window that could actually be held."""
+    return pd.DataFrame({
+        symbol: executable_return(prices, horizon=horizon)
         for symbol, prices in frames.items()
     }).sort_index()
 
@@ -149,24 +200,30 @@ def relative_direction(panel: pd.DataFrame, *,
 
 
 def build_panel_labels(frames: dict, *, horizon: int = 1, target: str = RELATIVE,
-                       threshold: float = 0.0,
-                       neutral_band: float = 0.0) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """(labels, returns-to-grade-on) for the whole panel, for either target.
+                       threshold: float = 0.0, neutral_band: float = 0.0
+                       ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """(labels, returns-to-grade-on, returns-that-could-be-held).
 
     One entry point so that a caller cannot pair a relative label with absolute
-    returns, which would be a quiet and very flattering mistake.
+    returns, which would be a quiet and very flattering mistake -- and so that
+    the executable series is demeaned exactly the way the graded one is. A
+    market-neutral book earns market-relative returns whichever window it is
+    held over, and demeaning one and not the other would make the comparison
+    between them meaningless.
     """
     if target not in TARGETS:
         raise ValueError(f"target must be one of {TARGETS}, not {target!r}")
 
     panel = forward_return_panel(frames, horizon=horizon)
+    reachable = executable_return_panel(frames, horizon=horizon)
 
     if target == RELATIVE:
-        graded = relative_forward_return(panel)
-        return relative_direction(panel, neutral_band=neutral_band), graded
+        return (relative_direction(panel, neutral_band=neutral_band),
+                relative_forward_return(panel),
+                relative_forward_return(reachable))
 
     labels = pd.DataFrame({
         symbol: direction(prices, horizon=horizon, threshold=threshold)
         for symbol, prices in frames.items()
     }).sort_index()
-    return labels, panel
+    return labels, panel, reachable

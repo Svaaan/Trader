@@ -147,7 +147,7 @@ function evaluationPanel(run) {
   // discipline applied to the number somebody would actually act on.
   const risk = el("div", "figures");
   risk.appendChild(figure("Sharpe", (evaluation.strategy_sharpe ?? 0).toFixed(2),
-    "return per unit of risk"));
+    "close to close — not tradeable"));
   risk.appendChild(figure("t", (evaluation.strategy_tstat ?? 0).toFixed(2),
     "under 2 is not distinguishable from luck"));
   risk.appendChild(figure("Worst drawdown", percent(evaluation.strategy_max_drawdown),
@@ -155,6 +155,33 @@ function evaluationPanel(run) {
   risk.appendChild(figure("Cost drag", percent(evaluation.cost_drag_annualised),
     `${(evaluation.position_changes || 0).toLocaleString()} position changes`));
   panel.appendChild(risk);
+
+  // And the same money over the window an order could actually reach. Shown
+  // as its own row rather than a column, because it is the one the gate reads
+  // and the one a person would be acting on.
+  if (evaluation.executable_sharpe !== undefined
+      && evaluation.executable_sharpe !== null) {
+    panel.appendChild(el("h4", null, "Held from the first open after the signal"));
+    const real = el("div", "figures");
+    real.appendChild(figure("Sharpe", (evaluation.executable_sharpe ?? 0).toFixed(2),
+      "what an order could reach"));
+    real.appendChild(figure("t", (evaluation.executable_tstat ?? 0).toFixed(2),
+      "the gate reads this one"));
+    real.appendChild(figure("Annualised", signed(evaluation.executable_annualised),
+      "after costs"));
+    real.appendChild(figure("Execution gap",
+      (evaluation.execution_gap ?? 0).toFixed(2),
+      "Sharpe lost to the overnight move"));
+    panel.appendChild(real);
+
+    panel.appendChild(el("p", "note",
+      "The features are computed from a close, so nothing can be positioned at "
+      + "that close on the strength of it — the earliest an order can go in is "
+      + "the next open. The row above grades close to close, which is what the "
+      + "label describes and what nobody can hold. This row grades open to "
+      + "close. When they disagree, the gap is the overnight move, and it "
+      + "belongs to whoever was already holding."));
+  }
 
   if (evaluation.verdict !== undefined || run.verdict) {
     panel.appendChild(el("p", "verdict", run.verdict));

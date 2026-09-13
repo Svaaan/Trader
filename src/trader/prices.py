@@ -23,6 +23,14 @@ for ten years, got two, and never noticed -- the symbol quietly fell out of the
 panel because it had no rows before the cut date, and nine names trained where
 ten were reported. So the cache records what it covers and is refetched when it
 covers less than it is asked for.
+
+**And a cache is only valid until the next session closes.** Checking the span
+is not enough: a ten-year history ending twelve days ago still spans ten years.
+Measured -- the panel was fetched once, and a fortnight later the page was
+still generating "today's signal" from bars dated 2026-09-01, labelled honestly
+as `as_of` and read by nobody. For a daily signal that is the whole product
+quietly two weeks out of date, so a cache whose last bar is older than a few
+days is refetched whatever its span.
 """
 
 from __future__ import annotations
@@ -56,6 +64,13 @@ class PriceError(Exception):
 # satisfy a ten-year request however many times it is refetched.
 CACHE_TOLERANCE_DAYS = 45
 
+# And how stale the *end* of a cache may be before it is refetched. Four days
+# covers a weekend plus a public holiday; beyond that the series has genuinely
+# missed sessions. A delisted symbol will be refetched every run under this
+# rule and fail every time, which is the correct outcome -- it is not a usable
+# price history and the run should keep saying so.
+MAX_CACHE_AGE_DAYS = 4
+
 
 def _period_days(period: str) -> float | None:
     """Roughly how many calendar days `period` asks for, or None if open-ended.
@@ -73,6 +88,20 @@ def _period_days(period: str) -> float | None:
 
     count = int(match.group(1))
     return count * {"d": 1.0, "wk": 7.0, "mo": 30.44, "y": 365.25}[match.group(2)]
+
+
+def _is_current(frame: pd.DataFrame, today: dt.date | None = None) -> bool:
+    """Does this cache reach the present, or did it stop a fortnight ago?
+
+    Separate from `_covers_period` because they fail differently and only one
+    of them was being checked. A history can span exactly what was asked for and
+    still end before the last session anybody traded.
+    """
+    if frame.empty:
+        return False
+
+    today = today or dt.datetime.now(dt.timezone.utc).date()
+    return (today - frame.index[-1].date()).days <= MAX_CACHE_AGE_DAYS
 
 
 def _covers_period(frame: pd.DataFrame, period: str) -> bool:
@@ -162,12 +191,18 @@ def load(symbol: str, *, period: str = "10y", refresh: bool = False) -> pd.DataF
     if not refresh and os.path.exists(path):
         try:
             cached = pd.read_csv(path, index_col="date", parse_dates=["date"])
-            if _covers_period(cached, period):
+            if not _covers_period(cached, period):
+                logger.info(
+                    "Cache for %s covers %s..%s, which is short of %s; refetching",
+                    symbol, cached.index[0].date(), cached.index[-1].date(),
+                    period)
+            elif not _is_current(cached):
+                logger.info(
+                    "Cache for %s ends %s, which is stale; refetching",
+                    symbol, cached.index[-1].date())
+            else:
                 logger.debug("%s: %d rows from cache", symbol, len(cached))
                 return _drop_unfinished_session(cached)
-            logger.info(
-                "Cache for %s covers %s..%s, which is short of %s; refetching",
-                symbol, cached.index[0].date(), cached.index[-1].date(), period)
         except Exception as exc:                       # noqa: BLE001
             logger.warning("Cache for %s unreadable (%s); refetching", symbol, exc)
 
