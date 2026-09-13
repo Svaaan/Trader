@@ -49,6 +49,7 @@ from . import labels as labels_mod
 from . import model as model_mod
 from . import news as news_mod
 from . import prices as prices_mod
+from . import trainer as trainer_mod
 from . import universe as universe_mod
 from .helloworld import Client, HelloWorldError
 
@@ -66,6 +67,7 @@ DEFAULT_UNIVERSE = os.environ.get("TRADER_UNIVERSE", "wide")
 
 STATE_FILE = "run.json"
 BUNDLE_FILE = "model.zip"
+LOCAL_BUNDLE_FILE = "local_model.zip"
 
 # Training length, in passes over the data rather than in steps.
 #
@@ -127,12 +129,20 @@ class Run:
     horizon: int
     task_id: Optional[str] = None
     status: str = "building"
+    # Which trainer produced the headline numbers, and which were asked for.
+    backend: str = trainer_mod.HELLOWORLD
+    primary: str = ""
     spec: dict = dataclasses.field(default_factory=dict)
     dataset: dict = dataclasses.field(default_factory=dict)
     verification: dict = dataclasses.field(default_factory=dict)
     evaluation: dict = dataclasses.field(default_factory=dict)
     controls: dict = dataclasses.field(default_factory=dict)
     walk_forward: dict = dataclasses.field(default_factory=dict)
+    # The local reference model, when one was trained. Kept beside rather than
+    # inside `evaluation`, because the pair is the point -- see trainer.py.
+    local_evaluation: dict = dataclasses.field(default_factory=dict)
+    local_verdict: str = ""
+    comparison: dict = dataclasses.field(default_factory=dict)
     verdict: str = ""
     signals: list = dataclasses.field(default_factory=list)
     trust: dict = dataclasses.field(default_factory=dict)
@@ -160,8 +170,24 @@ class Run:
         return os.path.join(_run_dir(self.run_id), BUNDLE_FILE)
 
     @property
+    def local_bundle_path(self) -> str:
+        return os.path.join(_run_dir(self.run_id), LOCAL_BUNDLE_FILE)
+
+    @property
     def has_model(self) -> bool:
         return os.path.exists(self.bundle_path)
+
+    @property
+    def has_local_model(self) -> bool:
+        return os.path.exists(self.local_bundle_path)
+
+    @property
+    def wants_remote(self) -> bool:
+        return self.backend in (trainer_mod.HELLOWORLD, trainer_mod.BOTH)
+
+    @property
+    def wants_local(self) -> bool:
+        return self.backend in (trainer_mod.LOCAL, trainer_mod.BOTH)
 
     @property
     def cut_date(self) -> Optional[pd.Timestamp]:
@@ -191,9 +217,10 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
           period: str = "10y", test_fraction: float = 0.2,
           target: str = labels_mod.RELATIVE,
           spec: dataset_mod.Spec | None = None,
+          backend: str = trainer_mod.BOTH,
           steps: int | None = None, client: Client | None = None,
           run_controls: bool = True, folds: int = 6) -> Run:
-    """Build a dataset from live prices and send it to HelloWorldAi.
+    """Build a dataset from live prices and train a model on it.
 
     The test half never leaves this machine. HelloWorldAi gets the training rows
     only, so the score this project reports is measured on data no model in the
@@ -208,7 +235,23 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
     A fixed step count is a fixed number of *samples*, which is a shrinking
     number of passes as the panel widens, and an undertrained model looks
     exactly like a model with nothing to learn.
+
+    `backend` chooses where the training happens:
+
+      "helloworld"  upload, submit, poll, download -- the original path
+      "local"       train here in numpy, about half a minute, no network
+      "both"        do both on the same rows and compare them
+
+    "both" is the one worth running. The two get identical rows and identical
+    hyperparameters, so any gap between their scores is a fact about the round
+    trip rather than about the data -- see trainer.py. A local-only run finishes
+    before this function returns; anything involving HelloWorldAi comes back
+    "training" and is picked up by `collect`.
     """
+    if backend not in trainer_mod.BACKENDS:
+        raise ValueError(
+            f"backend must be one of {trainer_mod.BACKENDS}, not {backend!r}")
+
     client = client or Client()
     symbols = universe_mod.resolve(watchlist) if watchlist else default_watchlist()
 
@@ -218,7 +261,8 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
 
     run = Run(run_id=run_id,
               created=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-              watchlist=symbols, horizon=horizon, spec=spec.to_dict())
+              watchlist=symbols, horizon=horizon, spec=spec.to_dict(),
+              backend=backend)
     run.save()
 
     try:
@@ -232,21 +276,6 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
 
         description = dataset_mod.describe(splits, scaler, spec, report, cut)
         run.dataset = description
-
-        # --- what a model has to beat, measured here, before anything is sent --
-        if run_controls:
-            try:
-                # The same width, depth and step count as the job about to
-                # be submitted, so the control is a control.
-                run.controls = baseline_mod.run_controls(
-                    splits, report["feature_names"],
-                    hidden=64, depth=2, steps=steps)
-                run.walk_forward = baseline_mod.walk_forward(
-                    frames, spec, folds=folds)
-                run.save()
-            except Exception as exc:                    # noqa: BLE001
-                logger.warning("Controls failed, continuing: %s", exc)
-                run.controls = {"error": str(exc)}
 
         # Now that the rows exist, work out how much training they deserve.
         training_steps = steps if steps is not None else steps_for(len(y_train))
@@ -271,33 +300,69 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
                 logger.warning("Controls failed, continuing: %s", exc)
                 run.controls = {"error": str(exc)}
 
-        blob = dataset_mod.pack_for_helloworld(x_train, y_train)
-        description["bytes_sent"] = len(blob)
+        hyper = trainer_mod.Hyperparameters(
+            hidden=64, depth=2, steps=training_steps, batch=BATCH_SIZE)
+        description["hyperparameters"] = hyper.to_dict()
 
-        artifact_id = client.upload_dataset(blob)
+        # --- train here, if asked ------------------------------------------
+        #
+        # Done first, and synchronously. It takes about half a minute, so a
+        # `both` run has a scored model before the submit has finished
+        # uploading -- which means the page has something to show during the
+        # hour the remote job spends queued, and means a broken round trip is
+        # visible as a gap rather than as an absence.
+        if run.wants_local:
+            bundle = trainer_mod.train_local(
+                x_train, y_train, report["feature_names"], hyper)
+            with open(run.local_bundle_path, "wb") as handle:
+                handle.write(bundle)
+            logger.info("Run %s: trained locally (%d bytes)", run_id, len(bundle))
 
-        # Choose the machine rather than letting the coordinator choose on a
-        # flag that goes stale -- see Client.pick_node. None falls back to its
-        # placement, which is right when every node is reporting normally.
-        node_id = client.pick_node()
-        description["node_id"] = node_id
+        # --- and send it, if asked -----------------------------------------
+        if run.wants_remote:
+            blob = dataset_mod.pack_for_helloworld(x_train, y_train)
+            description["bytes_sent"] = len(blob)
 
-        run.task_id = client.submit(
-            dataset_id=artifact_id,
-            model_name=f"trader-{run_id}",
-            steps=training_steps,
-            batch_size=BATCH_SIZE,
-            hidden_dim=64,
-            depth=2,
-            node_id=node_id,
-        )
-        run.status = "training"
-        logger.info("Run %s submitted as %s", run_id, run.task_id)
+            artifact_id = client.upload_dataset(blob)
+
+            # Choose the machine rather than letting the coordinator choose on
+            # a flag that goes stale -- see Client.pick_node. None falls back to
+            # its placement, which is right when every node is reporting
+            # normally.
+            node_id = client.pick_node()
+            description["node_id"] = node_id
+
+            run.task_id = client.submit(
+                dataset_id=artifact_id,
+                model_name=f"trader-{run_id}",
+                steps=training_steps,
+                batch_size=BATCH_SIZE,
+                hidden_dim=64,
+                depth=2,
+                node_id=node_id,
+            )
+            run.status = "training"
+            logger.info("Run %s submitted as %s", run_id, run.task_id)
+
+        # A local-only run has nothing to wait for, so it finishes here.
+        if run.wants_local and not run.wants_remote:
+            _process(run)
+            run.status = "done"
+            logger.info("Run %s finished locally: %s", run_id, run.verdict)
+        elif run.wants_local:
+            # Score the local model now so the page is readable while the
+            # remote job queues. `collect` re-scores both together when it
+            # lands, which is where the comparison gets made.
+            try:
+                _process(run)
+            except Exception as exc:                    # noqa: BLE001
+                logger.warning("Could not score the local model yet: %s", exc)
+            run.status = "training"
 
     except Exception as exc:                            # noqa: BLE001
         run.status = "failed"
         run.error = str(exc)
-        logger.exception("Run %s could not be submitted", run_id)
+        logger.exception("Run %s could not be started", run_id)
 
     run.save()
     return run
@@ -306,7 +371,12 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
 # --- collecting ------------------------------------------------------------
 
 def collect(run: Run, *, client: Client | None = None) -> Run:
-    """Fetch and process the model if the job has finished. Safe to repeat."""
+    """Fetch and process the remote model if the job has finished.
+
+    Safe to repeat. A run with no remote half has nothing here to wait for --
+    it was finished by `start` -- so it is left alone rather than being polled
+    for a task that does not exist.
+    """
     if run.status in ("done", "failed") or not run.task_id:
         return run
 
@@ -366,8 +436,17 @@ def collect_all(*, client: Client | None = None) -> list:
 # --- what to do with a finished model --------------------------------------
 
 def _process(run: Run) -> None:
-    """Score the model out of time, then read today's signal from it."""
-    model = model_mod.load_bundle_file(run.bundle_path)
+    """Score whatever models this run has, out of time, on one rebuild.
+
+    A run can hold two: the one HelloWorldAi returned and the one trained here
+    on the same rows with the same hyperparameters. Both go through the same
+    loader, the same forward pass and the same evaluator, because the only way
+    the comparison between them means anything is if nothing else differs.
+
+    The headline numbers describe the *remote* model when there is one -- it is
+    the thing under test -- and the local one otherwise, so that a `both` run is
+    readable during the hour it spends waiting rather than blank.
+    """
     scaler = dataset_mod.Scaler.from_dict(run.dataset["scaler"])
     spec = dataset_mod.Spec.from_dict(run.spec or {})
 
@@ -404,14 +483,45 @@ def _process(run: Run) -> None:
     # --- the honest score: rows that were never sent anywhere ---
     (x_test, y_test, returns, dates), symbols = dataset_mod.test_matrix(
         splits, scaler)
-
-    probabilities = model.probabilities(x_test)[:, 1]
     train_up_share = (run.dataset.get("train") or {}).get("up_share")
-    result = evaluate_mod.evaluate(probabilities, y_test, returns, dates, symbols,
-                                   train_up_share=train_up_share)
+
+    def score(path: str) -> tuple:
+        model = model_mod.load_bundle_file(path)
+        probabilities = model.probabilities(x_test)[:, 1]
+        result = evaluate_mod.evaluate(
+            probabilities, y_test, returns, dates, symbols,
+            train_up_share=train_up_share)
+        return model, result
+
+    # --- the local reference, when there is one ---
+    local_model = None
+    if run.has_local_model:
+        local_model, local_result = score(run.local_bundle_path)
+        run.local_evaluation = local_result.to_dict()
+        run.local_verdict = evaluate_mod.verdict(local_result)
+
+    # --- the model under test ---
+    if run.has_model:
+        model, result = score(run.bundle_path)
+        run.primary = trainer_mod.HELLOWORLD
+    elif local_model is not None:
+        model, result = local_model, local_result
+        run.primary = trainer_mod.LOCAL
+    else:
+        raise ValueError("this run has no model to score")
 
     run.evaluation = result.to_dict()
     run.verdict = evaluate_mod.verdict(result)
+
+    # --- what the gap between them means -------------------------------------
+    #
+    # Same architecture, same rows, same hyperparameters: the only thing that
+    # should separate them is the seed, and the noise floor is how much that is
+    # worth. Anything larger is the round trip doing something.
+    if run.has_model and run.local_evaluation:
+        run.comparison = trainer_mod.compare(
+            run.local_evaluation, run.evaluation,
+            noise_floor=(run.controls.get("noise_floor") or {}).get("spread"))
 
     # Whether anything below is worth printing. Decided once, from the
     # out-of-time score, the noise floor and the walk-forward.

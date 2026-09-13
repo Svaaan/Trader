@@ -46,6 +46,7 @@ from starlette.requests import Request
 from .. import context as context_mod
 from .. import news as news_mod
 from .. import pipeline
+from .. import trainer as trainer_mod
 from ..helloworld import Client
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,12 @@ class Question(BaseModel):
 
     question: str
     symbol: str | None = None
+
+
+class NewRun(BaseModel):
+    """Where to train. See trainer.py for why "both" is the useful one."""
+
+    backend: str = trainer_mod.BOTH
 
 
 def _newest_done():
@@ -140,6 +147,13 @@ def api_analysis():
             "spec": run.spec,
             "trust": run.trust,
             "evaluation": run.evaluation,
+            # Which trainer produced the headline numbers, the local reference
+            # model when there is one, and what the gap between them means.
+            "backend": run.backend,
+            "primary": run.primary,
+            "local_evaluation": run.local_evaluation,
+            "local_verdict": run.local_verdict,
+            "comparison": run.comparison,
             # What a model had to beat, measured locally before anything was
             # sent. Shown beside the trained model rather than under it.
             "controls": run.controls,
@@ -204,20 +218,31 @@ def api_status():
 
 
 @app.post("/api/runs")
-def api_start(background: BackgroundTasks):
-    """Build a dataset and send it. Returns immediately; the page polls."""
+def api_start(background: BackgroundTasks, body: NewRun | None = None):
+    """Build a dataset and train on it. Returns immediately; the page polls.
+
+    Even a local run goes through the background task rather than blocking the
+    request: assembling a wide panel takes long enough that a browser would
+    give up on it.
+    """
+    backend = (body.backend if body else trainer_mod.BOTH)
+    if backend not in trainer_mod.BACKENDS:
+        return JSONResponse(
+            {"error": f"backend must be one of {list(trainer_mod.BACKENDS)}"},
+            status_code=400)
+
     if not _starting.acquire(blocking=False):
         return JSONResponse(
             {"error": "A run is already being prepared."}, status_code=409)
 
-    def build_and_submit():
+    def build_and_train():
         try:
-            pipeline.start()
+            pipeline.start(backend=backend)
         finally:
             _starting.release()
 
-    background.add_task(build_and_submit)
-    return {"status": "started"}
+    background.add_task(build_and_train)
+    return {"status": "started", "backend": backend}
 
 
 @app.post("/api/collect")

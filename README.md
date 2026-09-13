@@ -1,11 +1,12 @@
 # Trader
 
-Direction signals for US and European equities, trained on HelloWorldAi and
-scored honestly.
+Direction signals for US and European equities, trained two ways and scored
+honestly.
 
-It fetches daily prices, builds features from five sources, sends the training
-half to HelloWorldAi to train on a real GPU, fetches the finished model back
-automatically, and grades it on the last stretch of history it was never given.
+It fetches daily prices, builds features from five sources, and trains on the
+training half — here in numpy, or on HelloWorldAi across a network, or both at
+once so the two can be compared. Either way the model is graded on the last
+stretch of history it was never given.
 
 **It produces an opinion about direction and nothing else.** No orders, no
 broker credentials, no keys to anything that can spend money. Adding execution
@@ -16,8 +17,11 @@ python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
 
 cp env/.env.example env/.env      # then put a submitter key in it
+
+python train.py                   # train here AND on HelloWorldAi, then compare
+python train.py --backend local   # here only: ~30s, no network, no key needed
 python run.py                     # the UI, on http://127.0.0.1:8600
-python watch.py --news            # collect finished models, and grow the news store
+python watch.py --news            # collect finished models, grow the news store
 ```
 
 The first run fetches a few hundred price histories and takes some minutes.
@@ -71,6 +75,61 @@ For contrast, the original absolute target on the same panel: the seed spread
 alone was 1.84 points, walk-forward was positive in 1 of 6 windows, and the mean
 edge across windows was −2.44%. Every "edge" ever measured on that setup was
 smaller than the gap between a model and itself.
+
+---
+
+## Two trainers, and why that is the point
+
+Training happens in one of three places, and the useful one is both:
+
+| `--backend` | what it does |
+|---|---|
+| `local` | trains here in numpy — about 30 seconds, no network, no GPU, no key |
+| `helloworld` | upload, submit, poll, download — the original path |
+| `both` | the same rows to both, then compare them (**default**) |
+
+**Your GPU is not the bottleneck, and neither was the network.** The model is
+**7,233 parameters** — 46 → 64 → 64 → 1. Training it for the full step count is
+26 seconds of numpy on a CPU; a full train-and-score cycle is about 30. At batch
+size 64 an RTX 3070 is launching kernels for matrices too small to fill it. What
+was being shipped across a network and queued behind a node-placement bug was
+half a minute of arithmetic.
+
+So the HelloWorldAi path stays, because running a real workload through a
+distributed trainer is the point of having built one — but it is no longer the
+only way to get a model, and it now has something to be checked against.
+
+**Both backends produce the same artifact.** A locally trained network is packed
+into the same zip of `model.safetensors` plus a `config.json` manifest that
+HelloWorldAi returns, loaded by the same `model.load_bundle`, run through the
+same numpy forward pass, and scored by the same evaluator on the same held-out
+rows. Nothing downstream knows which one it got.
+
+That identity is what makes the comparison mean anything: same rows, same
+hyperparameters, same everything except where the gradient descent happened. Any
+gap is a fact about the **round trip** — placement, their trainer, the holdout
+it carves out, the weights that came back — rather than about the data.
+
+And the gap has a scale. Two models of this shape on these rows differ by the
+seed alone, and the noise floor already measures how much that is worth, so the
+page reports the gap in multiples of it:
+
+> The two agree to within the seed spread (1.62 points). The round trip is
+> returning what training here returns, which is what it should do.
+
+A gap several times the seed spread in HelloWorldAi's favour is treated as
+*suspicious* rather than good news — both saw the same training rows, so a real
+advantage has to have come from somewhere, and the usual somewhere is having
+seen more than it should.
+
+One trap worth recording, because it would never have raised: the bundle format
+ends in two class scores through a softmax and the local network ends in one
+logit through a sigmoid. `softmax([a0, a1])[1]` is `sigmoid(a1 − a0)`, so the
+"down" row must be **zero** and the "up" row the trained weights. Mirroring them
+as `[−w, +w]` is the obvious thing to write, doubles the logit, and silently
+sharpens every probability the model reports by up to 0.14. `train_local` loads
+its own output back through the real loader and refuses to return a bundle that
+disagrees with the network that produced it.
 
 ---
 
@@ -395,6 +454,8 @@ labels.py     the only forward-looking lines, kept separate; two targets
 dataset.py    one cut date, carried not re-derived; purge; scaler on train only
    |
 baseline.py   majority, logistic, local MLP, walk-forward, noise floor
+trainer.py    two backends producing the same artifact, and what their
+   |          disagreement means, in units of the seed spread
 helloworld.py upload -> submit -> poll -> download
    |
 model.py      numpy forward pass; no torch, no GPU, no black box
@@ -439,7 +500,7 @@ times the old default, which is a real request of somebody else's GPU.
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-101 tests. The look-ahead ones test the property rather than the implementation
+122 tests. The look-ahead ones test the property rather than the implementation
 — features computed on a truncated history must match the full one — and there
 is a test that deliberately introduces a centred rolling window to confirm the
 property test can still fail. The macro, cross-sectional and event blocks each
@@ -449,4 +510,6 @@ here instead of in production.
 
 Several are regression tests for the bugs listed above: the pinned cut date, the
 RSI warm-up, per-trade costs, the withheld small-bucket accuracy, the
-training-period baseline, the append-only news store, and the noise floor.
+training-period baseline, the append-only news store, the noise floor, and the
+sigmoid-to-softmax conversion that would have sharpened every probability by up
+to 0.14 without raising anything.

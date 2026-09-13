@@ -190,6 +190,66 @@ function figureRow(label, value, hint) {
   return grid;
 }
 
+// --- the two backends ------------------------------------------------------
+
+function backendPanel(run) {
+  const local = run.local_evaluation || {};
+  const comparison = run.comparison || {};
+  if (!local.accuracy && !comparison.gap) return null;
+
+  const panel = el("section", "a-panel");
+  panel.appendChild(el("h2", null, "Trained here, and trained there"));
+
+  const rows = [
+    ["Trained here (numpy, no GPU)", local, run.primary === "local"],
+    ["HelloWorldAi", run.evaluation || {}, run.primary === "helloworld"],
+  ].filter(([, value]) => value && value.accuracy !== undefined);
+
+  const table = el("table", "compare");
+  const header = el("tr");
+  ["Where", "Accuracy", "Edge", "Up-rate", "Sharpe", "t"].forEach((label) => {
+    header.appendChild(el("th", null, label));
+  });
+  table.appendChild(header);
+
+  rows.forEach(([label, result, isPrimary]) => {
+    const row = el("tr", isPrimary ? "is-subject" : null);
+    row.appendChild(el("td", null, label));
+    row.appendChild(el("td", null, pct(result.accuracy, 2)));
+    row.appendChild(el("td", null, pct(result.edge, 2)));
+    row.appendChild(el("td", null, pct(result.up_rate, 0)));
+    row.appendChild(el("td", null, num(result.strategy_sharpe)));
+    row.appendChild(el("td", null, num(result.strategy_tstat)));
+    table.appendChild(row);
+  });
+  panel.appendChild(table);
+
+  if (comparison.gap !== undefined && comparison.gap !== null) {
+    panel.appendChild(figureRow(
+      "Gap",
+      pct(comparison.gap, 2),
+      comparison.multiples_of_noise !== undefined
+        ? `${num(comparison.multiples_of_noise)}× the seed spread`
+        : "no noise floor measured"));
+  }
+
+  // The reading is the point. A gap in points means nothing without knowing
+  // how far apart two identical models land by chance.
+  panel.appendChild(el("p", "note", comparison.reading
+    || "Only one backend has reported so far. The comparison appears when the "
+       + "other does."));
+
+  panel.appendChild(el("p", "note",
+    "Both were given the same rows and the same hyperparameters, and both are "
+    + "loaded by the same numpy forward pass and scored by the same evaluator. "
+    + "So a difference between them is a fact about the round trip — placement, "
+    + "the trainer, the holdout it carves out, the weights that came back — "
+    + "rather than about the data. The model is 7,233 parameters; training it "
+    + "here takes about half a minute and needs no GPU."));
+
+  return panel;
+}
+
 // --- did it hold up across time? -------------------------------------------
 
 function walkForwardPanel(run) {
@@ -496,12 +556,17 @@ async function refresh() {
     const run = body.run;
     const target = run.spec?.target || "absolute";
 
+    const where = run.primary === "local" ? "trained here"
+      : run.primary === "helloworld" ? "trained on HelloWorldAi"
+        : "";
     host.appendChild(el("p", "analysis-meta",
-      `Model ${run.run_id}, ${run.horizon}-day horizon, ${target} target, `
-      + `graded on ${run.dataset?.test?.from || "?"} → ${run.dataset?.test?.to || "?"}.`));
+      `Model ${run.run_id}${where ? ", " + where : ""}, ${run.horizon}-day `
+      + `horizon, ${target} target, graded on `
+      + `${run.dataset?.test?.from || "?"} → ${run.dataset?.test?.to || "?"}.`));
 
     [
       trustPanel(run),
+      backendPanel(run),
       controlsPanel(run),
       walkForwardPanel(run),
       datasetPanel(run),

@@ -275,3 +275,113 @@ def test_an_old_run_missing_new_fields_still_loads(runs_dir):
     runs = pipeline.list_runs()
     assert len(runs) == 1
     assert runs[0].controls == {}
+
+
+# --- backends --------------------------------------------------------------
+
+def test_a_local_run_finishes_without_a_network(runs_dir, panel_prices,
+                                                offline_spec):
+    """Nothing to wait for: about half a minute of numpy and it is scored."""
+    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="local",
+                         client=StubClient(), run_controls=False)
+
+    assert run.status == "done"
+    assert run.task_id is None, "a local run should not have submitted anything"
+    assert run.primary == "local"
+    assert run.has_local_model and not run.has_model
+    assert run.evaluation["rows"] > 0
+    assert run.signals
+
+
+def test_a_remote_run_does_not_train_locally(runs_dir, panel_prices,
+                                             offline_spec):
+    run = pipeline.start(list(panel_prices), spec=offline_spec,
+                         backend="helloworld", client=StubClient(),
+                         run_controls=False)
+
+    assert run.status == "training"
+    assert run.task_id == "task-1"
+    assert not run.has_local_model
+
+
+def test_both_trains_here_and_submits_the_same_rows(runs_dir, panel_prices,
+                                                    offline_spec):
+    """The local half has to be scored before the remote one lands.
+
+    Otherwise the page is blank for the hour the job spends queued, and a round
+    trip that never returns is indistinguishable from one still running.
+    """
+    client = StubClient()
+    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="both",
+                         client=client, run_controls=False)
+
+    assert run.status == "training"
+    assert run.task_id == "task-1"
+    assert run.has_local_model
+    assert run.primary == "local", "the local model should carry the page"
+    assert run.local_evaluation["rows"] > 0
+    # And both halves got the same hyperparameters.
+    assert client.submitted["steps"] == run.dataset["hyperparameters"]["steps"]
+
+
+def test_when_the_remote_lands_it_becomes_the_subject(runs_dir, panel_prices,
+                                                      offline_spec):
+    from trader import trainer
+
+    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="both",
+                         client=StubClient(), run_controls=False)
+
+    # Stand in for the returned model with the same architecture on the same
+    # rows, differing only in seed -- which is what it should be.
+    splits, _, report = dataset.build_panel(panel_prices, offline_spec)
+    x, y, _ = dataset.combine(splits, report["feature_names"])
+    with open(run.bundle_path, "wb") as handle:
+        handle.write(trainer.train_local(
+            x, y, report["feature_names"],
+            trainer.Hyperparameters(steps=run.dataset["steps"], seed=11)))
+
+    pipeline._process(run)
+
+    assert run.primary == "helloworld"
+    assert run.local_evaluation["rows"] == run.evaluation["rows"]
+    assert run.comparison["gap"] is not None
+
+
+def test_the_comparison_is_scaled_by_the_noise_floor(runs_dir, panel_prices,
+                                                     offline_spec):
+    """"0.6 points" and "eight times what a seed can do" are different claims."""
+    from trader import trainer
+
+    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="both",
+                         client=StubClient(), run_controls=True, folds=3)
+
+    splits, _, report = dataset.build_panel(panel_prices, offline_spec)
+    x, y, _ = dataset.combine(splits, report["feature_names"])
+    with open(run.bundle_path, "wb") as handle:
+        handle.write(trainer.train_local(
+            x, y, report["feature_names"],
+            trainer.Hyperparameters(steps=run.dataset["steps"], seed=11)))
+
+    pipeline._process(run)
+
+    assert run.comparison["noise_floor"] == run.controls["noise_floor"]["spread"]
+    assert "multiples_of_noise" in run.comparison
+    assert run.comparison["reading"]
+
+
+def test_collect_leaves_a_local_run_alone(runs_dir, panel_prices, offline_spec):
+    """There is no task to poll for, and polling would invent one."""
+    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="local",
+                         client=StubClient(), run_controls=False)
+
+    class Exploding:
+        def job(self, task_id):
+            raise AssertionError("a local run must not be polled")
+
+    assert pipeline.collect(run, client=Exploding()).status == "done"
+
+
+def test_an_unknown_backend_is_refused(runs_dir, panel_prices, offline_spec):
+    with pytest.raises(ValueError, match="backend must be"):
+        pipeline.start(list(panel_prices), spec=offline_spec,
+                       backend="somewhere-else", client=StubClient())
