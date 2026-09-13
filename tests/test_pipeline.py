@@ -552,3 +552,29 @@ def test_the_app_loads_its_own_environment():
 
     source = importlib.resources.files  # noqa: F841  (import guard only)
     assert "load_dotenv" in open(web_app.__file__, encoding="utf-8").read()
+
+
+def test_a_feature_that_can_no_longer_be_built_refuses_scoring_by_name(
+        runs_dir, panel_prices, offline_spec, monkeypatch):
+    """A macro series that stopped updating takes its features out of the
+    block. A run trained on one of them must say so, not fail on a shape
+    mismatch three calls later or be scored on a column that was invented."""
+    run = pipeline.start(list(panel_prices), spec=offline_spec,
+                         client=StubClient(), run_controls=False)
+    with open(run.bundle_path, "wb") as handle:
+        handle.write(make_bundle(run.dataset["feature_names"]))
+
+    real = pipeline.dataset_mod.prepare
+    lost = run.dataset["feature_names"][-1]
+
+    def without_one(frames, spec=None, **kwargs):
+        prepared = real(frames, spec, **kwargs)
+        prepared.feature_names = [n for n in prepared.feature_names if n != lost]
+        prepared.report["macro"] = {"ended": {"vix3m": {"last": "2026-07-17"}}}
+        return prepared
+
+    monkeypatch.setattr(pipeline.dataset_mod, "prepare", without_one)
+    with pytest.raises(ValueError, match="can no longer be built") as refused:
+        pipeline._process(run)
+    assert lost in str(refused.value)
+    assert "2026-07-17" in str(refused.value)

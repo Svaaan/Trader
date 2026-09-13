@@ -24,15 +24,17 @@ itself, and each has a test of its own below:
     there is and loses 3.2% a year, so accuracy alone cannot open the gate
 """
 
+import math
 import os
 import sys
 
 import numpy as np
+import pandas as pd
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from trader import explain                                    # noqa: E402
+from trader import evaluate, explain                          # noqa: E402
 from trader.dataset import Scaler                             # noqa: E402
 
 
@@ -298,3 +300,113 @@ def test_the_money_hurdle_is_recorded_even_when_it_is_the_only_failure():
     names = [c["name"] for c in trust.checks]
     assert names[-1] == "makes_money"
     assert sum(1 for c in trust.checks if not c["passed"]) == 1
+
+
+# --- how often chance clears the chance hurdle ------------------------------
+#
+# The edge is accuracy minus a baseline measured on the same rows, so it is a
+# difference of two noisy proportions, and on an absolute target the baseline
+# is shared by every name on a date. The hurdle used to size its bar as one
+# proportion over the effective rows, which ignored both. These grade models
+# with no skill at all -- sticky random views, like a real model whose features
+# move slowly -- through evaluate and the gate, exactly as a run would be.
+
+def skill_free_evaluations(kind, *, trials=150, days=300, names=10, seed=0):
+    rng = np.random.default_rng(seed)
+    calendar = pd.bdate_range("2020-01-01", periods=days)
+    dates = np.repeat(calendar, names)
+    symbols = np.tile([f"S{i}" for i in range(names)], days)
+
+    graded = []
+    for _ in range(trials):
+        shared = (rng.normal(0.0, 0.01, size=(days, 1))
+                  if kind == "shared_market" else 0.0)
+        returns = shared + rng.normal(0.0, 0.01, size=(days, names))
+        if kind == "relative":
+            ranks = pd.DataFrame(returns).rank(axis=1, pct=True).to_numpy()
+            labels = (ranks > 0.5).astype(int)
+            returns = returns - returns.mean(axis=1, keepdims=True)
+        else:
+            labels = (returns > 0).astype(int)
+
+        view = np.empty((days, names))
+        view[0] = rng.random(names)
+        for t in range(1, days):
+            redraw = rng.random(names) > 0.9
+            view[t] = np.where(redraw, rng.random(names), view[t - 1])
+
+        result = evaluate.evaluate(
+            view.ravel(), labels.ravel(), returns.ravel(), dates, symbols,
+            executable_returns=returns.ravel(), train_up_share=0.5, cost=0.0)
+        graded.append(result.to_dict())
+    return graded
+
+
+@pytest.fixture(scope="module")
+def skill_free():
+    """Simulated once and shared: about 450 evaluations is ten seconds."""
+    return {kind: skill_free_evaluations(kind, seed=index)
+            for index, kind in enumerate(("independent", "shared_market",
+                                          "relative"))}
+
+
+def chance_hurdle(evaluations, *, measured=True):
+    """(share that cleared beats_chance, spread of edge / standard error)."""
+    passed, ratios = 0, []
+    for scored in evaluations:
+        if not measured:
+            scored = {k: v for k, v in scored.items()
+                      if k != "edge_standard_error"}
+        trust = explain.assess(scored)
+        check = next((c for c in trust.checks if c["name"] == "beats_chance"),
+                     None)
+        passed += bool(check and check["passed"])
+        ratios.append(trust.edge / max(trust.needed / 2.0, 1e-12))
+    return passed / len(evaluations), float(np.std(ratios))
+
+
+def test_the_chance_hurdle_admits_skill_free_models_at_about_its_nominal_rate(
+        skill_free):
+    """Two standard errors, one-sided, is a 2.3% false-pass rate by design.
+
+    Both halves are checked. The pass rate says the bar is not too low; the
+    spread of edge over standard error says it is not too high either, which
+    matters because the obvious repair -- doubling the row variance -- would
+    have passed the first check while making the relative target 30% too strict.
+    """
+    for kind, evaluations in skill_free.items():
+        rate, spread = chance_hurdle(evaluations)
+        assert rate <= 0.06, (
+            f"{kind}: a model with no skill cleared the chance hurdle "
+            f"{rate:.1%} of the time")
+        assert 0.85 <= spread <= 1.15, (
+            f"{kind}: edge / standard error spread {spread:.2f}, not near 1")
+
+
+def test_the_old_single_proportion_bar_let_them_through(skill_free):
+    """The companion, and what a stored run from before the fix still gets.
+
+    Without the measured standard error the gate falls back to the old formula,
+    and on the same simulated models it over-admits -- badly where the names
+    share a market. If this ever comes back calibrated, the test above has
+    stopped exercising the problem it was written for.
+    """
+    rate, spread = chance_hurdle(skill_free["shared_market"], measured=False)
+    assert rate >= 0.10
+    assert spread >= 1.6
+
+    _, spread = chance_hurdle(skill_free["independent"], measured=False)
+    assert spread >= 1.25
+
+
+def test_the_measured_standard_error_sets_the_bar_when_present():
+    trust = explain.assess({**evaluation(0.53, 0.50), "edge_standard_error": 0.02})
+    assert trust.needed == pytest.approx(0.04)
+    assert not named(trust, "beats_chance")["passed"]
+
+
+def test_a_stored_run_without_it_keeps_the_old_formula_and_says_so():
+    trust = explain.assess(evaluation(0.53, 0.50, effective=2400))
+    assert trust.needed == pytest.approx(2.0 * math.sqrt(0.25 / 2400))
+    assert named(trust, "beats_chance")["passed"]
+    assert "older" in named(trust, "beats_chance")["detail"]

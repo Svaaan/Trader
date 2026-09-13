@@ -209,11 +209,17 @@ def assemble(frames: dict, spec: Spec | None = None, *,
     macro_frame = None
     if spec.use_macro:
         try:
-            macro_frame = macro_mod.build(refresh=refresh)
+            notes: dict = {}
+            macro_frame = macro_mod.build(refresh=refresh, report=notes)
             macro_names = macro_mod.names(macro_frame)
             names += macro_names
+            # `ended` names any series the provider stopped publishing, which
+            # took its features out of the block; `gaps` counts sessions left
+            # blank inside a series that resumed.
             report["macro"] = {"used": True, "columns": macro_names,
-                               "rows": len(macro_frame)}
+                               "rows": len(macro_frame),
+                               "ended": notes.get("ended", {}),
+                               "gaps": notes.get("gaps", {})}
         except Exception as exc:                        # noqa: BLE001
             logger.warning("Macro block unavailable, continuing without it: %s", exc)
             report["macro"] = {"used": False, "columns": [], "error": str(exc)}
@@ -311,7 +317,8 @@ def choose_cut_date(assembled: dict, label_frame: pd.DataFrame, *,
 def build_one(symbol: str, frame: pd.DataFrame, label: pd.Series,
               graded: pd.Series, executable: pd.Series, *,
               cut_date: pd.Timestamp, feature_names: Sequence[str],
-              embargo: int = 1, horizon: int = 1) -> Split:
+              embargo: int = 1, horizon: int = 1,
+              train_label: pd.Series | None = None) -> Split:
     """Features, labels and a chronological split for a single symbol.
 
     Two return series, not one: what the label describes (close to close) and
@@ -319,6 +326,13 @@ def build_one(symbol: str, frame: pd.DataFrame, label: pd.Series,
     are joined together so a row survives only if both exist -- grading a model
     on rows where one window is missing and the other is not would make the
     comparison between them a comparison of different rows.
+
+    And two labels when a neutral band is in use. `label` is every row, and it
+    decides what is graded; `train_label` is the banded one, NaN in the middle
+    of each date's cross-section, and it only thins the training rows. The band
+    is chosen by where a row's *future* return ranked, so letting it remove test
+    rows meant grading a model only on names already known to have moved a lot
+    -- measured on the synthetic panel, 132 of one symbol's 230 test rows.
     """
     joined = frame.join(label.rename("label"), how="inner") \
                   .join(graded.rename("graded"), how="inner") \
@@ -335,7 +349,8 @@ def build_one(symbol: str, frame: pd.DataFrame, label: pd.Series,
     cut = int((dates < cut_date).sum())
 
     # The purge. A row this close to the cut is labelled with a return that
-    # realises on the far side of it.
+    # realises on the far side of it. Counted on every row, before the band
+    # thins anything, so it removes exactly `embargo` sessions.
     train_end = cut - max(embargo, 0)
 
     if train_end < 1 or cut >= len(joined):
@@ -343,11 +358,20 @@ def build_one(symbol: str, frame: pd.DataFrame, label: pd.Series,
             f"{symbol}: {len(joined)} rows leave nothing on one side of "
             f"{pd.Timestamp(cut_date).date()} (train ends at {train_end})")
 
+    keep = np.ones(train_end, dtype=bool)
+    y_train = y[:train_end]
+    if train_label is not None:
+        banded = train_label.reindex(dates[:train_end])
+        keep = banded.notna().to_numpy()
+        y_train = banded.to_numpy()[keep].astype(np.int64)
+        if not keep.any():
+            raise ValueError(f"{symbol}: the neutral band left no training rows")
+
     return Split(
         symbol=symbol,
-        x_train=x[:train_end], y_train=y[:train_end],
+        x_train=x[:train_end][keep], y_train=y_train,
         x_test=x[cut:], y_test=y[cut:],
-        train_dates=dates[:train_end], test_dates=dates[cut:],
+        train_dates=dates[:train_end][keep], test_dates=dates[cut:],
         forward_returns_test=returns[cut:],
         executable_returns_test=reachable[cut:],
         horizon=horizon,
@@ -363,12 +387,17 @@ class Prepared:
     """
 
     assembled: dict
+    # Every row's label, unbanded. This decides what is graded and where the cut
+    # dates fall, so it must not depend on how anything's future ranked.
     label_frame: pd.DataFrame
     graded_frame: pd.DataFrame
     executable_frame: pd.DataFrame
     feature_names: list
     report: dict
     spec: Spec
+    # The same labels with the neutral band applied, for training rows only.
+    # None when there is no band, which is the common case.
+    train_label_frame: pd.DataFrame | None = None
 
 
 def prepare(frames: dict, spec: Spec | None = None, *,
@@ -380,16 +409,24 @@ def prepare(frames: dict, spec: Spec | None = None, *,
 
     assembled, feature_names, report = assemble(frames, spec, refresh=refresh)
 
+    labelled = {s: frames[s] for s in assembled}
+    # Unbanded, always: these are the rows that get graded and dated.
     label_frame, graded_frame, executable_frame = labels_mod.build_panel_labels(
-        {s: frames[s] for s in assembled},
-        horizon=spec.horizon, target=spec.target,
-        threshold=spec.threshold, neutral_band=spec.neutral_band)
+        labelled, horizon=spec.horizon, target=spec.target,
+        threshold=spec.threshold, neutral_band=0.0)
+
+    train_label_frame = None
+    if spec.neutral_band > 0.0:
+        train_label_frame, _, _ = labels_mod.build_panel_labels(
+            labelled, horizon=spec.horizon, target=spec.target,
+            threshold=spec.threshold, neutral_band=spec.neutral_band)
 
     report["requested"] = sorted(frames)
     return Prepared(assembled=assembled, label_frame=label_frame,
                     graded_frame=graded_frame,
                     executable_frame=executable_frame,
-                    feature_names=feature_names, report=report, spec=spec)
+                    feature_names=feature_names, report=report, spec=spec,
+                    train_label_frame=train_label_frame)
 
 
 def split_at(prepared: Prepared, cut_date: pd.Timestamp) -> tuple[list, dict]:
@@ -410,11 +447,14 @@ def split_at(prepared: Prepared, cut_date: pd.Timestamp) -> tuple[list, dict]:
             excluded[symbol] = "no labels"
             continue
         try:
+            banded = prepared.train_label_frame
             splits.append(build_one(
                 symbol, assembled[symbol], label_frame[symbol],
                 graded_frame[symbol], executable_frame[symbol],
                 cut_date=cut_date, feature_names=feature_names,
-                embargo=spec.embargo, horizon=spec.horizon))
+                embargo=spec.embargo, horizon=spec.horizon,
+                train_label=(banded[symbol] if banded is not None
+                             and symbol in banded.columns else None)))
         except ValueError as exc:
             # Left out rather than split somewhere else, which would put it back
             # in the overlap the single cut date exists to prevent. Named, so

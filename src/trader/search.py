@@ -178,6 +178,7 @@ def record_trial(spec, scores: dict, *, note: str = "") -> dict:
             # The bar is set by this, not by rows: two hundred symbols on the
             # same day are nowhere near two hundred independent observations.
             "effective_rows": scores.get("effective_rows"),
+            "edge_standard_error": scores.get("edge_standard_error"),
             "days": scores.get("days"),
         },
     }
@@ -219,7 +220,8 @@ def leaderboard(limit: int = 20, by: str = "executable_sharpe") -> list:
 # --- what a search costs ----------------------------------------------------
 
 def corrected_threshold(trials: int, baseline: float, effective_rows: int,
-                        alpha: float = 0.05) -> dict:
+                        alpha: float = 0.05,
+                        standard_error: float | None = None) -> dict:
     """How large an edge has to be once you have looked this many times.
 
     A two-standard-error bar admits noise about one time in twenty. Look `n`
@@ -240,8 +242,15 @@ def corrected_threshold(trials: int, baseline: float, effective_rows: int,
     # about 4e-4 -- ample here, where the question is "roughly how much worse".
     z = _inverse_normal(1.0 - per_trial / 2.0)
 
-    error = math.sqrt(max(baseline * (1.0 - baseline), 1e-9)
-                      / max(effective_rows, 1))
+    # The measured spread of the edge when there is one; the single-proportion
+    # formula only for trials recorded before it existed. The two disagree most
+    # on an absolute target, where the old one runs low -- see
+    # evaluate._edge_standard_error.
+    if standard_error is not None:
+        error = float(standard_error)
+    else:
+        error = math.sqrt(max(baseline * (1.0 - baseline), 1e-9)
+                          / max(effective_rows, 1))
 
     return {
         "trials": trials,
@@ -342,7 +351,8 @@ def open_test_set(prepared, cut: Cut, *, seed: int = 0) -> dict:
     correction = corrected_threshold(
         trials,
         baseline=float(scores.get("baseline_accuracy") or 0.5),
-        effective_rows=int(scores.get("effective_rows") or scores.get("rows") or 1))
+        effective_rows=int(scores.get("effective_rows") or scores.get("rows") or 1),
+        standard_error=scores.get("edge_standard_error"))
 
     opening = {
         "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),

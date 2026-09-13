@@ -31,14 +31,26 @@ still generating "today's signal" from bars dated 2026-09-01, labelled honestly
 as `as_of` and read by nobody. For a daily signal that is the whole product
 quietly two weeks out of date, so a cache whose last bar is older than a few
 days is refetched whatever its span.
+
+**But asking again does not make the provider know more.** Both rules above
+assume a refetch can fix what they find, and for some symbols it cannot. ^VIX3M
+stopped updating at the provider on 2026-07-17, and DSFIR.AS listed in 2023, so
+neither will ever satisfy a ten-year, up-to-date check. Every load refetched
+them, got back exactly what was cached, and refetched again on the next panel
+assembly -- nine times in one search. So every fetch is now recorded, and a
+cache that fails the checks but came from the provider within the last
+RECHECK_HOURS is used as it is, with a warning naming what the provider
+actually has.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 import re
+import threading
 from concurrent import futures
 from typing import Iterable
 
@@ -70,6 +82,21 @@ CACHE_TOLERANCE_DAYS = 45
 # rule and fail every time, which is the correct outcome -- it is not a usable
 # price history and the run should keep saying so.
 MAX_CACHE_AGE_DAYS = 4
+
+
+# How long a provider's answer stands. A cache that fails the checks above but
+# was fetched this recently is what the provider has: asking again within the
+# hour returns the same rows. Long enough that one search does not ask nine
+# times; short enough that a series which resumes updating is picked up the
+# same day.
+RECHECK_HOURS = 12
+
+# Every fetch, by symbol: when, for what period, and the first and last dates it
+# returned. One small file beside the CSVs rather than a file per symbol.
+FETCH_LOG = "_fetched.json"
+
+_LOG_LOCK = threading.Lock()
+_WARNED: set = set()
 
 
 def _period_days(period: str) -> float | None:
@@ -127,6 +154,81 @@ def _cache_path(symbol: str) -> str:
     # prices actually were.
     safe = symbol.replace("/", "_").replace("\\", "_")
     return os.path.join(os.path.abspath(CACHE_DIR), f"{safe}.csv")
+
+
+def _fetch_log_path() -> str:
+    return os.path.join(os.path.abspath(CACHE_DIR), FETCH_LOG)
+
+
+def _read_fetch_log() -> dict:
+    try:
+        with open(_fetch_log_path(), encoding="utf-8") as handle:
+            log = json.load(handle)
+        return log if isinstance(log, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _record_fetch(symbol: str, period: str, frame: pd.DataFrame,
+                  now: dt.datetime | None = None) -> None:
+    """Note what the provider returned, and when.
+
+    Written whole to a temporary file and swapped in, under a lock, because
+    load_many fetches on several threads at once. Two processes can still race
+    and lose an entry; that costs one redundant fetch, never a wrong answer.
+    And a log that cannot be written must not stop prices loading -- it only
+    means the next load asks again.
+    """
+    now = now or dt.datetime.now(dt.timezone.utc)
+    entry = {"at": now.isoformat(timespec="seconds"), "period": str(period),
+             "first": str(frame.index[0].date()) if len(frame) else None,
+             "last": str(frame.index[-1].date()) if len(frame) else None}
+    path = _fetch_log_path()
+    with _LOG_LOCK:
+        try:
+            log = _read_fetch_log()
+            log[symbol] = entry
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            temporary = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            with open(temporary, "w", encoding="utf-8") as handle:
+                json.dump(log, handle, indent=1, sort_keys=True)
+            os.replace(temporary, path)
+        except OSError as exc:
+            logger.debug("Could not record the fetch of %s: %s", symbol, exc)
+
+
+def _vouched_for(symbol: str, cached: pd.DataFrame, period: str,
+                 now: dt.datetime | None = None) -> dict | None:
+    """The fetch that produced this cache, if it was recent enough to stand.
+
+    Three conditions, each closing a way to trust a cache wrongly: the fetch was
+    within RECHECK_HOURS; it asked for at least this much history, so a 2y fetch
+    cannot vouch for a 10y request; and its first and last dates are the ones in
+    the file, so a CSV replaced by hand since is not taken on the log's word.
+    """
+    entry = _read_fetch_log().get(symbol)
+    if not isinstance(entry, dict) or cached.empty:
+        return None
+
+    try:
+        at = dt.datetime.fromisoformat(entry["at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    now = now or dt.datetime.now(dt.timezone.utc)
+    if now - at > dt.timedelta(hours=RECHECK_HOURS):
+        return None
+
+    asked, wanted = _period_days(entry.get("period", "")), _period_days(period)
+    if wanted is None:
+        if asked is not None:
+            return None
+    elif asked is not None and asked < wanted:
+        return None
+
+    if (entry.get("first") != str(cached.index[0].date())
+            or entry.get("last") != str(cached.index[-1].date())):
+        return None
+    return entry
 
 
 def _normalise(frame: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -191,18 +293,45 @@ def load(symbol: str, *, period: str = "10y", refresh: bool = False) -> pd.DataF
     if not refresh and os.path.exists(path):
         try:
             cached = pd.read_csv(path, index_col="date", parse_dates=["date"])
-            if not _covers_period(cached, period):
+            short = not _covers_period(cached, period)
+            stale = not short and not _is_current(cached)
+            if not (short or stale):
+                logger.debug("%s: %d rows from cache", symbol, len(cached))
+                return _drop_unfinished_session(cached)
+
+            vouched = _vouched_for(symbol, cached, period)
+            if vouched is not None:
+                if symbol not in _WARNED:
+                    _WARNED.add(symbol)
+                    # Judged separately: a frozen end also shortens the span,
+                    # so "short" alone would hide the problem that matters.
+                    ended = not _is_current(cached)
+                    problems = ([] if _covers_period(cached, period)
+                                else [f"short of {period}"])
+                    if ended:
+                        age = (dt.datetime.now(dt.timezone.utc).date()
+                               - cached.index[-1].date()).days
+                        problems.append(f"{age} days out of date")
+                    logger.warning(
+                        "%s: the provider only has %s..%s (asked at %s), which "
+                        "is %s; using it as it is and not asking again for %d "
+                        "hours.%s",
+                        symbol, vouched["first"], vouched["last"], vouched["at"],
+                        " and ".join(problems), RECHECK_HOURS,
+                        (f" Anything that aligns this series to a calendar and "
+                         f"forward-fills it will carry {vouched['last']} past "
+                         f"that date." if ended else ""))
+                return _drop_unfinished_session(cached)
+
+            if short:
                 logger.info(
                     "Cache for %s covers %s..%s, which is short of %s; refetching",
                     symbol, cached.index[0].date(), cached.index[-1].date(),
                     period)
-            elif not _is_current(cached):
+            else:
                 logger.info(
                     "Cache for %s ends %s, which is stale; refetching",
                     symbol, cached.index[-1].date())
-            else:
-                logger.debug("%s: %d rows from cache", symbol, len(cached))
-                return _drop_unfinished_session(cached)
         except Exception as exc:                       # noqa: BLE001
             logger.warning("Cache for %s unreadable (%s); refetching", symbol, exc)
 
@@ -220,6 +349,7 @@ def load(symbol: str, *, period: str = "10y", refresh: bool = False) -> pd.DataF
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     frame.to_csv(path)
+    _record_fetch(symbol, period, frame)
 
     return frame
 

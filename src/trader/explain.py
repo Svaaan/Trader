@@ -124,10 +124,18 @@ def assess(evaluation: dict, *, controls: dict | None = None,
     if controls:
         noise = float((controls.get("noise_floor") or {}).get("spread") or 0.0)
 
-    # The spread of a proportion measured over `effective` independent samples.
-    # Two of these is the usual bar for "probably not chance".
-    standard_error = math.sqrt(max(baseline * (1.0 - baseline), 1e-9)
-                               / max(effective, 1))
+    # How far the edge moves by chance. Two of these is the usual bar for
+    # "probably not chance". Measured on the edge itself when the evaluation
+    # carries it -- see evaluate._edge_standard_error for why the single-
+    # proportion formula below let skill-less models through up to 17.5% of the
+    # time. Stored runs from before that field existed keep the old formula, so
+    # their pages still render; they are simply graded against the older bar.
+    measured = evaluation.get("edge_standard_error")
+    if measured is not None:
+        standard_error = float(measured)
+    else:
+        standard_error = math.sqrt(max(baseline * (1.0 - baseline), 1e-9)
+                                   / max(effective, 1))
     needed = 2.0 * standard_error
 
     checks: list = []
@@ -176,7 +184,10 @@ def assess(evaluation: dict, *, controls: dict | None = None,
     beats_chance = edge >= needed
     record("beats_chance", beats_chance,
            f"Chance alone produces about {needed * 100:.2f} points over "
-           f"{effective:,} independent rows.")
+           f"{days} days and {effective:,} independent rows"
+           + ("." if measured is not None else
+              " (sized by the older single-proportion formula, which runs "
+              "low; this run predates the measured one)."))
     if not beats_chance:
         return refuse(f"It is {edge * 100:.2f} points above the baseline, and "
                       f"chance alone produces about {needed * 100:.2f}. "

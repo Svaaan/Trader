@@ -83,13 +83,15 @@ def _load(watchlist) -> dict:
 def _bar_for(entry: dict, trials: int) -> dict:
     """The corrected bar at this trial count, sized by this trial's evidence."""
     scores = entry.get("validation") or {}
-    # Older ledger lines predate effective_rows. Raw rows overstate the
-    # evidence, so the bar they give is too low -- say so rather than guess.
+    # Older ledger lines predate the measured standard error, and older still
+    # predate effective rows. Each fallback gives a bar that runs low -- say so
+    # rather than guess.
     rows = scores.get("effective_rows") or scores.get("rows") or 1
     bar = search_mod.corrected_threshold(
         trials, baseline=float(scores.get("baseline") or 0.5),
-        effective_rows=int(rows))
-    bar["from_raw_rows"] = not scores.get("effective_rows")
+        effective_rows=int(rows),
+        standard_error=scores.get("edge_standard_error"))
+    bar["estimated"] = scores.get("edge_standard_error") is None
     return bar
 
 
@@ -171,9 +173,10 @@ def do_board(args) -> int:
         print(f"\n  After {trials} looks an edge has to clear "
               f"{bar['corrected']:+.4f}, where {bar['naive']:+.4f} would have "
               f"done on the first look ({bar['inflation']:.2f}x).")
-        if bar["from_raw_rows"]:
-            print("  (sized from raw rows -- this trial predates effective "
-                  "rows, so the real bar is higher)")
+        if bar["estimated"]:
+            print("  (sized by the older formula -- this trial predates the "
+                  "measured standard error, and on an absolute target the "
+                  "real bar is higher)")
         if edge < bar["corrected"]:
             print(f"  The leader's {edge:+.4f} does not clear it. So far this "
                   f"is the search finding noise, not the model finding an edge.")

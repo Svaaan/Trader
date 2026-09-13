@@ -102,7 +102,8 @@ def test_a_trial_never_records_a_test_score(sealed, offline_spec):
                                  "executable_sharpe": 1.2})
     assert set(entry["validation"]) <= {
         "accuracy", "baseline", "edge", "executable_sharpe",
-        "executable_tstat", "rows", "effective_rows", "days"}
+        "executable_tstat", "rows", "effective_rows", "edge_standard_error",
+        "days"}
     assert "test" not in json.dumps(entry).lower().replace("test_fraction", "")
 
 
@@ -255,3 +256,16 @@ def test_the_horizon_survives_the_split_and_the_truncation(offline_spec):
 
     _, _, scaler = dataset.combine(truncated, prepared.feature_names)
     assert dataset.test_matrix(truncated, scaler).horizon == 5
+
+
+
+def test_a_measured_standard_error_sets_the_search_bar():
+    """The same repair as the gate: the bar is sized by how the edge itself
+    varies, and the single-proportion formula is only a fallback for trials
+    recorded before that was measured."""
+    measured = search.corrected_threshold(1, baseline=0.5, effective_rows=10_000,
+                                          standard_error=0.01)
+    assert measured["naive"] == pytest.approx(0.0196, abs=1e-4)
+
+    fallback = search.corrected_threshold(1, baseline=0.5, effective_rows=10_000)
+    assert fallback["naive"] == pytest.approx(1.96 * 0.005, abs=1e-4)

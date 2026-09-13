@@ -459,3 +459,36 @@ def test_the_horizon_reaches_every_statistic_that_needs_it():
     assert told.effective_rows < naive.effective_rows
     assert told.executable_daily == pytest.approx(
         naive.executable_daily / horizon, abs=1e-6)
+
+
+
+# --- the standard error of the edge -------------------------------------------
+
+def test_a_model_that_is_the_baseline_has_nothing_for_chance_to_move():
+    """Answering the training majority on every row makes the edge exactly zero
+    row by row, whatever the labels do."""
+    rng = np.random.default_rng(5)
+    days, names = 200, 5
+    calendar = pd.bdate_range("2021-01-01", periods=days)
+    returns = rng.normal(0.0, 0.01, days * names)
+    result = evaluate.evaluate(
+        np.full(days * names, 0.9), (returns > 0).astype(int), returns,
+        np.repeat(calendar, names), np.tile(list("ABCDE"), days),
+        train_up_share=0.6, cost=0.0)
+    assert result.edge == 0.0
+    assert result.edge_standard_error == 0.0
+
+
+def test_a_model_that_ignores_the_baseline_carries_both_noises():
+    """Independent names, a model answering at random: the difference of two
+    independent coin flips has twice the variance of one."""
+    rng = np.random.default_rng(6)
+    days, names = 400, 10
+    calendar = pd.bdate_range("2021-01-01", periods=days)
+    returns = rng.normal(0.0, 0.01, days * names)
+    result = evaluate.evaluate(
+        rng.random(days * names), (returns > 0).astype(int), returns,
+        np.repeat(calendar, names), np.tile([f"S{i}" for i in range(names)], days),
+        train_up_share=0.5, cost=0.0)
+    assert result.edge_standard_error == pytest.approx(
+        np.sqrt(0.5 / (days * names)), rel=0.15)

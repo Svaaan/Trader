@@ -583,8 +583,19 @@ it is no longer a test.
 **The trial count sets the bar.** Looking `n` times and keeping the best means
 at least one false pass with probability 1 − 0.95ⁿ: 19% at four trials, 99% by
 ninety. `board` and `open` both apply a Šidák correction and print what an edge
-has to clear given how many times you have looked, sized by effective rows
-rather than raw ones.
+has to clear given how many times you have looked, sized by the measured spread
+of the edge itself rather than by a row count.
+
+**The neutral band thins training, never grading.** `--neutral-band 0.2` drops
+names whose forward return ranked near the middle of their date, so the model is
+not taught to reproduce noise. The ranking is of the *future* return, and until
+this was fixed the band removed test and validation rows too: a banded model was
+graded only on names already known to have moved a lot — 132 of one symbol's 230
+test rows on the synthetic panel, half of all validation rows — and a search
+would have preferred banded configurations for that alone. Now the band applies
+to training rows only; graded rows, their returns and the cut dates are the same
+with or without it, and the purge still removes exactly `horizon` sessions. No
+banded trial had been recorded in the ledger before the fix.
 
 ### The first dry run, and the bug it found
 
@@ -691,11 +702,11 @@ shows its sources without prose and everything else works unchanged.
 
 ```
 universe.py   which symbols, and why width is the point
-prices.py     daily OHLCV, split-adjusted, cached -- and the cache is now
-   |          checked against the period asked for
+prices.py     daily OHLCV, split-adjusted, cached -- checked against the period
+   |          asked for, and not re-asked of a provider that just answered
 features.py   18 per-symbol indicators, every one computable at that close
 cross.py      9 -- where this name sits among its peers, lagged one session
-macro.py      16 -- the state of the world, from unrevised market data, lagged
+macro.py      up to 16 -- the state of the world, from unrevised market data, lagged
 events.py     3 -- distance to the next announcement, clipped to what was known
 news.py       a point-in-time store; inert as a feature until it has history
 labels.py     the only forward-looking lines, kept separate; two targets
@@ -736,14 +747,52 @@ universe is wide enough for the groups to be large.
 survives every statistical test in the project and still loses money after
 costs. Nothing here is tradeable; that is the finding, not a caveat.
 
-**The accuracy hurdle is still slightly generous.** Its standard error counts
-the noise in the accuracy but not in the baseline, which is measured on the same
-test rows. In the noise tests above, a skill-less model at one day cleared the
-accuracy check several times more often than the roughly 2% that two standard
-errors, one-sided, should allow.
-The other hurdles — noise floor, walk-forward agreement, return t-statistic —
-still stand behind it, which is why it has never opened the gate, but it is not
-the bar it claims to be.
+**Runs stored before the accuracy hurdle was fixed keep the old bar.** That
+hurdle used to size its standard error as a single proportion over the effective
+rows. But the edge is accuracy *minus* a baseline measured on the same rows, and
+on an absolute target that baseline is shared by every name on a date, because
+the market moves them together. On skill-less models the one-sided two-standard-
+error check — nominally 2.3% — passed 10% of the time with independent names and
+19% when they shared a market factor. The relative target was already right
+(0.7%): every date is half up by construction, so the baseline carries no
+date-level noise.
+
+The standard error is now measured on the difference itself, clustered by date,
+with the same overlap correction as everything past one session, and the same
+models pass 2.7%, 2.7% and 0.7%. The obvious repair — doubling the row variance
+and keeping the old design effect — was measured too and rejected: it only
+halved the shared-market case and made the relative target 30% too strict. The
+search bar uses the same number. Evaluations and ledger trials recorded before
+the fix have no measured standard error, so they fall back to the old formula
+and say so; on a relative target that makes little difference, on an absolute
+one their bar is too low. The other hurdles always stood behind it, which is
+why it never opened the gate.
+
+**One macro series has stopped updating, and the block now has 15 columns.**
+The provider's ^VIX3M history ends on 2026-07-17 while ^VIX runs on. The macro
+block used to forward-fill every series onto one calendar without limit, so for
+39 sessions `vix_term_slope` divided a July close by a current one — on the end
+of the sealed test period and on every live signal. `pct_change` was doing the
+same thing one step later: its default pads, so a stopped series would have
+reported a return of exactly zero every day.
+
+The fill is now bounded at five sessions — the longest gap in any of these
+series over ten years is two, STOXX over Christmas — and every `pct_change`
+passes `fill_method=None`. A series more than five sessions behind the others
+has *ended*: it is dropped with the features built from it, named with its last
+date in the run's macro report, and warned about once. Leaving it blank instead
+looks more conservative and is not: a blank column deletes that date for every
+symbol, which on the wide panel would have removed 7,777 of the most recent
+complete rows, today's included. Dropping the column keeps all 536,221 and the
+cut date where it was. A gap inside a series that resumes is filled for five
+sessions, left blank past that and reported; none has happened.
+
+What this costs: `vix_term_slope` is gone until the provider resumes or another
+source for three-month volatility is found. Models trained with it produce no
+signal (the page already refuses a row missing a trained feature), and a run
+waiting to be scored refuses by name rather than failing on a shape mismatch.
+The 20 trials in the search ledger were scored with the frozen column in place,
+so macro trials from here on are not strictly comparable with those.
 
 **Costs past one session are approximate.** Turnover is still charged day to
 day on overlapping positions, where a book that rebalances every h sessions
@@ -762,7 +811,7 @@ times the old default, which is a real request of somebody else's GPU.
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-204 tests. The look-ahead ones test the property rather than the implementation
+234 tests. The look-ahead ones test the property rather than the implementation
 — features computed on a truncated history must match the full one — and there
 is a test that deliberately introduces a centred rolling window to confirm the
 property test can still fail. The macro, cross-sectional and event blocks each
@@ -777,4 +826,7 @@ sigmoid-to-softmax conversion that would have sharpened every probability by up
 to 0.14 without raising anything, the executable return that turns an
 untradeable backtest into the number the gate reads, and the overlap correction
 — which checks both that a skill-less model at five days used to clear t = 2
-more than a quarter of the time, and that it no longer does.
+more than a quarter of the time, and that it no longer does. The accuracy
+hurdle has the same pair: skill-less models graded through `evaluate` and the
+gate must clear it at about the nominal rate and with an edge-to-error spread
+near one, and the old formula, on the same simulated models, must not.

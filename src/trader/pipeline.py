@@ -583,8 +583,25 @@ def _process(run: Run) -> None:
     frames = prices_mod.load_many(run.watchlist, period="10y")
 
     # The split this run was built on, not a fresh one. See the module docstring.
-    splits, report = dataset_mod.split_at(
-        dataset_mod.prepare(frames, spec), cut)
+    prepared = dataset_mod.prepare(frames, spec)
+
+    # A feature the model was trained on that the panel can no longer build --
+    # a macro series the provider stopped publishing, most likely. Scoring
+    # anyway would either fail on a shape mismatch or, worse, need the column
+    # invented; say which it is instead.
+    unavailable = [name for name in scaler.feature_names
+                   if name not in prepared.feature_names]
+    if unavailable:
+        ended = ((prepared.report.get("macro") or {}).get("ended") or {})
+        raise ValueError(
+            f"this run was trained on {unavailable}, which can no longer be "
+            f"built" + (f" (macro series that stopped updating: "
+                        f"{ {k: v['last'] for k, v in ended.items()} })"
+                        if ended else "") +
+            ". Its test set cannot be scored as trained; retrain on the "
+            "features that exist.")
+
+    splits, report = dataset_mod.split_at(prepared, cut)
 
     # If the panel is not the one that trained, the score is not the one that
     # was advertised. Say so rather than quietly grading something else.

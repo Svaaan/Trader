@@ -82,20 +82,33 @@ MACRO_NAMES = [
 # same trade prices.py makes when it drops an unfinished bar.
 LAG_SESSIONS = 1
 
+# How many consecutive sessions a level may be carried across on the shared
+# calendar. Long enough for a holiday one market keeps and another does not;
+# measured on the cached ten-year histories, the longest such gap in any series
+# here is two sessions (STOXX over Christmas 2018), so five never touches
+# history. Short enough that a series the provider has stopped publishing --
+# ^VIX3M, frozen since 2026-07-17 -- is not quietly read as unchanged for months.
+MAX_FILL_SESSIONS = 5
+
+_WARNED: set = set()
+
+
+def _warn_once(key, message: str, *args) -> None:
+    """A panel is assembled many times per search; say each thing once."""
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    logger.warning(message, *args)
+
 MAX_WARMUP = 252
 
 
 def _closes(period: str = "10y", refresh: bool = False) -> pd.DataFrame:
-    """Closing level of every series, on one index, forward-filled.
+    """Closing level of every series, on one index, not yet filled.
 
-    A missing series is dropped with a warning rather than failing the run: the
-    panel should still build when one exchange had a holiday the others did not,
-    and a macro block that is one column short is worth more than no run.
-
-    Forward-filling is safe here and only here. A holiday means the level did
-    not change because nothing traded, so carrying yesterday's forward states
-    exactly what was known. It is not filling a gap in knowledge -- it is the
-    knowledge.
+    A missing series is dropped with a warning rather than failing the run: a
+    macro block that is one column short is worth more than no run. The gaps
+    the shared calendar creates are left for `_bound` to judge.
     """
     frames = {}
     for name, ticker in SERIES.items():
@@ -108,17 +121,89 @@ def _closes(period: str = "10y", refresh: bool = False) -> pd.DataFrame:
     if not frames:
         raise prices_mod.PriceError("no macro series could be fetched")
 
-    return pd.DataFrame(frames).sort_index().ffill()
+    return pd.DataFrame(frames).sort_index()
 
 
-def build(period: str = "10y", refresh: bool = False) -> pd.DataFrame:
+def _bound(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Forward-fill across a holiday, and never across an ending.
+
+    A holiday means the level did not change because nothing traded, so
+    carrying yesterday forward states exactly what was known -- for a day or
+    two. Past MAX_FILL_SESSIONS it is no longer a holiday, and there are two
+    different things it can be:
+
+    **An ending.** The series stops and the others carry on. The whole series
+    is dropped, and every feature built from it goes with it. Leaving it blank
+    instead would be worse than it sounds: `build` drops any date with a
+    missing column and the panel drops any row whose macro join is empty, so a
+    blank ending deletes the most recent sessions -- including today -- for
+    every symbol. Measured on the wide panel, that would have blanked 34
+    sessions since ^VIX3M stopped and deleted 7,777 complete rows; dropping the
+    series instead keeps all 536,221, and costs one column.
+
+    **An outage.** The series resumes. The sessions past the limit are left
+    blank and counted, because they were not known; those dates drop out of the
+    panel, and so does anything a rolling window spans across them. That is the
+    honest cost and it is reported rather than hidden. None of the series here
+    has had one in ten years.
+
+    Returns the filled closes and {"ended": {...}, "gaps": {...}} for the report.
+    An ending is judged against the other series rather than the clock, so a
+    block that is a weekend behind has not ended.
+    """
+    filled = raw.ffill(limit=MAX_FILL_SESSIONS)
+    ended, gaps = {}, {}
+
+    for name in list(raw.columns):
+        last = raw[name].last_valid_index()
+        if last is None:
+            filled = filled.drop(columns=name)
+            continue
+
+        behind = int((raw.index > last).sum())
+        if behind > MAX_FILL_SESSIONS:
+            ended[name] = {"ticker": SERIES.get(name, name),
+                           "last": str(last.date()),
+                           "sessions_behind": behind}
+            filled = filled.drop(columns=name)
+            _warn_once(("ended", name, str(last.date())),
+                       "Macro series %s (%s) stopped on %s, %d sessions before "
+                       "the others; dropping it and the features built from it "
+                       "rather than carrying its last close forward",
+                       name, SERIES.get(name, name), last.date(), behind)
+            continue
+
+        first = raw[name].first_valid_index()
+        blank = int(filled.loc[first:last, name].isna().sum())
+        if blank:
+            gaps[name] = blank
+            _warn_once(("gap", name, blank),
+                       "Macro series %s (%s) has %d session(s) left blank inside "
+                       "its history, past the %d a holiday can explain; those "
+                       "dates, and rolling windows across them, drop out",
+                       name, SERIES.get(name, name), blank, MAX_FILL_SESSIONS)
+
+    return filled, {"ended": ended, "gaps": gaps}
+
+
+def build(period: str = "10y", refresh: bool = False,
+          report: dict | None = None) -> pd.DataFrame:
     """Macro features by date, already lagged, ready to join on.
 
     The returned frame is indexed by the date the features may be *used* on,
     not the date they were measured on. That shift happens once, here, at the
     end -- so no caller can forget it and no caller has to remember it.
+
+    Pass `report` to have it filled with the series that have ended and the
+    blanks left inside the others -- see `_bound`.
+
+    Every pct_change here passes fill_method=None. Its default pads, which on
+    a series that has stopped reports a return of exactly zero every day after
+    -- the same unbounded fill `_bound` removes, one step later.
     """
-    raw = _closes(period=period, refresh=refresh)
+    raw, notes = _bound(_closes(period=period, refresh=refresh))
+    if report is not None:
+        report.update(notes)
     out = pd.DataFrame(index=raw.index)
 
     def series(name: str) -> pd.Series | None:
@@ -150,7 +235,7 @@ def build(period: str = "10y", refresh: bool = False) -> pd.DataFrame:
 
     dollar = series("dollar")
     if dollar is not None:
-        out["dollar_return_20d"] = dollar.pct_change(20)
+        out["dollar_return_20d"] = dollar.pct_change(20, fill_method=None)
 
     hy, ig = series("hy"), series("ig")
     if hy is not None and ig is not None:
@@ -158,26 +243,26 @@ def build(period: str = "10y", refresh: bool = False) -> pd.DataFrame:
         # duration, so the ratio strips out the rate move and leaves the credit
         # move -- risk appetite, more or less directly.
         ratio = hy / ig.replace(0.0, np.nan)
-        out["credit_ratio_change_20d"] = ratio.pct_change(20)
+        out["credit_ratio_change_20d"] = ratio.pct_change(20, fill_method=None)
 
     oil, gold = series("oil"), series("gold")
     if oil is not None:
-        out["oil_return_20d"] = oil.pct_change(20)
+        out["oil_return_20d"] = oil.pct_change(20, fill_method=None)
     if gold is not None:
-        out["gold_return_20d"] = gold.pct_change(20)
+        out["gold_return_20d"] = gold.pct_change(20, fill_method=None)
 
     for tag, name in (("spx", "spx"), ("stoxx", "stoxx")):
         index = series(name)
         if index is None:
             continue
-        out[f"{tag}_return_5d"] = index.pct_change(5)
+        out[f"{tag}_return_5d"] = index.pct_change(5, fill_method=None)
         # How far the market sits below its own year's high. This is the single
         # most useful regime variable in the block: nearly every relationship
         # between features and returns behaves differently in a drawdown, and
         # without it the model has to infer the regime from the names it holds.
         out[f"{tag}_drawdown_252"] = index / index.rolling(252).max() - 1.0
         if tag == "spx":
-            out["spx_vol_20d"] = index.pct_change().rolling(20).std()
+            out["spx_vol_20d"] = index.pct_change(fill_method=None).rolling(20).std()
 
     out = out.replace([np.inf, -np.inf], np.nan)
 
@@ -188,7 +273,7 @@ def build(period: str = "10y", refresh: bool = False) -> pd.DataFrame:
     present = [name for name in MACRO_NAMES if name in out.columns]
     missing = [name for name in MACRO_NAMES if name not in out.columns]
     if missing:
-        logger.warning("Macro block is missing %s", missing)
+        _warn_once(("missing", tuple(missing)), "Macro block is missing %s", missing)
 
     return out[present].dropna()
 

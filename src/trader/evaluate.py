@@ -82,6 +82,9 @@ class Evaluation:
     baseline_source: str
     test_majority: float            # for reference only; not knowable in advance
     edge: float
+    # The spread of `edge` itself, clustered by date and corrected for overlap.
+    # What the gate compares the edge against; see _edge_standard_error.
+    edge_standard_error: float
     up_rate: float                  # how often it says up, which catches a stuck model
     by_confidence: list
 
@@ -245,6 +248,51 @@ def _effective_rows(correct: np.ndarray, dates, symbols,
     return int(round(rows / design)), design, rho
 
 
+def _edge_standard_error(correct: np.ndarray, majority_hit: np.ndarray,
+                         dates, horizon: int = 1) -> float:
+    """How far `accuracy - baseline` moves by chance, measured on that difference.
+
+    The gate used to size this as a single proportion, sqrt(b(1 - b) / n), with
+    n discounted by the design effect of `correct` alone. Two things were
+    missing. The baseline is measured on the same test rows, so the edge is a
+    difference of two noisy proportions -- for a model that says up and down
+    about equally, the per-row variance of that difference is twice what a
+    single proportion has. And on an absolute target the baseline is shared by
+    every name on a date, because the market moves them together, so its noise
+    clusters by date in a way the correlation of `correct` never sees.
+
+    So the difference is taken row by row, summed within each date, and the
+    spread of those date sums gives the standard error directly -- clustered by
+    date, with the same overlap correction as everything else past one session.
+    The size of the problem, on skill-less models with sticky views, as the
+    spread of edge / standard error (1.00 is calibrated) and how often the
+    one-sided two-standard-error hurdle passed (2.3% is nominal):
+
+        independent names, absolute target   1.41, 5.5%   ->  1.02, 1.0%
+        names that share a market factor     2.24, 17.5%  ->  1.02, 2.5%
+        relative target                      0.99, 1.0%   ->  1.00, 1.0%
+
+    The relative target was already right: every date is half up by
+    construction, so the baseline carries no date-level noise. Doubling the
+    row variance and keeping the old design effect -- the obvious repair --
+    would have made that case too strict (0.70) while only halving the
+    correlated one (1.58).
+    """
+    difference = np.asarray(correct, dtype=np.float64) - np.asarray(
+        majority_hit, dtype=np.float64)
+    frame = pd.DataFrame({"date": pd.DatetimeIndex(dates), "d": difference})
+    per_date = frame.groupby("date")["d"].agg(["sum", "count"])
+
+    rows = float(per_date["count"].sum())
+    if rows <= 0 or len(per_date) < 2:
+        return 0.0
+
+    edge = float(per_date["sum"].sum()) / rows
+    residual = (per_date["sum"] - edge * per_date["count"]).to_numpy()
+    variance_of_total = float(residual @ residual) * _overlap(residual, horizon)
+    return math.sqrt(max(variance_of_total, 0.0)) / rows
+
+
 def _overlap(series, horizon: int = 1) -> float:
     """How much overlapping holding windows inflate the variance of a mean.
 
@@ -360,12 +408,14 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
     # old behaviour and is marked as such wherever it is used.
     test_majority = float(max((actual == 1).mean(), 1.0 - (actual == 1).mean()))
     if train_up_share is None:
+        always = 1 if (actual == 1).mean() >= 0.5 else 0
         baseline = test_majority
         source = "test period majority (not knowable in advance)"
     else:
         always = 1 if train_up_share >= 0.5 else 0
         baseline = float((actual == always).mean())
         source = f"always '{'up' if always else 'down'}', the training majority"
+    majority_hit = (actual == always).astype(float)
 
     frame = pd.DataFrame({"date": dates, "symbol": symbols,
                           "position": np.where(predicted == 1, 1.0, -1.0),
@@ -441,6 +491,8 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
         baseline_source=source,
         test_majority=round(test_majority, 4),
         edge=round(accuracy - baseline, 4),
+        edge_standard_error=round(
+            _edge_standard_error(correct, majority_hit, dates, horizon), 6),
         up_rate=round(float(predicted.mean()), 4),
         by_confidence=buckets,
         strategy_daily=round(float(net.mean()) / horizon, 6),
