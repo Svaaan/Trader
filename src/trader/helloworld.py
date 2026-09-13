@@ -184,7 +184,7 @@ class Client:
 
     def submit(self, *, dataset_id: str, model_name: str,
                steps: int = 20000, batch_size: int = 64,
-               learning_rate: float = 0.01,
+               learning_rate: float = 0.001,
                hidden_dim: int = 64, depth: int = 2,
                node_id: str | None = None,
                time_ordered: bool = True) -> str:
@@ -194,6 +194,10 @@ class Client:
         it queues behind whatever that machine is doing. It is the default here
         because auto-placement picks on a stale flag; see pick_node.
         """
+        # 0.001 is Adam's default and this project's, for a reason measured
+        # rather than assumed: at 0.01 every unit of the second hidden layer
+        # dies and the model returns one constant probability. See
+        # baseline.network_health.
         path = f"/submit-task/{node_id}" if node_id else "/submit-task"
         # Everything this project sends is a price series, so the coordinator's
         # verification should hold back the newest rows rather than a random

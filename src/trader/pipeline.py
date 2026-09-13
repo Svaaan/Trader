@@ -88,16 +88,28 @@ MIN_STEPS = 4000
 
 def steps_for(rows: int, *, epochs: int = TARGET_EPOCHS,
               batch: int = BATCH_SIZE) -> int:
-    """How many gradient steps `rows` rows deserve.
+    """How many gradient steps `rows` rows are *allowed*.
+
+    A ceiling, not an instruction. `baseline.fit_mlp` holds back the most
+    recent slice of the training rows and stops when the validation loss stops
+    improving, which on the wide panel happens around 5,000 steps whatever this
+    returns. Training to the ceiling instead costs accuracy: measured, 5,000
+    steps scores 0.5118 out of time and 200,000 scores 0.5029, while training
+    accuracy climbs from 0.5194 to 0.5690 the whole way. That is memorisation,
+    and it is why "train for longer" and "loop until it is smarter" have the
+    same answer.
+
+    The number still matters for the remote backend, which does its own
+    training and does not stop itself.
 
     Floored, because a very small panel still needs enough steps to converge,
     and capped so that a very wide one does not queue on somebody's GPU for a
     day.
 
     Worth knowing before the first wide submission: this asks for roughly twenty
-    times the old fixed 4,000 on a 240-symbol panel. That is the right amount of
-    training and it is a real request of somebody else's machine -- the job will
-    take correspondingly longer, and a coordinator with a per-job ceiling may
+    times the old fixed 4,000 on a 240-symbol panel. Locally that costs nothing,
+    because training stops when it stops helping; remotely it is a real request
+    of somebody else's machine, and a coordinator with a per-job ceiling may
     refuse it. Pass `steps=` explicitly to override.
     """
     return int(min(max(epochs * max(rows, 1) // batch, MIN_STEPS), 200_000))

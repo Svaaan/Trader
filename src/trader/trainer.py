@@ -63,7 +63,7 @@ class Hyperparameters:
     depth: int = 2
     steps: int = 4000
     batch: int = 64
-    learning_rate: float = 0.01
+    learning_rate: float = 0.001
     seed: int = 0
 
     def to_dict(self) -> dict:
@@ -142,12 +142,37 @@ def train_local(x: np.ndarray, y: np.ndarray, feature_names,
     """
     hyper = hyper or Hyperparameters()
 
-    logger.info("Training locally: %d rows, %d steps, %d wide, %d deep",
-                len(y), hyper.steps, hyper.hidden, hyper.depth)
+    logger.info("Training locally: %d rows, %d steps, %d wide, %d deep, lr %g",
+                len(y), hyper.steps, hyper.hidden, hyper.depth,
+                hyper.learning_rate)
 
     network = baseline_mod.fit_mlp(
         x, y, hidden=hyper.hidden, depth=hyper.depth, steps=hyper.steps,
         batch=hyper.batch, lr=hyper.learning_rate, seed=hyper.seed)
+
+    # A dead network is a training failure and has to be raised as one. Left to
+    # run, it returns one constant probability, the gate calls it "the model
+    # answers the same way almost every day, it has learned nothing", and a
+    # broken optimiser gets recorded as a fact about the market. That is the
+    # exact misattribution this project exists to prevent, and it happened.
+    health = baseline_mod.network_health(network, x)
+    if health.get("collapsed"):
+        raise ValueError(
+            f"training collapsed: {health['dead_units']} of "
+            f"{health['hidden_width']} hidden units are dead, so the network "
+            f"returns a constant {health['probability_range'][0]}. This is the "
+            f"optimiser, not the data -- a learning rate of "
+            f"{hyper.learning_rate:g} is too high for this network. Nothing "
+            f"about the market can be concluded from it.")
+    if health.get("probability_std", 1.0) < 1e-6:
+        raise ValueError(
+            f"training produced a constant model (probability std "
+            f"{health['probability_std']:.2e}) without any layer being fully "
+            f"dead. Still a training failure, not a result.")
+
+    logger.info("  health: %s dead of %s, probability std %.5f",
+                health["dead_units"], health["hidden_width"],
+                health["probability_std"])
 
     bundle = pack_bundle(network.layers, feature_names)
 

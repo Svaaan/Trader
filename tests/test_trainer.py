@@ -187,3 +187,188 @@ def test_no_noise_floor_means_no_verdict_on_the_gap():
 def test_comparing_against_nothing_returns_nothing():
     assert trainer.compare({}, {"accuracy": 0.5}) == {}
     assert trainer.compare({"accuracy": 0.5}, {}) == {}
+
+
+# --- a dead network is a training failure, not a market finding -------------
+
+def dead_network(width=8, inputs=4):
+    """A network whose second hidden layer cannot fire, built by hand.
+
+    Constructed rather than trained into, because the point is to test the
+    detector deterministically -- whether a given learning rate kills a given
+    dataset is a property of both, and not something a unit test should race.
+    """
+    first = (np.ones((inputs, width)), np.zeros(width))
+    # Every weight into the second layer negative, with a negative bias: no
+    # non-negative input can make any of these positive.
+    second = (-np.ones((width, width)), -np.ones(width))
+    out = (np.zeros((width, 1)), np.array([0.07]))
+    return baseline.MLP(layers=[first, second, out])
+
+
+def test_a_fully_dead_layer_is_detected(separable):
+    x, _ = separable
+    health = baseline.network_health(dead_network(inputs=9), np.abs(x))
+
+    assert health["dead_units"][1] == health["hidden_width"][1]
+    assert health["collapsed"] is True
+    assert health["probability_std"] == 0.0
+
+
+def test_a_working_network_is_not_flagged(separable, names):
+    x, y = separable
+    network = baseline.fit_mlp(x, y, hidden=16, depth=2, steps=2000, seed=0)
+    health = baseline.network_health(network, x)
+
+    assert health["collapsed"] is False
+    assert health["probability_std"] > 0.01
+
+
+def test_training_refuses_to_return_a_collapsed_network(separable, names,
+                                                        monkeypatch):
+    """The regression test for a constant model read as a market result.
+
+    At lr=0.01 every unit of the second hidden layer died on the real panel and
+    the model returned a constant 0.516992. The gate then said "it has learned
+    nothing", which is a sentence about the market, and it was a sentence about
+    the optimiser.
+    """
+    x, y = separable
+    monkeypatch.setattr(baseline, "fit_mlp",
+                        lambda *a, **k: dead_network(inputs=9))
+
+    with pytest.raises(ValueError, match="training collapsed"):
+        trainer.train_local(np.abs(x), y, names)
+
+
+def test_the_collapse_message_blames_the_optimiser_not_the_data(separable,
+                                                                names,
+                                                                monkeypatch):
+    x, y = separable
+    monkeypatch.setattr(baseline, "fit_mlp",
+                        lambda *a, **k: dead_network(inputs=9))
+
+    with pytest.raises(ValueError) as caught:
+        trainer.train_local(np.abs(x), y, names)
+
+    message = str(caught.value)
+    assert "learning rate" in message
+    assert "Nothing about the market can be concluded" in message
+
+
+def test_a_constant_model_is_refused_even_without_a_dead_layer(separable, names,
+                                                               monkeypatch):
+    """Zero output variance is a failure however it was arrived at."""
+    x, y = separable
+
+    def flat(*args, **kwargs):
+        width, inputs = 8, 9
+        return baseline.MLP(layers=[
+            (np.ones((inputs, width)), np.zeros(width)),
+            (np.ones((width, width)), np.ones(width)),
+            # Alive hidden units, but the output ignores every one of them.
+            (np.zeros((width, 1)), np.array([0.3])),
+        ])
+
+    monkeypatch.setattr(baseline, "fit_mlp", flat)
+    with pytest.raises(ValueError, match="constant model"):
+        trainer.train_local(np.abs(x), y, names)
+
+
+def test_the_default_learning_rate_is_adams_not_ten_times_it():
+    """0.01 is what shipped, and it killed the network on both backends."""
+    import inspect
+
+    from trader import helloworld
+
+    assert inspect.signature(baseline.fit_mlp).parameters["lr"].default == 0.001
+    assert trainer.Hyperparameters().learning_rate == 0.001
+    assert inspect.signature(
+        helloworld.Client.submit).parameters["learning_rate"].default == 0.001
+
+
+# --- it stops itself --------------------------------------------------------
+
+def overfittable():
+    """Enough noise features that a network will memorise if allowed to."""
+    rng = np.random.default_rng(2)
+    x = rng.normal(size=(4000, 12))
+    # A weak real signal buried in noise: fitting it is possible, memorising
+    # the rest is easier, which is the situation early stopping exists for.
+    logit = 0.35 * x[:, 0]
+    y = (rng.random(4000) < 1 / (1 + np.exp(-logit))).astype(int)
+    return x, y
+
+
+def test_the_step_count_is_a_ceiling_not_an_instruction():
+    """Three very different budgets have to reach the same place.
+
+    Measured on the wide panel: ceilings of 20,000, 80,268 and 200,000 steps
+    all stop at 5,000 and score identically. If the ceiling still decided the
+    outcome, early stopping would not be doing anything.
+    """
+    x, y = overfittable()
+
+    stops = [baseline.fit_mlp(x, y, hidden=32, steps=steps, seed=0,
+                              check_every=250, patience=4).stopped_at
+             for steps in (4000, 16000, 40000)]
+
+    assert len(set(stops)) == 1, f"the ceiling still decided the outcome: {stops}"
+    assert stops[0] < 4000, "it never stopped early at all"
+
+
+def test_more_training_does_not_beat_stopping_when_it_should(monkeypatch):
+    """The answer to "should it loop until it is smarter" is no, measurably."""
+    x, y = overfittable()
+    cut = int(len(x) * 0.7)
+    x_fit, y_fit, x_out, y_out = x[:cut], y[:cut], x[cut:], y[cut:]
+
+    stopped = baseline.fit_mlp(x_fit, y_fit, hidden=32, steps=40000, seed=0,
+                               check_every=250, patience=4)
+    ground_on = baseline.fit_mlp(x_fit, y_fit, hidden=32, steps=40000, seed=0,
+                                 validation=0.0)
+
+    def accuracy(net):
+        return float(((net.probabilities(x_out) > 0.5) == y_out).mean())
+
+    assert accuracy(stopped) >= accuracy(ground_on), (
+        "training to the ceiling beat stopping early, which means this test "
+        "is not exercising overfitting")
+
+
+def test_the_weights_kept_are_the_best_ones_not_the_last_ones():
+    x, y = overfittable()
+    network = baseline.fit_mlp(x, y, hidden=32, steps=40000, seed=0,
+                               check_every=250, patience=4)
+
+    # The recorded stopping point is where validation loss was lowest, and it
+    # is strictly before training gave up.
+    assert 0 < network.stopped_at < 40000
+    assert network.validation_loss is not None
+
+
+def test_the_validation_slice_is_the_most_recent_training_rows():
+    """Taken at random it would let the model stop using days it memorised.
+
+    `combine` leaves rows in date order, so the tail is the most recent stretch
+    of the training period -- the nearest rehearsal of the test set available
+    without touching it.
+    """
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(2000, 6))
+    # The last fifth is unlearnable noise; a model validated on it cannot
+    # improve there, so it should stop almost immediately.
+    y = (x[:, 0] > 0).astype(int)
+    y[-400:] = (rng.random(400) > 0.5).astype(int)
+
+    network = baseline.fit_mlp(x, y, hidden=16, steps=20000, seed=0,
+                               validation=0.2, check_every=200, patience=3)
+    assert network.stopped_at < 20000
+
+
+def test_stopping_can_be_switched_off():
+    x, y = overfittable()
+    network = baseline.fit_mlp(x, y, hidden=16, steps=1500, seed=0,
+                               validation=0.0)
+    assert network.validation_loss is None
+    assert network.stopped_at == 1500

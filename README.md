@@ -122,7 +122,89 @@ A gap several times the seed spread in HelloWorldAi's favour is treated as
 advantage has to have come from somewhere, and the usual somewhere is having
 seen more than it should.
 
-One trap worth recording, because it would never have raised: the bundle format
+### The learning rate was killing the network
+
+Running the local backend on the wide panel produced a model with an edge of
+exactly **+0.0000** while a logistic regression on identical rows scored +1.08
+points. An MLP with hidden layers strictly contains a logistic regression's
+capacity, so that is not a fact about the data — it is a training failure.
+
+It was, precisely:
+
+```
+up-rate 1.0000   accuracy 0.5003
+probability range: 0.516992 .. 0.516992   std 0.000000
+  layer 0: 64/64 units alive (0 dead)
+  layer 1:  0/64 units alive (64 dead)
+```
+
+Every unit of the second hidden layer was dead. A ReLU whose pre-activation is
+negative for every input outputs zero for every input *and has zero gradient*,
+so it never recovers — the network had collapsed to its output bias and was
+returning one constant probability for every row in the panel. Adam at
+`lr=0.01`, on every seed tried.
+
+`lr=0.01` was the default on **both** backends, and `pipeline` never overrode
+it, so every HelloWorldAi run this project ever made was trained at it too.
+
+| lr | accuracy | up-rate | dead in layer 2 |
+|---|---|---|---|
+| 0.01 | 0.4997 | 0.000 | **64 of 64** |
+| 0.003 | 0.5054 | 0.875 | 38 of 64 |
+| **0.001** | **0.5087** | **0.571** | **1 of 64** |
+| 0.0003 | 0.5079 | 0.474 | 0 of 64 |
+
+Now 0.001 — Adam's own default — everywhere. At full step count on the wide
+panel the same model goes from an edge of +0.0000 to **+0.0091**, up-rate 1.000
+to 0.556, probability std 0.000000 to 0.047.
+
+The worst part is what the gate said about it: *"The model answers the same way
+almost every day, so its accuracy is just the class balance. It has learned
+nothing."* That is a sentence about the market, and it was a sentence about the
+optimiser. So `train_local` now checks the network it produced and **refuses to
+return a collapsed one**, naming the learning rate and saying in as many words
+that nothing about the market can be concluded from it.
+
+A training failure that reports itself as a market finding is the most expensive
+kind of bug this project can have, because the conclusion it produces is exactly
+the conclusion the project expects.
+
+### And it stops itself now
+
+With the learning rate fixed, the obvious next question is whether training
+longer helps. It does not, and the curve is unambiguous:
+
+| steps | passes | train acc | **test acc** | edge |
+|---|---|---|---|---|
+| 5,000 | 0.7 | 0.5194 | **0.5118** | +0.0115 |
+| 20,000 | 3.0 | 0.5337 | 0.5108 | +0.0105 |
+| 80,268 | 12.0 | 0.5564 | 0.5066 | +0.0063 |
+| 200,000 | 29.9 | 0.5690 | **0.5029** | +0.0026 |
+
+Training accuracy climbs the whole way; out-of-sample accuracy falls the whole
+way. The model is not getting smarter, it is memorising — so looping training to
+"keep improving" makes it strictly worse, and would have done nothing whatsoever
+in the collapsed case, where the second layer had zero gradient from the start.
+
+But picking 5,000 off that table means picking a hyperparameter by reading the
+test set, which is how the one number that has to stay clean gets spent. So
+`fit_mlp` holds back the **last 15% of the training rows** — chronologically, so
+the slice is the most recent part of the training period — checks against it
+every 1,000 steps, keeps the best weights, and gives up after 8 checks without
+improvement.
+
+It lands on 5,000 steps. The same place, chosen without looking:
+
+| ceiling | stopped at | test acc | edge |
+|---|---|---|---|
+| 20,000 | 5,000 | 0.5077 | +0.0075 |
+| 80,268 | 5,000 | 0.5077 | +0.0075 |
+| 200,000 | 5,000 | 0.5077 | +0.0075 |
+
+`steps` is now a ceiling rather than an instruction, a local run takes 6 seconds
+instead of 69, and the step count stopped being a number anybody has to guess.
+
+One more trap worth recording, because it would never have raised: the bundle format
 ends in two class scores through a softmax and the local network ends in one
 logit through a sigmoid. `softmax([a0, a1])[1]` is `sigmoid(a1 − a0)`, so the
 "down" row must be **zero** and the "up" row the trained weights. Mirroring them

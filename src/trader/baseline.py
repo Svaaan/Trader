@@ -108,6 +108,11 @@ class MLP:
     """The same shape as the job that goes to HelloWorldAi, run here."""
 
     layers: list
+    # Where early stopping settled, and what it settled on. Recorded so that a
+    # run says how much training it actually used rather than how much it was
+    # allowed.
+    stopped_at: int = 0
+    validation_loss: float | None = None
 
     def probabilities(self, x: np.ndarray) -> np.ndarray:
         activation = np.asarray(x, dtype=np.float64)
@@ -118,10 +123,62 @@ class MLP:
         return _sigmoid(activation.ravel())
 
 
+def network_health(network: MLP, x: np.ndarray, sample: int = 20000) -> dict:
+    """Whether this network is still capable of answering different things.
+
+    A ReLU whose pre-activation is negative for every input in the data outputs
+    zero for every input, and its gradient is zero too -- so it never comes back.
+    When a whole layer dies the network collapses to its output bias: one
+    probability, the same for every row, forever. Training longer makes it
+    worse, not better, because there is nothing left to update.
+
+    This is not a hypothetical. At `lr=0.01` -- the default this project shipped
+    with, on both backends -- all sixty-four units of the second hidden layer
+    died on every seed tried, and the model returned a constant 0.516992. The
+    gate then reported "it has learned nothing", which reads as a statement
+    about the market and was a statement about the optimiser.
+    """
+    rows = np.asarray(x, dtype=np.float64)[:sample]
+    if not len(rows):
+        return {"checked_rows": 0}
+
+    activation = rows
+    dead_per_layer = []
+    for weight, bias in network.layers[:-1]:
+        z = activation @ weight + bias
+        alive = (z > 0).any(axis=0)
+        dead_per_layer.append(int((~alive).sum()))
+        activation = np.maximum(z, 0.0)
+
+    probabilities = network.probabilities(rows)
+    width = [len(w[1]) for w in [(None, b) for _, b in network.layers[:-1]]]
+
+    return {
+        "checked_rows": int(len(rows)),
+        "dead_units": dead_per_layer,
+        "hidden_width": width,
+        # A layer entirely dead means the network cannot vary at all.
+        "collapsed": any(d == w for d, w in zip(dead_per_layer, width)),
+        "probability_std": round(float(probabilities.std()), 8),
+        "probability_range": [round(float(probabilities.min()), 6),
+                              round(float(probabilities.max()), 6)],
+    }
+
+
+def _cross_entropy(probabilities: np.ndarray, target: np.ndarray) -> float:
+    safe = np.clip(probabilities, 1e-12, 1 - 1e-12)
+    return float(-(target * np.log(safe) + (1 - target) * np.log(1 - safe)).mean())
+
+
 def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
-            steps: int = 4000, batch: int = 64, lr: float = 0.01,
-            seed: int = 0) -> MLP:
+            steps: int = 4000, batch: int = 64, lr: float = 0.001,
+            seed: int = 0, validation: float = 0.15,
+            patience: int = 8, check_every: int = 1000) -> MLP:
     """A small ReLU network trained with Adam, in numpy.
+
+    The learning rate is Adam's own default and was not always. At 0.01 this
+    network dies: see `network_health` for what that means and how it was
+    found. Raising it is not a free knob -- check the health report.
 
     Counted in **gradient steps, not epochs**, because that is how the job
     submitted to HelloWorldAi is counted -- `steps=4000, batch_size=64`. Passing
@@ -132,6 +189,32 @@ def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
     twenty-four times as much. Epoch-counting made the controls take minutes on
     a wide panel, which is long enough that somebody would turn them off.
 
+    **It stops itself.** `steps` is a ceiling, not an instruction. The last
+    `validation` fraction of the training rows is held back -- chronologically,
+    because `combine` leaves them in date order, so the slice is the most recent
+    part of the training period and the nearest thing available to a rehearsal
+    of the test set. Training checks against it every `check_every` steps, keeps
+    the weights that scored best, and gives up after `patience` checks without
+    improvement.
+
+    That is not a refinement, it is the difference between a model and a
+    memorised table. Measured on the wide panel at a fixed step count:
+
+        steps    passes   train acc   test acc
+        5,000       0.7      0.5194     0.5118
+        20,000      3.0      0.5337     0.5108
+        80,268     12.0      0.5564     0.5066
+        200,000    29.9      0.5690     0.5029
+
+    Training accuracy climbs the whole way and out-of-sample accuracy falls the
+    whole way. More training makes it strictly worse, so "train for longer" and
+    "loop until it is smarter" both have the same answer, and it is no.
+
+    The stopping point has to be chosen on the validation slice rather than on
+    the test set, even though the test set would pick a better one. Reading the
+    test set to decide a hyperparameter is how the one number that has to stay
+    clean gets spent.
+
     Deliberately not torch. The project refuses that dependency to keep every
     arithmetic step readable, and a control that needed two gigabytes of CUDA to
     run would not be much of a control.
@@ -140,7 +223,17 @@ def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1, 1)
 
-    sizes = [x.shape[1]] + [hidden] * depth + [1]
+    # The validation slice comes off the end, which is the most recent stretch
+    # of the training period. Taking it at random would let the model choose its
+    # stopping point using days it had memorised the neighbours of.
+    holdout = int(len(x) * max(min(validation, 0.5), 0.0))
+    if holdout > 50:
+        x_fit, y_fit = x[:-holdout], y[:-holdout]
+        x_val, y_val = x[-holdout:], y[-holdout:]
+    else:
+        x_fit, y_fit, x_val, y_val = x, y, None, None
+
+    sizes = [x_fit.shape[1]] + [hidden] * depth + [1]
     layers = []
     for a, b in zip(sizes[:-1], sizes[1:]):
         # He initialisation, which is what ReLU wants.
@@ -149,20 +242,22 @@ def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
     moment1 = [[np.zeros_like(w), np.zeros_like(b)] for w, b in layers]
     moment2 = [[np.zeros_like(w), np.zeros_like(b)] for w, b in layers]
 
-    order = rng.permutation(len(x))
+    order = rng.permutation(len(x_fit))
     cursor = 0
+
+    best_loss, best_layers, best_step, stale = np.inf, None, 0, 0
 
     for step in range(1, max(steps, 1) + 1):
         # Draw the next minibatch, reshuffling when the pass runs out. Sampling
         # without replacement within a pass keeps the gradient estimates less
         # correlated than drawing independently every time.
         if cursor + batch > len(order):
-            order = rng.permutation(len(x))
+            order = rng.permutation(len(x_fit))
             cursor = 0
         index = order[cursor:cursor + batch]
         cursor += batch
 
-        xb, yb = x[index], y[index]
+        xb, yb = x_fit[index], y_fit[index]
 
         activations = [xb]
         for depth_index, (weight, bias) in enumerate(layers):
@@ -193,7 +288,31 @@ def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
                 corrected2 = moment2[depth_index][slot] / (1 - 0.999 ** step)
                 param -= lr * corrected1 / (np.sqrt(corrected2) + 1e-8)
 
-    return MLP(layers=layers)
+        # --- stop when it stops helping ---------------------------------
+        if x_val is not None and (step % check_every == 0 or step == steps):
+            candidate = MLP(layers=layers)
+            loss = _cross_entropy(candidate.probabilities(x_val), y_val.ravel())
+
+            if loss < best_loss - 1e-6:
+                best_loss, best_step, stale = loss, step, 0
+                # Copied, because `layers` keeps being updated in place.
+                best_layers = [(w.copy(), b.copy()) for w, b in layers]
+            else:
+                stale += 1
+                if stale >= patience:
+                    logger.info(
+                        "Stopped at %d of %d steps; best validation loss "
+                        "%.5f at step %d", step, steps, best_loss, best_step)
+                    break
+
+    # The weights that scored best, not the ones it happened to end on.
+    if best_layers is not None:
+        layers = best_layers
+
+    return MLP(layers=layers,
+               stopped_at=best_step or steps,
+               validation_loss=(None if best_loss == np.inf
+                                else round(best_loss, 6)))
 
 
 @dataclasses.dataclass
@@ -268,6 +387,9 @@ def run_controls(splits, feature_names, *, hidden: int = 64, depth: int = 2,
         accuracies.append(scored["accuracy"])
         if seed == 0:
             out["local_mlp"] = scored
+            # Recorded so that a dead network is diagnosable from the run file
+            # rather than only from its suspiciously round accuracy.
+            out["local_mlp_health"] = network_health(model, x_train)
 
     # The number that says how much of any "edge" is just which seed came up.
     out["noise_floor"] = {
