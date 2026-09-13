@@ -1,12 +1,13 @@
 // The trading view: a call per symbol, and the argument for it.
 //
 // The order on the page is the order of the reasoning, and it is deliberate.
-// First whether the model has earned an opinion at all; then what it pays
-// attention to; then, underneath both, what it says about each symbol. Putting
-// the calls first would make the gate look like a footnote on a recommendation
-// rather than the thing that decides whether there is one.
+// First whether the model has earned an opinion at all; then what it had to
+// beat; then whether it held up across time; then what it pays attention to;
+// then, underneath all of it, what it says about each symbol. Putting the calls
+// first would make the gate look like a footnote on a recommendation rather
+// than the thing that decides whether there is one.
 //
-// createElement throughout: symbol names come from a data provider.
+// createElement throughout: symbol names and headlines come from providers.
 
 const POLL_MS = 30000;
 
@@ -18,12 +19,21 @@ function el(tag, className, text) {
 }
 
 const pct = (v, d = 1) => (v === null || v === undefined ? "—" : `${(v * 100).toFixed(d)}%`);
+const num = (v, d = 2) => (v === null || v === undefined ? "—" : Number(v).toFixed(d));
 
 const VERDICT = {
   buy: { label: "Buy now", tone: "is-buy" },
   no_buy: { label: "No buy", tone: "is-nobuy" },
   unsure: { label: "Still collecting data", tone: "is-unsure" },
 };
+
+function figure(label, value, hint) {
+  const box = el("div", "figure");
+  box.appendChild(el("div", "figure-label", label));
+  box.appendChild(el("div", "figure-value", value));
+  if (hint) box.appendChild(el("div", "figure-hint", hint));
+  return box;
+}
 
 // --- has it earned an opinion? --------------------------------------------
 
@@ -43,29 +53,235 @@ function trustPanel(run) {
   panel.appendChild(el("p", "trust-reason", trust.reason || ""));
 
   const grid = el("div", "figures");
-  const figure = (label, value, hint) => {
-    const box = el("div", "figure");
-    box.appendChild(el("div", "figure-label", label));
-    box.appendChild(el("div", "figure-value", value));
-    if (hint) box.appendChild(el("div", "figure-hint", hint));
-    return box;
-  };
-
+  // Runs from before the distinction existed have rows and no day count, and
+  // showing "0 days" would be worse than showing the number they do have.
   grid.appendChild(figure("Accuracy", pct(evaluation.accuracy),
-    `${(evaluation.rows || 0).toLocaleString()} days it never saw`));
+    evaluation.days
+      ? `${evaluation.days.toLocaleString()} days it never saw`
+      : `${(evaluation.rows || 0).toLocaleString()} rows it never saw`));
   grid.appendChild(figure("Baseline", pct(evaluation.baseline_accuracy),
-    "always the commoner direction"));
+    // Only claim the training majority when the run actually recorded that it
+    // used one; older runs read the baseline off the test period.
+    evaluation.baseline_source || "the commoner direction"));
   grid.appendChild(figure("Edge", pct(trust.edge, 2), "accuracy minus baseline"));
   grid.appendChild(figure("Needed", pct(trust.needed, 2),
-    "two standard errors, from the sample size"));
+    "two standard errors, from the effective sample"));
   panel.appendChild(grid);
 
-  // The bar is computed from how much evidence there is, not chosen, so it is
-  // worth saying that out loud where somebody is deciding whether to believe it.
+  // The row count and the sample size are different numbers, and the gap
+  // between them is the whole reason the bar sits where it does -- when there
+  // is a gap. A relative target largely removes it, and claiming a discount
+  // that was not applied would be its own small dishonesty.
+  if (evaluation.effective_rows) {
+    const rows = (evaluation.rows || 0).toLocaleString();
+    const effective = evaluation.effective_rows.toLocaleString();
+    const discounted = evaluation.effective_rows < (evaluation.rows || 0);
+
+    panel.appendChild(el("p", "note",
+      discounted
+        ? `${rows} rows across ${evaluation.symbols || "?"} symbols, but they `
+          + `move together (mean correlation ${num(evaluation.row_correlation, 3)}), `
+          + `so they are worth about ${effective} independent observations. The `
+          + `bar is computed from that smaller number, because ten symbols on `
+          + `one day are not ten verdicts.`
+        : `${rows} rows across ${evaluation.symbols || "?"} symbols, and this `
+          + `time they do not move together (mean correlation `
+          + `${num(evaluation.row_correlation, 3)}), so all of them count. A `
+          + `relative target tends to do that: once the market move is taken `
+          + `out of the label, being right about one name says little about `
+          + `being right about the next.`));
+  }
+
+  // Every hurdle, passed or not. A gate that says no without saying which
+  // question it failed teaches nobody anything.
+  const checks = trust.checks || [];
+  if (checks.length) {
+    const list = el("ul", "checks");
+    checks.forEach((check) => {
+      const row = el("li", check.passed ? "is-ok" : "is-bad");
+      row.appendChild(el("span", "check-mark", check.passed ? "✓" : "✗"));
+      row.appendChild(el("span", "check-name", check.name.replace(/_/g, " ")));
+      row.appendChild(el("span", "check-detail", check.detail));
+      list.appendChild(row);
+    });
+    panel.appendChild(list);
+  }
+
+  return panel;
+}
+
+// --- what it had to beat ---------------------------------------------------
+
+function controlsPanel(run) {
+  const controls = run.controls || {};
+  const evaluation = run.evaluation || {};
+  if (!controls.majority) return null;
+
+  const panel = el("section", "a-panel");
+  panel.appendChild(el("h2", null, "What it had to beat"));
+
+  const rows = [
+    ["Always the training majority", controls.majority],
+    ["Logistic regression, same rows", controls.logistic],
+    ["Local MLP, same shape", controls.local_mlp],
+    ["HelloWorldAi model", evaluation],
+  ].filter(([, value]) => value && value.accuracy !== undefined);
+
+  const table = el("table", "compare");
+  const header = el("tr");
+  ["Model", "Accuracy", "Edge", "Up-rate", "Sharpe", "t"].forEach((label) => {
+    header.appendChild(el("th", null, label));
+  });
+  table.appendChild(header);
+
+  rows.forEach(([label, result], index) => {
+    const row = el("tr", index === rows.length - 1 ? "is-subject" : null);
+    row.appendChild(el("td", null, label));
+    row.appendChild(el("td", null, pct(result.accuracy, 2)));
+    row.appendChild(el("td", null, pct(result.edge, 2)));
+    row.appendChild(el("td", null, pct(result.up_rate, 0)));
+    row.appendChild(el("td", null, num(result.strategy_sharpe)));
+    row.appendChild(el("td", null, num(result.strategy_tstat)));
+    table.appendChild(row);
+  });
+  panel.appendChild(table);
+
+  const floor = controls.noise_floor;
+  if (floor && floor.seeds > 1) {
+    panel.appendChild(figureRow(
+      "Noise floor",
+      pct(floor.spread, 2),
+      `${floor.seeds} identical configurations, different seeds only`));
+    panel.appendChild(el("p", "note",
+      "That spread is the smallest difference between two models that means "
+      + "anything. An edge smaller than it is a fact about which seed came up, "
+      + "and the gate above refuses it on exactly that basis."));
+  }
+
+  const hyper = controls.hyperparameters;
+  let how = "All three ran here, on the same rows. ";
+  if (hyper) {
+    how = `All three ran here, on the same rows, with the submission's own `
+      + `shape (${hyper.hidden} wide, ${hyper.depth} deep). `;
+    // A control that saw a quarter of the steps is worth having and is not the
+    // same claim as one that saw all of them, so the gap is stated.
+    if (controls.local_step_share !== undefined && controls.local_step_share < 1) {
+      how += `The local MLP was trained for ${(controls.local_steps || 0).toLocaleString()} `
+        + `of the submission's ${hyper.steps.toLocaleString()} steps `
+        + `(${pct(controls.local_step_share, 0)}) to keep it to seconds, so read `
+        + `it as a floor rather than a match. `;
+    } else if (hyper.steps) {
+      how += `The local MLP saw the same ${hyper.steps.toLocaleString()} steps. `;
+    }
+  }
+
   panel.appendChild(el("p", "note",
-    "The bar moves with the amount of evidence: over a few hundred days chance "
-    + "alone can produce several points of apparent edge, over several thousand "
-    + "it cannot. Nothing is called unless the gap clears it."));
+    how
+    + "If the trained model does not beat the logistic regression, the round "
+    + "trip bought a linear model slowly; if it does not beat the majority, it "
+    + "learnt nothing."));
+
+  return panel;
+}
+
+function figureRow(label, value, hint) {
+  const grid = el("div", "figures");
+  grid.appendChild(figure(label, value, hint));
+  return grid;
+}
+
+// --- did it hold up across time? -------------------------------------------
+
+function walkForwardPanel(run) {
+  const wf = run.walk_forward || {};
+  const folds = wf.folds || [];
+  if (!folds.length) return null;
+
+  const panel = el("section", "a-panel");
+  panel.appendChild(el("h2", null, "Across consecutive windows"));
+
+  const table = el("table", "compare");
+  const header = el("tr");
+  ["Window", "Rows", "Accuracy", "Baseline", "Edge", "Sharpe"].forEach((label) => {
+    header.appendChild(el("th", null, label));
+  });
+  table.appendChild(header);
+
+  folds.forEach((fold) => {
+    const row = el("tr", fold.edge > 0 ? "is-ok" : "is-bad");
+    row.appendChild(el("td", null, `${fold.test_from} → ${fold.test_to}`));
+    row.appendChild(el("td", null, (fold.rows || 0).toLocaleString()));
+    row.appendChild(el("td", null, pct(fold.accuracy, 2)));
+    row.appendChild(el("td", null, pct(fold.baseline, 2)));
+    row.appendChild(el("td", null, pct(fold.edge, 2)));
+    row.appendChild(el("td", null, num(fold.sharpe)));
+    table.appendChild(row);
+  });
+  panel.appendChild(table);
+
+  panel.appendChild(el("p", "note",
+    `Positive in ${wf.folds_positive} of ${wf.folds_run} windows, mean edge `
+    + `${pct(wf.mean_edge, 2)} with a spread of ${pct(wf.sd_edge, 2)}. `
+    + "One test period is one draw. An edge that shows up in a single window "
+    + "and not the others is what a coin looks like, and the gate treats it "
+    + `that way. Graded with the ${wf.model} control, because six GPU round `
+    + "trips would take a day and this takes seconds."));
+
+  return panel;
+}
+
+// --- what went into it -----------------------------------------------------
+
+function datasetPanel(run) {
+  const dataset = run.dataset || {};
+  const blocks = dataset.blocks || {};
+  const excluded = dataset.excluded || {};
+
+  const panel = el("section", "a-panel");
+  panel.appendChild(el("h2", null, "What went in"));
+
+  const grid = el("div", "figures");
+  grid.appendChild(figure("Symbols", (dataset.symbols || []).length,
+    `${Object.keys(excluded).length} excluded`));
+  grid.appendChild(figure("Features", (dataset.feature_names || []).length,
+    "own, cross-sectional, macro, events"));
+  grid.appendChild(figure("Train rows", (dataset.train?.rows || 0).toLocaleString(),
+    `to ${dataset.train?.to || "?"}`));
+  grid.appendChild(figure("Test rows", (dataset.test?.rows || 0).toLocaleString(),
+    `from ${dataset.test?.from || "?"}`));
+  panel.appendChild(grid);
+
+  const chips = el("div", "chips");
+  Object.entries(blocks).forEach(([name, block]) => {
+    if (!block) return;
+    const used = block.used;
+    const chip = el("span", `chip ${used ? "is-ok" : "is-off"}`,
+      `${name}: ${used ? `${(block.columns || []).length} columns` : "off"}`);
+    chips.appendChild(chip);
+  });
+  panel.appendChild(chips);
+
+  // A watchlist of ten that trains as nine used to be invisible.
+  const names = Object.keys(excluded);
+  if (names.length) {
+    const list = el("ul", "excluded");
+    names.slice(0, 12).forEach((symbol) => {
+      list.appendChild(el("li", null, `${symbol} — ${excluded[symbol]}`));
+    });
+    if (names.length > 12) {
+      list.appendChild(el("li", null, `…and ${names.length - 12} more`));
+    }
+    panel.appendChild(el("h3", null, "Left out of the panel"));
+    panel.appendChild(list);
+  }
+
+  if (dataset.panel_drift) {
+    panel.appendChild(el("p", "warn",
+      `The scoring panel differed from the trained one: added `
+      + `${(dataset.panel_drift.added || []).join(", ") || "none"}, lost `
+      + `${(dataset.panel_drift.lost || []).join(", ") || "none"}. Only the `
+      + "trained symbols were graded."));
+  }
 
   return panel;
 }
@@ -82,7 +298,7 @@ function learntPanel(run) {
   const strongest = Math.max(...learnt.map((f) => f.influence), 1e-9);
 
   const list = el("div", "influence");
-  learnt.forEach((feature) => {
+  learnt.slice(0, 20).forEach((feature) => {
     const row = el("div", "influence-row");
     row.appendChild(el("div", "influence-name", feature.feature.replace(/_/g, " ")));
 
@@ -111,7 +327,7 @@ function learntPanel(run) {
 
 // --- the calls -------------------------------------------------------------
 
-function signalCard(signal) {
+function signalCard(signal, gateOpen) {
   const verdict = VERDICT[signal.verdict] || VERDICT.unsure;
 
   const card = el("article", `call ${verdict.tone}`);
@@ -125,7 +341,9 @@ function signalCard(signal) {
   card.appendChild(head);
 
   const numbers = el("div", "call-numbers");
-  numbers.appendChild(el("span", null, `Close ${signal.close}`));
+  if (signal.close !== null && signal.close !== undefined) {
+    numbers.appendChild(el("span", null, `Close ${signal.close}`));
+  }
   numbers.appendChild(el("span", null, `P(up) ${signal.probability_up.toFixed(3)}`));
   card.appendChild(numbers);
 
@@ -138,11 +356,72 @@ function signalCard(signal) {
     card.appendChild(why);
   }
 
+  // Background is fetched on demand, so a page of two hundred symbols does not
+  // make two hundred calls nobody asked for.
+  const more = el("button", "context-button", "Background");
+  const slot = el("div", "context-slot");
+  more.addEventListener("click", () => loadContext(signal.symbol, slot, more, gateOpen));
+  card.appendChild(more);
+  card.appendChild(slot);
+
   return card;
+}
+
+async function loadContext(symbol, slot, button, gateOpen) {
+  button.disabled = true;
+  button.textContent = "Reading…";
+  slot.replaceChildren();
+
+  try {
+    const response = await fetch(`/api/context/${encodeURIComponent(symbol)}`);
+    if (!response.ok) throw new Error(`server returned ${response.status}`);
+    const body = await response.json();
+
+    const box = el("div", `context ${gateOpen ? "" : "is-gated"}`);
+    // The heading says what this is before the prose does, because prose reads
+    // as conviction and this is not evidence.
+    box.appendChild(el("div", "context-head",
+      gateOpen ? "Context" : "Background — not evidence"));
+    box.appendChild(el("p", "context-text", body.text));
+
+    const sources = body.sources || [];
+    if (sources.length) {
+      const list = el("ol", "sources");
+      sources.forEach((source) => {
+        const item = el("li");
+        if (source.url) {
+          const link = el("a", null, source.title || source.url);
+          link.href = source.url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          item.appendChild(link);
+        } else {
+          item.appendChild(el("span", null, source.title || "untitled"));
+        }
+        // Capture time, not the provider's claim: it is the only timestamp
+        // here that could not have been revised after the fact.
+        item.appendChild(el("span", "source-meta",
+          ` — ${source.provider || "unknown"}, first seen ${source.captured_utc}`));
+        list.appendChild(item);
+      });
+      box.appendChild(list);
+    }
+
+    box.appendChild(el("p", "note", body.note || ""));
+    slot.appendChild(box);
+
+  } catch (error) {
+    slot.appendChild(el("p", "error", `Could not load: ${error.message}`));
+  } finally {
+    button.disabled = false;
+    button.textContent = "Background";
+  }
 }
 
 function callsPanel(run) {
   const signals = run.signals || [];
+  const gateOpen = Boolean((run.trust || {}).trusted);
+
   const panel = el("section", "a-panel");
   panel.appendChild(el("h2", null, "Today"));
 
@@ -152,13 +431,47 @@ function callsPanel(run) {
   }
 
   const grid = el("div", "calls");
-  signals.forEach((signal) => grid.appendChild(signalCard(signal)));
+  signals.forEach((signal) => grid.appendChild(signalCard(signal, gateOpen)));
   panel.appendChild(grid);
 
   panel.appendChild(el("p", "note",
     "The reasons describe what moved this model's answer today. They explain "
     + "the decision; they are not evidence the decision is right, and they are "
     + "worth reading only when the gate above is open."));
+
+  return panel;
+}
+
+// --- the news store --------------------------------------------------------
+
+function newsPanel(body) {
+  const state = body.news || {};
+  if (!state.needed_days) return null;
+
+  const panel = el("section", "a-panel");
+  panel.appendChild(el("h2", null, "Point-in-time news store"));
+
+  const grid = el("div", "figures");
+  grid.appendChild(figure("Items", (state.items || 0).toLocaleString(),
+    state.since ? `since ${String(state.since).slice(0, 10)}` : "nothing yet"));
+  grid.appendChild(figure("History", `${state.history_days || 0} d`,
+    `${state.needed_days} needed`));
+  grid.appendChild(figure("Usable as features", state.ready ? "yes" : "not yet",
+    state.ready ? "" : "accumulating"));
+  panel.appendChild(grid);
+
+  panel.appendChild(el("p", "note",
+    "News cannot be backfilled honestly: an archive fetched today has been "
+    + "re-ranked by what turned out to matter, and its publication timestamps "
+    + "are often ingestion times. So the store records when this machine "
+    + "provably saw each item and is written forwards only. Until it clears "
+    + `${state.needed_days} days it is used for reading, never as a feature.`));
+
+  if (!body.context_available) {
+    panel.appendChild(el("p", "note",
+      "No language model is configured, so the background panels show sources "
+      + "without prose. Set ANTHROPIC_API_KEY to enable them."));
+  }
 
   return panel;
 }
@@ -181,15 +494,21 @@ async function refresh() {
     }
 
     const run = body.run;
+    const target = run.spec?.target || "absolute";
 
-    const meta = el("p", "analysis-meta",
-      `Model ${run.run_id}, ${run.horizon}-day horizon, graded on `
-      + `${run.dataset?.test?.from || "?"} → ${run.dataset?.test?.to || "?"}.`);
-    host.appendChild(meta);
+    host.appendChild(el("p", "analysis-meta",
+      `Model ${run.run_id}, ${run.horizon}-day horizon, ${target} target, `
+      + `graded on ${run.dataset?.test?.from || "?"} → ${run.dataset?.test?.to || "?"}.`));
 
-    [trustPanel(run), learntPanel(run), callsPanel(run)]
-      .filter(Boolean)
-      .forEach((panel) => host.appendChild(panel));
+    [
+      trustPanel(run),
+      controlsPanel(run),
+      walkForwardPanel(run),
+      datasetPanel(run),
+      learntPanel(run),
+      callsPanel(run),
+      newsPanel(body),
+    ].filter(Boolean).forEach((panel) => host.appendChild(panel));
 
   } catch (error) {
     host.replaceChildren(el("p", "error", `Could not load: ${error.message}`));

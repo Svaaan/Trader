@@ -1,26 +1,50 @@
 """Building the training set, and splitting it the way time actually runs.
 
-Two decisions here are the difference between a number that means something and
-a number that does not.
+Four decisions here are the difference between a number that means something
+and a number that does not.
 
-**The split is chronological.** A random split of a price series lets the model
-train on Tuesday and Thursday and be tested on Wednesday, with both neighbours
-memorised. Markets are autocorrelated enough that this alone can lift accuracy
-several points, and every one of them is fictional. Train is the earlier part of
-history, test is the later part, and nothing crosses.
+**The split is chronological, at one date across the whole panel.** A random
+split of a price series lets the model train on Tuesday and Thursday and be
+tested on Wednesday, with both neighbours memorised. Splitting each symbol at
+its own 80% mark looks chronological and is not: symbols have different amounts
+of history, so one name's training rows can run years past the start of
+another's test rows, and these markets move together. One date, everything
+before it trains, everything after it tests.
 
-This matters twice over, because HelloWorldAi holds back a *random* 20% for its
-own verification. That score is a real check on whether training worked -- it
-catches a node returning untrained or corrupted weights, which is what it is
-for -- but for time-series data it is optimistic as a measure of skill. So this
-project keeps its own out-of-time test set, never sends it anywhere, and the UI
-shows both numbers side by side rather than picking the flattering one.
+**The cut date is chosen once and then carried, never re-derived.** It used to
+be recomputed at scoring time from a stored row-count, which reproduced the
+original split only by luck: measured, it moved from 2024-11-06 to 2024-12-31,
+graded 4,187 rows while the run advertised 4,100, and silently added a symbol to
+the test set that had been absent from training. Worse, the drift is not
+directional -- a single failed price fetch at scoring time changes the pool,
+which moves the date, which can move it *earlier* and put trained rows into the
+score this project exists to keep clean. So `cut_date` is an argument, it is
+stored with the run, and scoring passes back the one that was used.
+
+**Training labels may not reach across the cut.** A row on the last training
+day is labelled with a return that realises after it -- inside the test period.
+At a one-day horizon that is one row per symbol and nearly harmless; at a
+twenty-day horizon it is twenty rows of direct leakage. The last `horizon` rows
+before the cut are dropped from training. This is the standard purge and it
+costs almost nothing.
 
 **The scaler is fitted on training rows only.** Standardising with the mean and
 standard deviation of the whole series tells the model, in a small but real way,
 what the test period looked like. The statistics are computed on train, applied
 to both, and written into the artifact so that inference months later uses the
 same numbers rather than re-deriving them from whatever data is at hand.
+
+A note on what is assembled here. Features arrive from five places -- the
+symbol's own prices, its position among its peers, the state of the market, the
+distance to its next announcement, and the point-in-time news store -- and each
+is optional so that the contribution of each can be measured rather than
+assumed. The order of the columns is fixed and recorded, because the model
+treats them positionally and a reordering is silent and total.
+
+The news block is the one that can be asked for and refused. It is built
+forwards and is worthless until it has history, so asking for it over a young
+store gets a warning and no columns rather than a column of zeros for every
+historical row and a real number for today.
 """
 
 from __future__ import annotations
@@ -28,13 +52,60 @@ from __future__ import annotations
 import dataclasses
 import io
 import json
+import logging
 from typing import Sequence
 
 import numpy as np
 import pandas as pd
 
+from . import cross as cross_mod
+from . import events as events_mod
 from . import features as features_mod
 from . import labels as labels_mod
+from . import macro as macro_mod
+from . import news as news_mod
+
+logger = logging.getLogger(__name__)
+
+
+@dataclasses.dataclass
+class Spec:
+    """Which blocks go in, and what is being predicted.
+
+    Held together so that a run records exactly what it was built from. Two runs
+    whose numbers differ are only comparable if this is identical, and it is
+    stored with both.
+    """
+
+    target: str = labels_mod.RELATIVE
+    horizon: int = 1
+    threshold: float = 0.0
+    neutral_band: float = 0.0
+    use_macro: bool = True
+    use_cross: bool = True
+    use_events: bool = True
+    # Asking for the news block is not the same as getting it. The store is
+    # built forwards and is worthless until it has history, so `assemble`
+    # consults news.readiness and refuses the block until it clears -- loudly,
+    # in the report, rather than by handing the model a column of zeros for
+    # every historical row and a real number for today.
+    use_news: bool = False
+    test_fraction: float = 0.2
+
+    @property
+    def embargo(self) -> int:
+        """Training rows dropped before the cut so no label reaches across it."""
+        return self.horizon
+
+    def to_dict(self) -> dict:
+        out = dataclasses.asdict(self)
+        out["embargo"] = self.embargo
+        return out
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "Spec":
+        fields = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in (raw or {}).items() if k in fields})
 
 
 @dataclasses.dataclass
@@ -85,83 +156,288 @@ class Scaler:
         )
 
 
-def choose_cut_date(frames: dict, *, horizon: int = 1, threshold: float = 0.0,
+# --- assembling the inputs -------------------------------------------------
+
+def assemble(frames: dict, spec: Spec | None = None, *,
+             refresh: bool = False) -> tuple[dict, list[str], dict]:
+    """Every feature block, joined per symbol.
+
+    Returns (per-symbol feature frames, ordered column names, a report of what
+    was and was not available). The report is not decoration: a panel where the
+    macro block failed to download, or where half the names have no earnings
+    calendar, produces perfectly plausible numbers and the only way to know is
+    to have written it down.
+    """
+    spec = spec or Spec()
+
+    own = {}
+    for symbol, prices in frames.items():
+        try:
+            frame = features_mod.build(prices)
+            if not frame.empty:
+                own[symbol] = frame
+        except Exception as exc:                        # noqa: BLE001
+            logger.warning("No features for %s: %s", symbol, exc)
+
+    if not own:
+        raise ValueError("no symbol produced any features")
+
+    report = {"symbols_with_features": sorted(own)}
+    names = list(features_mod.FEATURE_NAMES)
+
+    # --- cross-sectional ---------------------------------------------------
+    cross_frames = {}
+    if spec.use_cross:
+        cross_frames = cross_mod.build(own)
+        cross_names = cross_mod.names(cross_frames)
+        names += cross_names
+        report["cross"] = {"used": bool(cross_names), "columns": cross_names,
+                           "panel_width": len(own)}
+    else:
+        report["cross"] = {"used": False, "columns": []}
+
+    # --- macro -------------------------------------------------------------
+    macro_frame = None
+    if spec.use_macro:
+        try:
+            macro_frame = macro_mod.build(refresh=refresh)
+            macro_names = macro_mod.names(macro_frame)
+            names += macro_names
+            report["macro"] = {"used": True, "columns": macro_names,
+                               "rows": len(macro_frame)}
+        except Exception as exc:                        # noqa: BLE001
+            logger.warning("Macro block unavailable, continuing without it: %s", exc)
+            report["macro"] = {"used": False, "columns": [], "error": str(exc)}
+    else:
+        report["macro"] = {"used": False, "columns": []}
+
+    # --- events ------------------------------------------------------------
+    if spec.use_events:
+        names += list(events_mod.EVENT_NAMES)
+        report["events"] = {"used": True,
+                            "columns": list(events_mod.EVENT_NAMES),
+                            "coverage": events_mod.coverage(sorted(own),
+                                                            refresh=refresh)}
+    else:
+        report["events"] = {"used": False, "columns": []}
+
+    # --- news --------------------------------------------------------------
+    use_news = False
+    if spec.use_news:
+        state = news_mod.readiness(sorted(own))
+        use_news = bool(state.get("ready"))
+        if use_news:
+            names += list(news_mod.NEWS_NAMES)
+        else:
+            logger.warning(
+                "News block asked for but the store has %d days of %d; "
+                "leaving it out rather than feeding zeros",
+                state.get("history_days", 0), news_mod.MIN_HISTORY_DAYS)
+        report["news"] = {"used": use_news,
+                          "columns": list(news_mod.NEWS_NAMES) if use_news else [],
+                          "readiness": state}
+    else:
+        report["news"] = {"used": False, "columns": []}
+
+    # --- join --------------------------------------------------------------
+    assembled = {}
+    for symbol, frame in own.items():
+        joined = frame
+
+        if spec.use_cross and symbol in cross_frames:
+            joined = joined.join(cross_frames[symbol], how="left")
+
+        if macro_frame is not None:
+            joined = joined.join(macro_frame, how="left")
+
+        if spec.use_events:
+            joined = joined.join(
+                events_mod.build(symbol, joined.index, refresh=refresh), how="left")
+
+        if use_news:
+            joined = joined.join(news_mod.build(symbol, joined.index), how="left")
+
+        joined = joined.replace([np.inf, -np.inf], np.nan).dropna()
+        if not joined.empty:
+            assembled[symbol] = joined[[n for n in names if n in joined.columns]]
+
+    if not assembled:
+        raise ValueError("no symbol survived joining the feature blocks")
+
+    # Whatever actually made it through, in the declared order.
+    present = [n for n in names if n in next(iter(assembled.values())).columns]
+    report["feature_names"] = present
+    report["feature_count"] = len(present)
+
+    return assembled, present, report
+
+
+# --- splitting -------------------------------------------------------------
+
+def choose_cut_date(assembled: dict, label_frame: pd.DataFrame, *,
                     test_fraction: float = 0.2) -> pd.Timestamp:
     """One date, before which everything trains and after which everything tests.
 
-    Splitting each symbol at its own 80% mark looks chronological per symbol and
-    is not chronological at all across the pool: symbols have different amounts
-    of history, so Apple's training rows can run years past the start of SAP's
-    test rows. These markets move together, so that is the same leak as a random
-    split, wearing a different hat -- the model sees 2025 in one name and is
-    graded on 2025 in another.
-
-    Measured on the first real panel built here: per-symbol splits gave a
-    training window ending 2026-04-21 and a test window starting 2024-09-09,
-    a twenty-month overlap.
-
-    So the cut is a single date, chosen so that roughly `test_fraction` of all
-    rows across all symbols fall after it.
+    Chosen so that roughly `test_fraction` of all usable rows across all symbols
+    fall after it. Call this once per run and then carry the answer -- see the
+    module docstring for what re-deriving it costs.
     """
-    all_dates = []
-    for symbol, prices in frames.items():
-        x_frame = features_mod.build(prices)
-        y_series = labels_mod.direction(prices, horizon=horizon, threshold=threshold)
-        joined = x_frame.join(y_series, how="inner").dropna()
-        all_dates.append(pd.DatetimeIndex(joined.index))
+    pooled = []
+    for symbol, frame in assembled.items():
+        if symbol not in label_frame.columns:
+            continue
+        usable = frame.index.intersection(label_frame[symbol].dropna().index)
+        pooled.append(pd.DatetimeIndex(usable))
 
-    if not all_dates:
-        raise ValueError("no symbols to choose a cut date from")
+    if not pooled:
+        raise ValueError("no symbol has both features and labels")
 
-    pooled = pd.DatetimeIndex(np.concatenate([d.values for d in all_dates])).sort_values()
-    position = int(len(pooled) * (1.0 - test_fraction))
-    position = min(max(position, 1), len(pooled) - 1)
+    dates = pd.DatetimeIndex(np.concatenate([d.values for d in pooled])).sort_values()
+    position = int(len(dates) * (1.0 - test_fraction))
+    position = min(max(position, 1), len(dates) - 1)
 
-    return pooled[position]
+    return dates[position]
 
 
-def build_one(symbol: str, prices: pd.DataFrame, *, horizon: int = 1,
-              threshold: float = 0.0, test_fraction: float = 0.2,
-              cut_date: pd.Timestamp | None = None) -> Split:
-    """Features, labels and a chronological split for a single symbol.
-
-    `cut_date` splits at a fixed date rather than a fraction, which is what
-    pooling several symbols requires -- see choose_cut_date.
-    """
-    x_frame = features_mod.build(prices)
-    y_series = labels_mod.direction(prices, horizon=horizon, threshold=threshold)
-    fwd = labels_mod.forward_return(prices, horizon=horizon)
-
-    # Keep only dates that have both a full set of features and a known future.
-    frame = x_frame.join(y_series, how="inner").join(fwd, how="inner").dropna()
-    if frame.empty:
+def build_one(symbol: str, frame: pd.DataFrame, label: pd.Series,
+              graded: pd.Series, *, cut_date: pd.Timestamp,
+              feature_names: Sequence[str], embargo: int = 1) -> Split:
+    """Features, labels and a chronological split for a single symbol."""
+    joined = frame.join(label.rename("label"), how="inner") \
+                  .join(graded.rename("graded"), how="inner").dropna()
+    if joined.empty:
         raise ValueError(f"{symbol}: no rows survive feature and label alignment")
 
-    x = frame[features_mod.FEATURE_NAMES].to_numpy(dtype=np.float32)
-    y = frame["label"].to_numpy(dtype=np.int64)
-    returns = frame["forward_return"].to_numpy(dtype=np.float32)
-    dates = pd.DatetimeIndex(frame.index)
+    x = joined[list(feature_names)].to_numpy(dtype=np.float32)
+    y = joined["label"].to_numpy(dtype=np.int64)
+    returns = joined["graded"].to_numpy(dtype=np.float32)
+    dates = pd.DatetimeIndex(joined.index)
 
-    if cut_date is not None:
-        cut = int((dates < cut_date).sum())
-    else:
-        cut = int(len(frame) * (1.0 - test_fraction))
+    cut = int((dates < cut_date).sum())
 
-    if cut < 1 or cut >= len(frame):
+    # The purge. A row this close to the cut is labelled with a return that
+    # realises on the far side of it.
+    train_end = cut - max(embargo, 0)
+
+    if train_end < 1 or cut >= len(joined):
         raise ValueError(
-            f"{symbol}: {len(frame)} rows leave nothing on one side of the split "
-            f"(cut at {cut})")
+            f"{symbol}: {len(joined)} rows leave nothing on one side of "
+            f"{pd.Timestamp(cut_date).date()} (train ends at {train_end})")
 
     return Split(
         symbol=symbol,
-        x_train=x[:cut], y_train=y[:cut],
+        x_train=x[:train_end], y_train=y[:train_end],
         x_test=x[cut:], y_test=y[cut:],
-        train_dates=dates[:cut], test_dates=dates[cut:],
+        train_dates=dates[:train_end], test_dates=dates[cut:],
         forward_returns_test=returns[cut:],
     )
 
 
-def combine(splits: Sequence[Split]) -> tuple[np.ndarray, np.ndarray, Scaler]:
+@dataclasses.dataclass
+class Prepared:
+    """Everything assembled and labelled, before any date has been chosen.
+
+    Separated from splitting so that walk-forward validation can cut the same
+    assembled panel at a dozen dates without rebuilding features a dozen times.
+    """
+
+    assembled: dict
+    label_frame: pd.DataFrame
+    graded_frame: pd.DataFrame
+    feature_names: list
+    report: dict
+    spec: Spec
+
+
+def prepare(frames: dict, spec: Spec | None = None, *,
+            refresh: bool = False) -> Prepared:
+    """Features and labels for the whole panel, not yet split."""
+    spec = spec or Spec()
+    if not frames:
+        raise ValueError("no price data to build from")
+
+    assembled, feature_names, report = assemble(frames, spec, refresh=refresh)
+
+    label_frame, graded_frame = labels_mod.build_panel_labels(
+        {s: frames[s] for s in assembled},
+        horizon=spec.horizon, target=spec.target,
+        threshold=spec.threshold, neutral_band=spec.neutral_band)
+
+    report["requested"] = sorted(frames)
+    return Prepared(assembled=assembled, label_frame=label_frame,
+                    graded_frame=graded_frame, feature_names=feature_names,
+                    report=report, spec=spec)
+
+
+def split_at(prepared: Prepared, cut_date: pd.Timestamp) -> tuple[list, dict]:
+    """Cut an assembled panel at one date. The only place a split is made."""
+    spec = prepared.spec
+    assembled = prepared.assembled
+    label_frame = prepared.label_frame
+    graded_frame = prepared.graded_frame
+    feature_names = prepared.feature_names
+    report = dict(prepared.report)
+    frames = assembled
+    cut_date = pd.Timestamp(cut_date)
+
+    splits, excluded = [], {}
+    for symbol in sorted(assembled):
+        if symbol not in label_frame.columns:
+            excluded[symbol] = "no labels"
+            continue
+        try:
+            splits.append(build_one(
+                symbol, assembled[symbol], label_frame[symbol],
+                graded_frame[symbol], cut_date=cut_date,
+                feature_names=feature_names, embargo=spec.embargo))
+        except ValueError as exc:
+            # Left out rather than split somewhere else, which would put it back
+            # in the overlap the single cut date exists to prevent. Named, so
+            # that a watchlist of ten training as nine is a line in the run
+            # rather than something nobody notices for a month.
+            excluded[symbol] = str(exc)
+
+    if not splits:
+        raise ValueError(f"no symbol has data on both sides of {cut_date.date()}")
+
+    dropped = sorted(set(report.get("requested", frames)) - {s.symbol for s in splits})
+    for symbol in dropped:
+        excluded.setdefault(symbol, "no usable features")
+
+    if excluded:
+        logger.warning("Excluded from the panel: %s", sorted(excluded))
+
+    report["excluded"] = excluded
+    report["included"] = [s.symbol for s in splits]
+
+    return splits, report
+
+
+def build_panel(frames: dict, spec: Spec | None = None, *,
+                cut_date: pd.Timestamp | None = None,
+                refresh: bool = False) -> tuple[list[Split], pd.Timestamp, dict]:
+    """Every symbol, split at one date, with everything that happened recorded.
+
+    Pass `cut_date` to reproduce an existing split exactly; leave it out to
+    choose one. Scoring a trained model must always pass the one its run
+    recorded -- see the module docstring for what re-deriving it costs.
+    """
+    prepared = prepare(frames, spec, refresh=refresh)
+
+    if cut_date is None:
+        cut_date = choose_cut_date(prepared.assembled, prepared.label_frame,
+                                   test_fraction=prepared.spec.test_fraction)
+    cut_date = pd.Timestamp(cut_date)
+
+    splits, report = split_at(prepared, cut_date)
+    return splits, cut_date, report
+
+
+# --- pooling ---------------------------------------------------------------
+
+def combine(splits: Sequence[Split],
+            feature_names: Sequence[str] | None = None
+            ) -> tuple[np.ndarray, np.ndarray, Scaler]:
     """Pool several symbols into one training set, scaled on train rows only.
 
     Pooling is deliberate. One symbol gives a few thousand rows, which is not
@@ -179,9 +455,6 @@ def combine(splits: Sequence[Split]) -> tuple[np.ndarray, np.ndarray, Scaler]:
     # of Apple followed by all of SAP means "hold back the last 20%" holds back
     # the tail of the last company rather than the most recent period, which is
     # not the question anybody meant to ask.
-    #
-    # Measured: declaring time order on symbol-stacked rows gave a holdout score
-    # of 54.9%, no better than the random slice it replaced.
     x_parts = np.concatenate([s.x_train for s in splits])
     y_parts = np.concatenate([s.y_train for s in splits])
     dates = np.concatenate([s.train_dates.values for s in splits])
@@ -194,10 +467,29 @@ def combine(splits: Sequence[Split]) -> tuple[np.ndarray, np.ndarray, Scaler]:
     scaler = Scaler(
         mean=x_train.mean(axis=0),
         std=x_train.std(axis=0),
-        feature_names=list(features_mod.FEATURE_NAMES),
+        feature_names=list(feature_names or features_mod.FEATURE_NAMES),
     )
 
     return scaler.apply(x_train).astype(np.float32), y_train, scaler
+
+
+def test_matrix(splits: Sequence[Split], scaler: Scaler
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """The pooled test set, scaled, in date order, with its dates.
+
+    Date order rather than symbol order, because everything that reads this --
+    turnover, drawdown, any statistic that treats consecutive rows as consecutive
+    -- is wrong on rows stacked by symbol.
+    """
+    x = np.concatenate([s.x_test for s in splits])
+    y = np.concatenate([s.y_test for s in splits])
+    returns = np.concatenate([s.forward_returns_test for s in splits])
+    dates = np.concatenate([s.test_dates.values for s in splits])
+    symbols = np.concatenate([np.full(len(s.y_test), s.symbol) for s in splits])
+
+    order = np.argsort(dates, kind="stable")
+    return (scaler.apply(x[order]).astype(np.float32), y[order],
+            returns[order], dates[order]), symbols[order]
 
 
 def pack_for_helloworld(x: np.ndarray, y: np.ndarray) -> bytes:
@@ -217,13 +509,15 @@ def pack_for_helloworld(x: np.ndarray, y: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
-def describe(splits: Sequence[Split], scaler: Scaler) -> dict:
+def describe(splits: Sequence[Split], scaler: Scaler, spec: Spec,
+             report: dict, cut_date: pd.Timestamp) -> dict:
     """Everything the UI needs to say what this dataset is.
 
     Written out rather than summarised into a single "quality" number, because
     the things that make a dataset misleading -- one class dominating, a test
-    period that is all one market regime, too few rows -- are all visible in the
-    detail and invisible in an average.
+    period that is all one market regime, too few rows, a block that silently
+    failed to download -- are all visible in the detail and invisible in an
+    average.
     """
     y_train = np.concatenate([s.y_train for s in splits])
     y_test = np.concatenate([s.y_test for s in splits])
@@ -242,8 +536,13 @@ def describe(splits: Sequence[Split], scaler: Scaler) -> dict:
         }
 
     return {
+        "spec": spec.to_dict(),
+        "cut_date": pd.Timestamp(cut_date).date().isoformat(),
         "symbols": [s.symbol for s in splits],
         "feature_names": list(scaler.feature_names),
+        "blocks": {k: report.get(k) for k in ("cross", "macro", "events", "news")},
+        "excluded": report.get("excluded", {}),
+        "requested": report.get("requested", []),
         "train": {
             **balance(y_train),
             "from": min(s.train_dates[0] for s in splits).date().isoformat(),
@@ -261,33 +560,3 @@ def describe(splits: Sequence[Split], scaler: Scaler) -> dict:
 def save_description(path: str, description: dict) -> None:
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(description, handle, indent=2)
-
-
-def build_panel(frames: dict, *, horizon: int = 1, threshold: float = 0.0,
-                test_fraction: float = 0.2) -> tuple[list[Split], pd.Timestamp]:
-    """Every symbol, split at one shared date.
-
-    The only correct way to pool: see choose_cut_date for what happens when
-    each symbol picks its own.
-    """
-    if not frames:
-        raise ValueError("no price data to build from")
-
-    cut = choose_cut_date(frames, horizon=horizon, threshold=threshold,
-                          test_fraction=test_fraction)
-
-    splits = []
-    for symbol, prices in frames.items():
-        try:
-            splits.append(build_one(symbol, prices, horizon=horizon,
-                                    threshold=threshold, cut_date=cut))
-        except ValueError:
-            # A symbol with too little history to sit on both sides of the cut
-            # is left out rather than split somewhere else, which would put it
-            # back in the overlap this function exists to prevent.
-            continue
-
-    if not splits:
-        raise ValueError(f"no symbol has data on both sides of {cut.date()}")
-
-    return splits, cut

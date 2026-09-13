@@ -5,7 +5,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Trader</title>
-    <link rel="stylesheet" href="/static/trader.css">
+    <link rel="stylesheet" href="/static/trader.css?v={{ v }}">
 </head>
 
 <body>
@@ -40,9 +40,19 @@
                 — including when it is not.
             </p>
             <p class="watchlist">
-                Watching:
-                {% for symbol in watchlist %}<code>{{ symbol }}</code>{% endfor %}
+                {# A few hundred names is the point -- a macro feature needs a
+                   cross-section to mean anything, and a rank needs peers. But
+                   printing all of them turns the sentence into a wall, so the
+                   count leads and the list is available underneath it. #}
+                Watching <strong>{{ watchlist | length }}</strong> symbols
+                across US and European exchanges.
             </p>
+            <details class="watchlist-all">
+                <summary>Show the universe</summary>
+                <p class="watchlist">
+                    {% for symbol in watchlist %}<code>{{ symbol }}</code>{% endfor %}
+                </p>
+            </details>
         </section>
 
         <div id="runs" class="runs">
@@ -50,7 +60,7 @@
         </div>
     </main>
 
-    <script src="/static/trader.js"></script>
+    <script src="/static/trader.js?v={{ v }}"></script>
 </body>
 
 </html>

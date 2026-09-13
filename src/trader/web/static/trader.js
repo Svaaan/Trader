@@ -113,46 +113,82 @@ function evaluationPanel(run) {
   const panel = el("section", "panel");
   panel.appendChild(el("h3", null, "What it scored on days it never saw"));
 
+  const relative = (run.spec || {}).target === "relative";
+
   const grid = el("div", "figures");
+  // Rows and days are different numbers. Labelling 4,514 symbol-days as
+  // "4,514 days" overstated the sample by an order of magnitude in the one
+  // place a reader is deciding how much to believe.
   grid.appendChild(figure("Accuracy", percent(evaluation.accuracy),
-    `${evaluation.rows.toLocaleString()} days`));
+    evaluation.days
+      ? `${evaluation.days.toLocaleString()} days, `
+        + `${(evaluation.rows || 0).toLocaleString()} rows`
+      : `${(evaluation.rows || 0).toLocaleString()} rows`));
   grid.appendChild(figure("Baseline", percent(evaluation.baseline_accuracy),
-    "always the commoner direction"));
+    evaluation.baseline_source || "the commoner direction"));
   grid.appendChild(figure("Edge", signed(evaluation.edge),
     "accuracy minus baseline"));
   grid.appendChild(figure("Says “up”", percent(evaluation.up_rate),
     "a stuck model sits near 0 or 100"));
   grid.appendChild(figure("Strategy", signed(evaluation.strategy_annualised),
-    `annualised, after ${percent(evaluation.cost_per_trade, 2)} a trade`));
-  grid.appendChild(figure("Just holding", signed(evaluation.hold_annualised),
-    "same days, no trading"));
+    `annualised, ${percent(evaluation.cost_per_trade, 2)} per unit traded`));
+  // A relative model is graded on market-relative returns, so an equal-weight
+  // long book earns zero by construction. Calling that "just holding" invites
+  // reading a structural zero as a result.
+  grid.appendChild(relative
+    ? figure("Turnover", (evaluation.turnover_daily || 0).toFixed(2),
+      "of the book, per day")
+    : figure("Just holding", signed(evaluation.hold_annualised),
+      "same days, no trading"));
   panel.appendChild(grid);
+
+  // The uncertainty that used to be missing entirely. The gate refuses to
+  // speak about accuracy without a standard error; these are the same
+  // discipline applied to the number somebody would actually act on.
+  const risk = el("div", "figures");
+  risk.appendChild(figure("Sharpe", (evaluation.strategy_sharpe ?? 0).toFixed(2),
+    "return per unit of risk"));
+  risk.appendChild(figure("t", (evaluation.strategy_tstat ?? 0).toFixed(2),
+    "under 2 is not distinguishable from luck"));
+  risk.appendChild(figure("Worst drawdown", percent(evaluation.strategy_max_drawdown),
+    "peak to trough"));
+  risk.appendChild(figure("Cost drag", percent(evaluation.cost_drag_annualised),
+    `${(evaluation.position_changes || 0).toLocaleString()} position changes`));
+  panel.appendChild(risk);
 
   if (evaluation.verdict !== undefined || run.verdict) {
     panel.appendChild(el("p", "verdict", run.verdict));
   }
 
-  const buckets = (evaluation.by_confidence || []).filter((b) => b.days > 0);
+  const buckets = (evaluation.by_confidence || []).filter((b) => b.rows > 0);
   if (buckets.length) {
     panel.appendChild(el("h4", null, "By how sure it was"));
     const table = el("table", "table");
     const head = el("tr");
-    ["Confidence", "Days", "Accuracy", "Mean return"].forEach((h) =>
+    ["Confidence", "Rows", "Accuracy", "Range", "Mean net return"].forEach((h) =>
       head.appendChild(el("th", null, h)));
     table.appendChild(head);
 
     buckets.forEach((bucket) => {
       const row = el("tr");
       row.appendChild(el("td", null, `${bucket.from}–${bucket.to}`));
-      row.appendChild(el("td", null, bucket.days.toLocaleString()));
-      row.appendChild(el("td", null, percent(bucket.accuracy)));
-      row.appendChild(el("td", null, signed(bucket.mean_return, 3)));
+      row.appendChild(el("td", null, bucket.rows.toLocaleString()));
+      // Withheld below the minimum sample. "100% accurate on its five most
+      // confident days" was the most misleading line this page ever printed.
+      row.appendChild(el("td", null,
+        bucket.enough ? percent(bucket.accuracy) : "too few"));
+      const [low, high] = bucket.accuracy_interval || [null, null];
+      row.appendChild(el("td", null,
+        low === null ? "—" : `${percent(low)} – ${percent(high)}`));
+      row.appendChild(el("td", null, signed(bucket.mean_net_return, 3)));
       table.appendChild(row);
     });
     panel.appendChild(table);
     panel.appendChild(el("p", "note",
       "A model worth anything is better on the days it commits. Flat across "
-      + "these rows means the confidence number carries no information."));
+      + "these rows means the confidence number carries no information. "
+      + "Accuracy is withheld on buckets too small to mean anything, and the "
+      + "range beside it is how wide the honest interval actually is."));
   }
 
   return panel;

@@ -426,3 +426,208 @@ main {
 }
 
 .call-reasons li { margin-bottom: 0.2rem; }
+
+/* --- the gate's working ---------------------------------------------------
+
+   Every hurdle the model was put through, passed or failed. A gate that says
+   no without saying which question it failed teaches nobody anything, so the
+   list is always rendered and never collapsed. */
+
+.checks {
+  list-style: none;
+  margin: 18px 0 0;
+  padding: 0;
+  border-top: 1px solid var(--border);
+}
+
+.checks li {
+  display: grid;
+  grid-template-columns: 20px 200px 1fr;
+  gap: 10px;
+  align-items: baseline;
+  padding: 9px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.check-mark { font-weight: 700; }
+.checks li.is-ok .check-mark { color: var(--up); }
+.checks li.is-bad .check-mark { color: var(--down); }
+.check-name { color: var(--text); }
+.check-detail { color: var(--text-muted); }
+
+@media (max-width: 700px) {
+  .checks li { grid-template-columns: 20px 1fr; }
+  .check-detail { grid-column: 2; }
+}
+
+/* --- comparison tables ----------------------------------------------------
+
+   Used for the controls and the walk-forward. The trained model is the last
+   row of the controls table on purpose: it is read after the things it had to
+   beat, not above them. */
+
+.compare {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 14px;
+  font-size: 13px;
+}
+
+.compare th {
+  text-align: right;
+  padding: 8px 10px;
+  color: var(--text-faint);
+  font-weight: 500;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border-bottom: 1px solid var(--border-strong);
+}
+
+.compare th:first-child,
+.compare td:first-child { text-align: left; }
+
+.compare td {
+  text-align: right;
+  padding: 9px 10px;
+  border-bottom: 1px solid var(--border);
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.compare td:first-child { font-family: inherit; color: var(--text-muted); }
+
+.compare tr.is-subject td {
+  background: var(--surface-2);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.compare tr.is-subject td:first-child { color: var(--text); }
+.compare tr.is-ok td:first-child { color: var(--up); }
+.compare tr.is-bad td:first-child { color: var(--down); }
+
+/* --- which blocks went in -------------------------------------------------- */
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+
+.chip {
+  padding: 4px 10px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border-strong);
+  font-size: 12px;
+  font-family: var(--mono);
+  color: var(--text-muted);
+}
+
+.chip.is-ok { border-color: rgba(52, 211, 153, 0.4); color: var(--up); }
+.chip.is-off { opacity: 0.5; }
+
+.excluded {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.excluded li { margin: 4px 0; }
+
+.warn {
+  margin-top: 14px;
+  padding: 10px 12px;
+  border-left: 3px solid var(--warn);
+  background: rgba(251, 191, 36, 0.08);
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* --- the reading panel -----------------------------------------------------
+
+   Deliberately quieter than the verdict above it. Prose reads as conviction,
+   and this is background rather than evidence -- when the gate is shut it is
+   dimmed and labelled as such, so it cannot be mistaken for the call. */
+
+.context-button {
+  margin-top: 12px;
+  padding: 5px 12px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.context-button:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.context-button:disabled { opacity: 0.5; cursor: default; }
+
+.context {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+}
+
+.context.is-gated { opacity: 0.85; border-left: 3px solid var(--warn); }
+
+.context-head {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 8px;
+}
+
+.context.is-gated .context-head { color: var(--warn); }
+
+.context-text { margin: 0 0 10px; font-size: 13px; color: var(--text); }
+
+.sources {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.sources li { margin: 5px 0; }
+.sources a { color: var(--accent); text-decoration: none; }
+.sources a:hover { text-decoration: underline; }
+
+.source-meta { color: var(--text-faint); font-size: 11px; }
+
+/* --- the universe ---------------------------------------------------------
+
+   A few hundred names is deliberate: a macro feature needs a cross-section to
+   mean anything and a rank needs peers. Printing all of them at once turns the
+   opening paragraph into a wall, so the count leads and the list folds away. */
+
+.watchlist-all {
+  margin: -4px 0 8px;
+  font-size: 13px;
+}
+
+.watchlist-all summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  padding: 4px 0;
+}
+
+.watchlist-all summary:hover { color: var(--accent); }
+
+.watchlist-all[open] summary { margin-bottom: 8px; }
+
+.watchlist-all .watchlist {
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface);
+}

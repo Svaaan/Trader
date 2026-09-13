@@ -10,6 +10,17 @@ So these test the property rather than the implementation. Compute the features
 on a truncated history and again on the full one; every date they have in common
 must be identical. A feature that can see the future changes when the future
 arrives, and that is detectable without knowing how it cheats.
+
+There are now four kinds of input rather than one, and three of them can leak in
+ways the per-symbol block cannot:
+
+  * cross-sectional ranks can read a symbol's peers, and in a panel spanning
+    New York and Zurich "the same day" is not the same instant
+  * macro series close after the European equity session they would be attached
+    to, so an unlagged macro block hands European names their own future
+  * event features can read a schedule that had not been announced yet
+
+Each gets its own property test below.
 """
 
 import os
@@ -21,33 +32,14 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from trader import dataset, features, labels     # noqa: E402
-
-
-def synthetic_prices(days=400, seed=7):
-    """A price series with trend, noise and volume, deterministic per seed."""
-    rng = np.random.default_rng(seed)
-    dates = pd.bdate_range("2020-01-01", periods=days, name="date")
-
-    steps = rng.normal(0.0004, 0.015, size=days)
-    close = 100.0 * np.exp(np.cumsum(steps))
-    spread = np.abs(rng.normal(0.008, 0.004, size=days)) * close
-
-    return pd.DataFrame({
-        "open": close - rng.normal(0, 0.003, days) * close,
-        "high": close + spread,
-        "low": close - spread,
-        "close": close,
-        "volume": rng.integers(1_000_000, 9_000_000, days).astype(float),
-    }, index=dates)
+from conftest import synthetic_panel, synthetic_prices        # noqa: E402
+from trader import cross, dataset, events, features, labels, macro   # noqa: E402
 
 
 # --- the property itself ---------------------------------------------------
 
-@pytest.mark.parametrize("cut", [120, 200, 310])
-def test_a_feature_does_not_change_when_more_history_arrives(cut):
-    prices = synthetic_prices()
-
+@pytest.mark.parametrize("cut", [600, 900, 1200])
+def test_a_feature_does_not_change_when_more_history_arrives(cut, prices):
     full = features.build(prices)
     truncated = features.build(prices.iloc[:cut])
 
@@ -64,206 +56,313 @@ def test_a_feature_does_not_change_when_more_history_arrives(cut):
             f"days arrived -- it is reading forward")
 
 
-def test_the_label_does_look_forward():
-    """The other half: a label that cannot see the future predicts nothing.
+def test_a_centred_window_is_caught(prices):
+    """The test has to be able to fail, so here is a leak on purpose.
 
-    Stated as a test because the pair is what matters. If someone ever 'fixes'
-    a look-ahead warning by removing the shift here, the model would be trained
-    to predict the day it was shown, and the accuracy would be superb.
+    A centred rolling mean is the classic accidental version -- it looks like
+    every other rolling call and reads half its window from the future. If this
+    test ever stops failing, the property test above has stopped testing.
     """
-    prices = synthetic_prices(days=60)
-    y = labels.direction(prices, horizon=1)
+    def leaky(frame):
+        out = features.build(frame)
+        out["return_1d"] = frame["close"].rolling(5, center=True).mean().reindex(
+            out.index)
+        return out
 
-    rose = prices["close"].shift(-1) > prices["close"]
-    both = y.notna()
+    full = leaky(prices)
+    truncated = leaky(prices.iloc[:900])
+    shared = truncated.index.intersection(full.index)
 
-    assert (y[both] == rose[both].astype(float)).all(), (
-        "the label is not describing the next session's move")
+    same = np.allclose(truncated.loc[shared, "return_1d"].to_numpy(),
+                       full.loc[shared, "return_1d"].to_numpy(),
+                       rtol=0, atol=1e-12, equal_nan=True)
+    assert not same, "a centred window should have been detected as look-ahead"
 
-    assert y.isna().sum() == 1, (
-        "the final row should have no label: its future has not happened")
+
+def test_the_rsi_warmup_is_blank_not_maximal(prices):
+    """A warm-up filled with 100 means "nothing but gains", which is a lie.
+
+    This was a real bug, hidden because the 50-day average dropped those rows
+    anyway. It is tested directly so that shortening the window set cannot
+    quietly reintroduce fourteen days of fictional maximum strength.
+    """
+    rsi = features._rsi(prices["close"], 14)
+    assert rsi.head(14).isna().all(), "RSI produced values before it had data"
+    assert rsi.dropna().between(0.0, 100.0).all()
 
 
-def test_the_last_row_has_features_but_no_label():
-    """Which is exactly the row a live signal is produced for."""
-    prices = synthetic_prices(days=200)
+# --- labels ----------------------------------------------------------------
 
+def test_the_label_does_look_forward(prices):
+    """The other half: a label that cannot see the future predicts nothing."""
+    label = labels.direction(prices, horizon=1)
+    close = prices["close"]
+
+    rose = (close.shift(-1) > close).astype(float)
+    aligned = label.dropna()
+    assert (aligned == rose.reindex(aligned.index)).all()
+
+
+def test_the_last_row_has_features_but_no_label(prices):
+    """Today is exactly the situation prediction exists for."""
     x = features.build(prices)
     y = labels.direction(prices, horizon=1)
 
-    last = x.index[-1]
-    assert last in x.index
-    assert pd.isna(y.loc[last]), (
-        "the most recent day should be predictable but not yet gradeable")
+    assert not x.empty
+    assert np.isnan(y.iloc[-1]), "the last row cannot have a known future"
+    assert x.index[-1] in prices.index
 
 
-# --- splitting time --------------------------------------------------------
+def test_a_relative_label_is_balanced_on_every_date(panel):
+    """The whole point of the relative target: no constant can beat it."""
+    forward = labels.forward_return_panel(panel, horizon=1)
+    relative = labels.relative_direction(forward)
 
-def test_the_split_is_chronological():
-    prices = synthetic_prices(days=500)
-    split = dataset.build_one("TEST", prices, test_fraction=0.2)
+    per_date = relative.dropna(how="all")
+    shares = per_date.mean(axis=1).dropna()
 
-    assert split.train_dates[-1] < split.test_dates[0], (
-        "training data runs past the start of the test period; a random split "
-        "of a price series lets the model memorise both sides of a gap")
-
-    assert len(split.y_test) > 0 and len(split.y_train) > len(split.y_test)
-
-
-def test_the_scaler_never_sees_the_test_period():
-    """Standardising on the whole series leaks the future's distribution."""
-    prices = synthetic_prices(days=500)
-    split = dataset.build_one("TEST", prices, test_fraction=0.2)
-
-    _, _, scaler = dataset.combine([split])
-
-    expected = split.x_train.mean(axis=0)
-    assert np.allclose(scaler.mean, expected, atol=1e-6), (
-        "the scaler's mean does not match the training rows alone")
-
-    everything = np.concatenate([split.x_train, split.x_test]).mean(axis=0)
-    if not np.allclose(expected, everything, atol=1e-9):
-        assert not np.allclose(scaler.mean, everything, atol=1e-9), (
-            "the scaler was fitted on train and test together")
+    # Six symbols ranked per date: the top half is three of them, every time.
+    assert shares.between(0.4, 0.6).all(), (
+        "a relative label that is not balanced per date reintroduces the "
+        "baseline problem it exists to remove")
 
 
-def test_a_constant_feature_does_not_become_infinity():
-    """std of 0 divides to inf, and a column of inf trains nothing."""
-    scaler = dataset.Scaler(
-        mean=np.array([0.0, 5.0], dtype=np.float32),
-        std=np.array([1.0, 0.0], dtype=np.float32),
-        feature_names=["moves", "constant"],
-    )
-    out = scaler.apply(np.array([[1.0, 5.0], [2.0, 5.0]], dtype=np.float32))
-
-    assert np.isfinite(out).all(), "a constant column produced a non-finite value"
+def test_a_relative_label_pairs_with_relative_returns(panel):
+    """A relative model graded on absolute returns is credited with drift."""
+    _, graded = labels.build_panel_labels(panel, target=labels.RELATIVE)
+    # Market-relative returns sum to zero across the panel on every date.
+    assert np.allclose(graded.sum(axis=1).dropna().to_numpy(), 0.0, atol=1e-12)
 
 
-# --- what gets sent --------------------------------------------------------
+# --- the blocks that can leak across symbols and timezones -----------------
 
-def test_the_packed_dataset_is_loadable_without_unpickling():
-    """HelloWorldAi refuses anything it would have to unpickle, and is right to."""
-    prices = synthetic_prices(days=400)
-    split = dataset.build_one("TEST", prices)
-    x, y, _ = dataset.combine([split])
+def test_the_cross_sectional_block_is_lagged(panel):
+    """A rank built from today's peers is today's future for a European name."""
+    own = {symbol: features.build(prices) for symbol, prices in panel.items()}
+    ranked = cross.build(own)
 
-    blob = dataset.pack_for_helloworld(x, y)
+    symbol = sorted(own)[0]
+    block = ranked[symbol]
+    assert not block.empty
 
-    import io
-    loaded = np.load(io.BytesIO(blob), allow_pickle=False)
-    assert set(loaded.files) == {"x", "y"}
-    assert loaded["x"].shape[0] == loaded["y"].shape[0]
-    assert loaded["x"].dtype == np.float32
-    assert loaded["y"].dtype == np.int64
+    # The first LAG_SESSIONS rows have nothing to carry forward from.
+    assert block.iloc[:cross.LAG_SESSIONS].isna().all().all()
 
-
-def test_it_refuses_to_send_nothing():
-    empty_x = np.zeros((0, len(features.FEATURE_NAMES)), dtype=np.float32)
-    empty_y = np.zeros((0,), dtype=np.int64)
-
-    with pytest.raises(ValueError):
-        dataset.pack_for_helloworld(empty_x, empty_y)
+    # And the value on any date must equal the unlagged value one row earlier.
+    unlagged = (pd.DataFrame({s: own[s]["return_1d"] for s in sorted(own)})
+                .rank(axis=1, pct=True) - 0.5)[symbol]
+    shared = block.dropna().index[:50]
+    for date in shared:
+        position = unlagged.index.get_loc(date)
+        assert np.isclose(block.loc[date, "rank_return_1d"],
+                          unlagged.iloc[position - cross.LAG_SESSIONS])
 
 
-def test_the_description_reports_the_baseline():
-    """Accuracy without the class balance beside it says nothing.
-
-    A model that always answers "up" scores the up-share exactly. Any headline
-    number has to be read against it, so the UI is given it rather than left to
-    work it out.
-    """
-    prices = synthetic_prices(days=500)
-    split = dataset.build_one("TEST", prices)
-    _, _, scaler = dataset.combine([split])
-
-    described = dataset.describe([split], scaler)
-
-    assert described["test"]["up_share"] is not None
-    assert 0.0 <= described["test"]["up_share"] <= 1.0
-    assert described["train"]["to"] < described["test"]["from"]
+def test_a_narrow_panel_gets_no_cross_sectional_block():
+    """A percentile over three names is an opinion about three numbers."""
+    own = {s: features.build(p)
+           for s, p in synthetic_panel(symbols=("AAA", "BBB")).items()}
+    assert not cross.usable(own)
+    assert all(frame.empty or not len(frame.columns)
+               for frame in cross.build(own).values())
 
 
-# --- pooling several symbols ----------------------------------------------
+def test_the_macro_block_is_lagged(monkeypatch):
+    """Macro closes after the European session it would be attached to."""
+    dates = pd.bdate_range("2020-01-01", periods=600, name="date")
+    rng = np.random.default_rng(3)
+    fake = pd.DataFrame(
+        {name: 20.0 + np.cumsum(rng.normal(0, 0.2, len(dates)))
+         for name in macro.SERIES},
+        index=dates)
 
-def test_the_whole_panel_is_split_at_one_date():
-    """Per-symbol splits are not chronological across a pool.
+    monkeypatch.setattr(macro, "_closes", lambda **kwargs: fake)
+    block = macro.build()
 
-    Symbols have different amounts of history, so an 80% cut lands on a
-    different date for each one. On the first real panel built here that gave a
-    training window running to 2026-04-21 and a test window starting
-    2024-09-09: twenty months in which the model trained on one company and was
-    graded on another over the same days. These markets move together, so that
-    is a random split with extra steps.
-    """
-    # A newer listing: starts later, runs to the same day as the older one.
-    # Two series that merely differ in length both ending at different dates is
-    # not the case that matters -- the overlap only exists when they are trading
-    # over the same period, which is the normal state of a watchlist.
-    long_history = synthetic_prices(days=900, seed=1)
-    frames = {
-        "LONG": long_history,
-        "SHORT": synthetic_prices(days=900, seed=2).iloc[-400:],
-    }
-    splits, cut = dataset.build_panel(frames, test_fraction=0.2)
+    # vix_log on date t must be the log of the VIX close on t - LAG_SESSIONS.
+    expected = np.log(fake["vix"].clip(lower=1e-6)).shift(macro.LAG_SESSIONS)
+    shared = block.index[:100]
+    assert np.allclose(block.loc[shared, "vix_log"].to_numpy(),
+                       expected.reindex(shared).to_numpy(), atol=1e-12)
 
-    assert len(splits) == 2, "a symbol was dropped that had data on both sides"
 
-    latest_train = max(s.train_dates[-1] for s in splits)
-    earliest_test = min(s.test_dates[0] for s in splits)
+def test_event_features_do_not_read_an_unannounced_schedule(monkeypatch):
+    """Nobody knew in January that the report would be in June."""
+    import datetime as dt
 
-    assert latest_train < earliest_test, (
-        f"training runs to {latest_train.date()} while testing starts "
-        f"{earliest_test.date()} -- the windows overlap across symbols")
+    reports = [dt.date(2020, 2, 5), dt.date(2020, 5, 6), dt.date(2020, 8, 5)]
+    monkeypatch.setattr(events, "earnings_dates",
+                        lambda symbol, refresh=False: reports * 3)
+
+    index = pd.bdate_range("2020-01-02", periods=120, name="date")
+    block = events.build("AAA", index)
+
+    # Ninety days out, the countdown must read "far" rather than 90.
+    far = block.loc[block.index < pd.Timestamp("2020-01-06"), "days_to_earnings"]
+    assert (far == 1.0).all(), (
+        "the countdown revealed a date that had not been announced yet")
+
+    # And it must be strictly decreasing as the announced date approaches.
+    approach = block.loc["2020-01-20":"2020-02-04", "days_to_earnings"]
+    assert approach.is_monotonic_decreasing
+
+
+def test_a_symbol_with_no_calendar_gets_neutral_values_not_invented_ones(monkeypatch):
+    monkeypatch.setattr(events, "earnings_dates", lambda symbol, refresh=False: [])
+    index = pd.bdate_range("2020-01-02", periods=40, name="date")
+    block = events.build("AAA", index)
+
+    assert (block["days_to_earnings"] == 1.0).all()
+    assert (block["in_earnings_drift"] == 0.0).all()
+    assert not block.isna().any().any()
+
+
+# --- the split -------------------------------------------------------------
+
+def test_the_split_is_chronological(panel, offline_spec):
+    splits, cut, _ = dataset.build_panel(panel, offline_spec)
 
     for split in splits:
-        assert split.train_dates[-1] < cut <= split.test_dates[0]
+        assert split.train_dates.max() < cut <= split.test_dates.min()
+        assert split.train_dates.is_monotonic_increasing
+        assert split.test_dates.is_monotonic_increasing
 
 
-def test_a_symbol_with_too_little_history_is_left_out_not_mis_split():
-    """Better absent than quietly put back into the overlap."""
-    frames = {
-        "LONG": synthetic_prices(days=900, seed=1),
-        # Too new to have any training rows at all: it begins after the cut.
-        "NEWCOMER": synthetic_prices(days=900, seed=3).iloc[-60:],
-    }
-    splits, cut = dataset.build_panel(frames, test_fraction=0.2)
+def test_the_whole_panel_is_split_at_one_date(panel, offline_spec):
+    """Per-symbol splits look chronological and are not, across the pool."""
+    splits, cut, _ = dataset.build_panel(panel, offline_spec)
+
+    latest_train = max(s.train_dates.max() for s in splits)
+    earliest_test = min(s.test_dates.min() for s in splits)
+    assert latest_train < earliest_test, (
+        "one symbol trains on days another is graded on")
+
+
+def test_no_training_label_reaches_past_the_cut(panel):
+    """The purge. At horizon 20 this is twenty rows of direct leakage."""
+    spec = dataset.Spec(use_macro=False, use_events=False, horizon=20)
+    splits, cut, _ = dataset.build_panel(panel, spec)
+
+    for split in splits:
+        realises = split.train_dates.max() + pd.Timedelta(days=0)
+        # The last training row's label looks `horizon` sessions ahead; the
+        # embargo has to have removed anything that lands on or after the cut.
+        position = split.train_dates.shape[0]
+        assert position > 0
+        assert realises < cut
+        # Explicitly: the gap between the last train date and the cut must
+        # cover the horizon in sessions.
+        gap = len(pd.bdate_range(split.train_dates.max(), cut)) - 1
+        assert gap >= spec.embargo, (
+            f"{split.symbol} has only {gap} sessions of embargo for a "
+            f"{spec.horizon}-session horizon")
+
+
+def test_the_cut_date_can_be_pinned(panel, offline_spec):
+    """The regression test for a seven-week silent drift.
+
+    Re-deriving the split at scoring time moved it from 2024-11-06 to
+    2024-12-31, graded 87 rows the run never advertised, and added a symbol to
+    the test set that had been absent from training. Passing the stored date
+    back has to reproduce the split exactly.
+    """
+    first, cut, _ = dataset.build_panel(panel, offline_spec)
+
+    # A different test_fraction would choose a different date -- unless it is
+    # given one, which is the whole point.
+    other = dataset.Spec(use_macro=False, use_events=False, test_fraction=0.35)
+    second, again, _ = dataset.build_panel(panel, other, cut_date=cut)
+
+    assert again == cut
+    assert [s.symbol for s in first] == [s.symbol for s in second]
+    for a, b in zip(first, second):
+        assert len(a.y_test) == len(b.y_test)
+        assert a.test_dates.equals(b.test_dates)
+
+
+def test_a_symbol_with_too_little_history_is_named_not_silently_dropped(offline_spec):
+    """Better absent than quietly put back into the overlap -- but say so.
+
+    A watchlist of ten that trains as nine used to be invisible. The symbol is
+    still excluded, because splitting it elsewhere would recreate the overlap
+    the single cut date exists to prevent, but the exclusion is now recorded.
+    """
+    frames = synthetic_panel()
+    frames["NEWCOMER"] = synthetic_prices(days=1400).iloc[-60:]
+
+    splits, cut, report = dataset.build_panel(frames, offline_spec)
 
     kept = {s.symbol for s in splits}
-    assert "LONG" in kept
-    # NEWCOMER starts after the cut, so it has no training rows at all.
+    assert "NEWCOMER" not in kept
+    assert "NEWCOMER" in report["excluded"], (
+        "a symbol vanished from the panel without being reported")
     for split in splits:
         assert len(split.y_train) > 0 and len(split.y_test) > 0
 
 
-def test_pooled_rows_leave_in_date_order():
-    """Because the coordinator is told they are.
+def test_the_scaler_never_sees_the_test_period(panel, offline_spec):
+    splits, _, report = dataset.build_panel(panel, offline_spec)
+    _, _, scaler = dataset.combine(splits, report["feature_names"])
 
-    HelloWorldAi holds back the newest rows when a submitter declares time
-    order. Stacked by symbol, "the newest rows" is the tail of whichever
-    company happened to be last, and the declaration is false: measured, that
-    gave a holdout score of 54.9%, identical to the random slice it replaced.
-    """
-    frames = {
-        "A": synthetic_prices(days=600, seed=11),
-        "B": synthetic_prices(days=600, seed=12),
-    }
-    splits, _ = dataset.build_panel(frames, test_fraction=0.2)
-    assert len(splits) == 2
+    train_only = np.concatenate([s.x_train for s in splits])
+    assert np.allclose(scaler.mean, train_only.mean(axis=0), atol=1e-5)
+    assert np.allclose(scaler.std, train_only.std(axis=0), atol=1e-5)
 
-    # Rebuild the ordering the same way combine does, and check it is sorted.
+
+def test_pooled_rows_leave_in_date_order(panel, offline_spec):
+    """The coordinator holds back the last 20%; it has to be the last 20%."""
+    splits, _, report = dataset.build_panel(panel, offline_spec)
+
     dates = np.concatenate([s.train_dates.values for s in splits])
     order = np.argsort(dates, kind="stable")
-    sorted_dates = dates[order]
+    assert (dates[order] == np.sort(dates)).all()
 
-    assert list(sorted_dates) == sorted(sorted_dates), "the sort is not a sort"
 
-    # And that combine actually applies it: the two symbols must interleave,
-    # not sit one after the other.
-    x, y, _ = dataset.combine(splits)
-    assert len(x) == len(dates)
+def test_the_test_matrix_is_in_date_order(panel, offline_spec):
+    """Turnover and drawdown treat consecutive rows as consecutive."""
+    splits, _, report = dataset.build_panel(panel, offline_spec)
+    _, _, scaler = dataset.combine(splits, report["feature_names"])
+    (_, _, _, dates), _ = dataset.test_matrix(splits, scaler)
 
-    # A stacked array would have every row of A before every row of B. After
-    # sorting by date the halves must overlap, since both cover the same span.
-    half = len(sorted_dates) // 2
-    assert sorted_dates[half] > sorted_dates[0], "dates did not advance"
-    assert sorted_dates[-1] >= sorted_dates[half], "dates are not monotonic"
+    assert (np.diff(dates.astype("datetime64[ns]").astype(np.int64)) >= 0).all()
+
+
+# --- packing ---------------------------------------------------------------
+
+def test_a_constant_feature_does_not_become_infinity():
+    scaler = dataset.Scaler(mean=np.array([1.0, 0.0], dtype=np.float32),
+                            std=np.array([0.0, 1.0], dtype=np.float32),
+                            feature_names=["flat", "moving"])
+    out = scaler.apply(np.array([[1.0, 2.0], [1.0, 3.0]], dtype=np.float32))
+    assert np.isfinite(out).all()
+
+
+def test_the_packed_dataset_is_loadable_without_unpickling(panel, offline_spec):
+    import io
+
+    splits, _, report = dataset.build_panel(panel, offline_spec)
+    x, y, _ = dataset.combine(splits, report["feature_names"])
+    blob = dataset.pack_for_helloworld(x, y)
+
+    loaded = np.load(io.BytesIO(blob), allow_pickle=False)
+    assert loaded["x"].shape[0] == loaded["y"].shape[0]
+    assert loaded["x"].dtype == np.float32
+
+
+def test_it_refuses_to_send_nothing():
+    with pytest.raises(ValueError):
+        dataset.pack_for_helloworld(np.zeros((0, 3), dtype=np.float32),
+                                    np.zeros((0,), dtype=np.int64))
+
+
+def test_the_description_reports_the_baseline_and_what_was_excluded(
+        panel, offline_spec):
+    splits, cut, report = dataset.build_panel(panel, offline_spec)
+    _, _, scaler = dataset.combine(splits, report["feature_names"])
+    described = dataset.describe(splits, scaler, offline_spec, report, cut)
+
+    assert described["train"]["up_share"] is not None
+    assert described["test"]["up_share"] is not None
+    assert "excluded" in described
+    assert described["cut_date"] == cut.date().isoformat()
+    assert described["spec"]["embargo"] == offline_spec.embargo

@@ -2,17 +2,35 @@
 
 Two separate questions, and the second one comes first.
 
-**Has this model shown any skill?** Out of time, against the baseline of always
-guessing the commoner direction, with enough days for the difference to mean
-something. Almost every model of this kind fails that, including every one this
-project has trained so far. A page that prints "Buy now" over a model with no
-measured edge is not a trading tool, it is a random number generator with
-confident typography.
+**Has this model shown any skill?** Out of time, against the class that
+dominated training, with enough evidence for the difference to mean something.
+Almost every model of this kind fails that, including every one this project has
+trained so far. A page that prints "Buy now" over a model with no measured edge
+is not a trading tool, it is a random number generator with confident typography.
 
 So the verdict is gated. If the model has not beaten the baseline by more than
 chance would produce, every symbol reads "Still collecting data" no matter what
 the probability says. That is not the page being coy -- it is the only honest
 thing it can say, and it is what "still collecting data" is for.
+
+The gate now has to clear five hurdles rather than three, and the two new ones
+came from watching the old one nearly pass things it should not have:
+
+**The sample size is the effective one.** Ten symbols on the same day are not
+ten independent verdicts. Measured on this panel the design effect is about 1.7,
+so the honest bar is a third higher than the naive one. A gate that is a third
+too permissive is exactly the kind that lets a marginal result through.
+
+**The edge has to beat the noise floor.** The same configuration trained three
+times with different seeds produced accuracies spanning 1.8 points. Any "edge"
+smaller than the spread between identical models is a statement about which seed
+came up, and nothing else. This one number would have killed several results the
+project once printed.
+
+**And it has to survive more than one window.** A single test period is a single
+draw. Walk-forward grades the same features on six consecutive stretches, and an
+edge that appears in one of them is what a coin looks like. When walk-forward
+results are available the gate requires most folds to agree.
 
 **Why this symbol, today?** By ablation: set one feature to its training average
 and see how far the answer moves. Because the scaler standardises to mean zero,
@@ -42,9 +60,29 @@ UNSURE = "unsure"
 # anything less is the model rounding.
 CALL_THRESHOLD = 0.58
 
-# Below this many graded days, an edge is not distinguishable from luck however
-# large it looks.
-MIN_DAYS = 250
+# Below this many effective observations an edge is not distinguishable from
+# luck however large it looks.
+MIN_EFFECTIVE_ROWS = 250
+
+# And below this many distinct dates, no amount of symbols helps: a wide panel
+# over three weeks is still three weeks.
+MIN_DAYS = 120
+
+# How much of the walk-forward has to agree before a single window is believed.
+MIN_FOLD_AGREEMENT = 0.7
+
+# And how far the money has to be from zero. Same two-standard-errors bar the
+# accuracy hurdles use, applied to the thing somebody would actually act on.
+#
+# This hurdle exists because the others were not enough, which was found by
+# running them. On the 238-symbol relative panel the logistic control clears
+# every accuracy test there is -- 1.08 points over the baseline on 25,520
+# independent rows, past chance, past the seed spread, positive in six of six
+# walk-forward windows -- and loses 3.2% a year. It is right more often about
+# small moves and wrong about large ones, which is a real and well-known way to
+# be accurate and broke. Without this check the page would have printed "Buy
+# now" over it.
+MIN_RETURN_TSTAT = 2.0
 
 
 @dataclasses.dataclass
@@ -56,63 +94,144 @@ class Trust:
     edge: float
     needed: float
     days: int
+    effective_rows: int
+    noise_floor: float
+    checks: list
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
 
 
-def assess(evaluation: dict) -> Trust:
+def assess(evaluation: dict, *, controls: dict | None = None,
+           walk_forward: dict | None = None) -> Trust:
     """Decide whether this model has earned an opinion.
 
-    The bar is that its accuracy beat the baseline by more than two standard
-    errors -- computed from the number of days it was graded on rather than
-    picked, because the honest threshold depends on how much evidence there is.
-    On 4,000 days that is about 1.6 percentage points; on 400 it is about five.
+    Every hurdle is recorded in `checks` whether it passed or not, so the page
+    can show what was tested rather than only the conclusion. A gate that says
+    no without saying which question it failed teaches nobody anything.
     """
-    days = int(evaluation.get("rows") or 0)
+    rows = int(evaluation.get("rows") or 0)
+    days = int(evaluation.get("days") or 0)
+    effective = int(evaluation.get("effective_rows") or rows)
     accuracy = float(evaluation.get("accuracy") or 0.0)
     baseline = float(evaluation.get("baseline_accuracy") or 0.0)
     up_rate = float(evaluation.get("up_rate") or 0.0)
     edge = accuracy - baseline
 
-    if days < MIN_DAYS:
-        return Trust(False,
-                     f"Only {days} days graded. Below about {MIN_DAYS} an edge "
-                     f"cannot be told apart from luck.",
-                     edge, float("nan"), days)
+    noise = 0.0
+    if controls:
+        noise = float((controls.get("noise_floor") or {}).get("spread") or 0.0)
 
-    # The spread of a proportion measured over `days` samples. Two of these is
-    # the usual bar for "probably not chance".
-    standard_error = math.sqrt(max(baseline * (1.0 - baseline), 1e-9) / days)
+    # The spread of a proportion measured over `effective` independent samples.
+    # Two of these is the usual bar for "probably not chance".
+    standard_error = math.sqrt(max(baseline * (1.0 - baseline), 1e-9)
+                               / max(effective, 1))
     needed = 2.0 * standard_error
 
-    if up_rate > 0.97 or up_rate < 0.03:
-        return Trust(False,
-                     "The model answers the same way almost every day, so its "
-                     "accuracy is just the class balance. It has learned nothing.",
-                     edge, needed, days)
+    checks: list = []
 
-    if edge <= 0:
-        return Trust(False,
-                     "It does no better than always guessing the commoner "
-                     "direction, on days it never saw.",
-                     edge, needed, days)
+    def record(name: str, passed: bool, detail: str) -> None:
+        checks.append({"name": name, "passed": bool(passed), "detail": detail})
 
-    if edge < needed:
-        return Trust(False,
-                     f"It is {edge * 100:.2f} points above the baseline, and "
-                     f"chance alone produces about {needed * 100:.2f} over "
-                     f"{days:,} days. Not enough to act on.",
-                     edge, needed, days)
+    def refuse(reason: str) -> Trust:
+        return Trust(False, reason, edge, needed, days, effective, noise, checks)
+
+    # --- enough evidence at all -------------------------------------------
+    enough_days = days >= MIN_DAYS
+    record("enough_days", enough_days,
+           f"{days} distinct dates graded; {MIN_DAYS} is the floor.")
+    if not enough_days:
+        return refuse(f"Only {days} distinct days graded. Below about {MIN_DAYS} "
+                      f"an edge cannot be told apart from luck, however many "
+                      f"symbols are stacked on top of them.")
+
+    enough_rows = effective >= MIN_EFFECTIVE_ROWS
+    record("enough_effective_rows", enough_rows,
+           f"{rows} rows are worth {effective} independent ones after "
+           f"discounting for how much the panel moves together.")
+    if not enough_rows:
+        return refuse(f"{rows} rows, but only about {effective} of them are "
+                      f"independent once the panel's shared movement is taken "
+                      f"out. Not enough to measure anything.")
+
+    # --- is it actually answering the question? ---------------------------
+    varies = 0.03 <= up_rate <= 0.97
+    record("model_varies", varies,
+           f"It answers 'up' on {up_rate:.1%} of days.")
+    if not varies:
+        return refuse("The model answers the same way almost every day, so its "
+                      "accuracy is just the class balance. It has learned nothing.")
+
+    # --- does it beat the floor? ------------------------------------------
+    positive = edge > 0
+    record("beats_baseline", positive,
+           f"{accuracy:.4f} against a baseline of {baseline:.4f} "
+           f"({edge * 100:+.2f} points).")
+    if not positive:
+        return refuse("It does no better than always guessing the class that "
+                      "dominated training, on days it never saw.")
+
+    beats_chance = edge >= needed
+    record("beats_chance", beats_chance,
+           f"Chance alone produces about {needed * 100:.2f} points over "
+           f"{effective:,} independent rows.")
+    if not beats_chance:
+        return refuse(f"It is {edge * 100:.2f} points above the baseline, and "
+                      f"chance alone produces about {needed * 100:.2f}. "
+                      f"Not enough to act on.")
+
+    # --- is it bigger than the difference between identical models? -------
+    beats_noise = noise <= 0.0 or edge > noise
+    record("beats_noise_floor", beats_noise,
+           f"Identical configurations trained on different seeds spanned "
+           f"{noise * 100:.2f} points."
+           if noise > 0 else "No noise floor was measured for this run.")
+    if not beats_noise:
+        return refuse(f"Its {edge * 100:.2f} point edge is smaller than the "
+                      f"{noise * 100:.2f} points that separate identical models "
+                      f"trained with different random seeds. That is a fact "
+                      f"about the seed, not about the market.")
+
+    # --- does it hold up in more than one window? -------------------------
+    if walk_forward and walk_forward.get("folds_run"):
+        run = int(walk_forward["folds_run"])
+        good = int(walk_forward.get("folds_positive") or 0)
+        share = good / max(run, 1)
+        consistent = share >= MIN_FOLD_AGREEMENT
+        record("consistent_across_time", consistent,
+               f"Positive in {good} of {run} walk-forward windows.")
+        if not consistent:
+            return refuse(f"It only beats the baseline in {good} of {run} "
+                          f"consecutive test windows. An edge that appears in "
+                          f"one period and not the others is what a coin looks "
+                          f"like.")
+    else:
+        record("consistent_across_time", True,
+               "No walk-forward was run, so consistency over time is untested.")
+
+    # --- and does being right actually pay? -------------------------------
+    tstat = float(evaluation.get("strategy_tstat") or 0.0)
+    sharpe = float(evaluation.get("strategy_sharpe") or 0.0)
+    pays = tstat >= MIN_RETURN_TSTAT
+    record("makes_money", pays,
+           f"After costs the strategy returns a t-statistic of {tstat:.2f} "
+           f"(Sharpe {sharpe:.2f}); {MIN_RETURN_TSTAT:.0f} is the bar.")
+    if not pays:
+        return refuse(
+            f"It is more accurate than the baseline, but after costs its "
+            f"return has a t-statistic of {tstat:.2f}. Being right more often "
+            f"is not the same as making money -- a model right about small "
+            f"moves and wrong about large ones is exactly this.")
 
     return Trust(True,
-                 f"{edge * 100:.2f} points above the baseline over {days:,} "
-                 f"days it never saw, which is past what chance produces "
-                 f"({needed * 100:.2f}).",
-                 edge, needed, days)
+                 f"{edge * 100:.2f} points above the baseline over {effective:,} "
+                 f"independent rows across {days} days it never saw, past what "
+                 f"chance produces ({needed * 100:.2f}) and past the "
+                 f"{noise * 100:.2f} that separates identical models.",
+                 edge, needed, days, effective, noise, checks)
 
 
-def rank(probability: float, trust: Trust) -> tuple[str, str]:
+def rank(probability: float, trust: Trust) -> tuple:
     """The call, and the sentence explaining it.
 
     Returns (verdict, because). The gate comes first: an untrusted model has no
@@ -138,7 +257,7 @@ def rank(probability: float, trust: Trust) -> tuple[str, str]:
         f"the honest answer most days.")
 
 
-def contributions(model, scaler, row: np.ndarray) -> list[dict]:
+def contributions(model, scaler, row: np.ndarray) -> list:
     """How much each feature moved today's answer, by setting it to average.
 
     The scaler standardises to mean zero, so replacing a scaled feature with 0
@@ -191,7 +310,7 @@ def in_words(contribution: dict) -> str:
             f"{abs(effect) * 100:.1f} points.")
 
 
-def what_it_learnt(model, scaler, rows: np.ndarray, sample: int = 400) -> list[dict]:
+def what_it_learnt(model, scaler, rows: np.ndarray, sample: int = 400) -> list:
     """Which features move this model at all, across many days.
 
     A per-day attribution says what mattered today. This says what the model

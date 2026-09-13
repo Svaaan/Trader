@@ -6,11 +6,26 @@ back, and how it scored. Nothing is held only in memory, because the interesting
 part happens minutes or hours after the submit and the answer to "what did it do
 and why" has to survive a restart.
 
+Two things happen before anything is sent, and both exist because of what the
+project measured about itself:
+
+**The local controls run first.** A majority-class model, a logistic regression
+and a small MLP trained with exactly the hyperparameters about to be submitted,
+all on the same rows. Nine models were once trained on a GPU across a network
+and compared only against the class balance -- a linear model would have scored
+the same, and nobody could have known. Their scores go into the run so that the
+returned model is always read next to something.
+
+**The cut date is chosen once and written down.** Scoring passes it back rather
+than re-deriving it. Re-deriving it moved the split by seven weeks, graded 87
+rows the run never advertised, and quietly added a symbol to the test set that
+had been missing from training.
+
 The hand-off from HelloWorldAi is a poll, not a callback. The coordinator has no
 way to call back into this project -- and a webhook would mean exposing a port
-from a laptop, which is a worse trade than asking every thirty seconds. `collect`
-is safe to call repeatedly; it picks up whatever has finished since the last
-time and leaves the rest alone.
+from a laptop, which is a worse trade than asking every thirty seconds.
+`collect` is safe to call repeatedly; it picks up whatever has finished since
+the last time and leaves the rest alone.
 """
 
 from __future__ import annotations
@@ -23,13 +38,18 @@ import os
 from typing import Optional, Sequence
 
 import numpy as np
+import pandas as pd
 
+from . import baseline as baseline_mod
 from . import dataset as dataset_mod
 from . import evaluate as evaluate_mod
 from . import explain as explain_mod
 from . import features as features_mod
+from . import labels as labels_mod
 from . import model as model_mod
+from . import news as news_mod
 from . import prices as prices_mod
+from . import universe as universe_mod
 from .helloworld import Client, HelloWorldError
 
 logger = logging.getLogger(__name__)
@@ -39,15 +59,54 @@ RUNS_DIR = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data", "runs"),
 )
 
-# Large caps on both sides of the Atlantic, liquid enough that a daily close is
-# a real price rather than the last trade somebody happened to make.
-DEFAULT_WATCHLIST = [
-    "AAPL", "MSFT", "NVDA", "JPM", "XOM",          # US
-    "ASML.AS", "SAP.DE", "NESN.SW", "MC.PA", "VOLV-B.ST",   # Europe
-]
+# Ten names is where this started and is too narrow for the macro and
+# cross-sectional blocks to say anything -- see universe.py. Override with
+# TRADER_UNIVERSE=core while iterating on code.
+DEFAULT_UNIVERSE = os.environ.get("TRADER_UNIVERSE", "wide")
 
 STATE_FILE = "run.json"
 BUNDLE_FILE = "model.zip"
+
+# Training length, in passes over the data rather than in steps.
+#
+# `steps=4000` was the default when the panel was ten symbols and 18,000 rows,
+# where it is fourteen passes -- a reasonable amount of training. On 238 symbols
+# and 428,000 rows the same number is *six tenths of one pass*, and the local
+# control demonstrated exactly what that produces: up-rate 1.00, accuracy equal
+# to the class balance, a model that never got far enough from its
+# initialisation to learn anything. It would have cost a GPU round trip to find
+# that out remotely.
+#
+# So the step count is derived from the data instead of fixed, and the run
+# records what it worked out to.
+TARGET_EPOCHS = 12
+BATCH_SIZE = 64
+MIN_STEPS = 4000
+
+
+def steps_for(rows: int, *, epochs: int = TARGET_EPOCHS,
+              batch: int = BATCH_SIZE) -> int:
+    """How many gradient steps `rows` rows deserve.
+
+    Floored, because a very small panel still needs enough steps to converge,
+    and capped so that a very wide one does not queue on somebody's GPU for a
+    day.
+
+    Worth knowing before the first wide submission: this asks for roughly twenty
+    times the old fixed 4,000 on a 240-symbol panel. That is the right amount of
+    training and it is a real request of somebody else's machine -- the job will
+    take correspondingly longer, and a coordinator with a per-job ceiling may
+    refuse it. Pass `steps=` explicitly to override.
+    """
+    return int(min(max(epochs * max(rows, 1) // batch, MIN_STEPS), 200_000))
+
+
+def default_watchlist() -> list:
+    return universe_mod.resolve(DEFAULT_UNIVERSE)
+
+
+# Kept as a name because the UI and older runs refer to it.
+DEFAULT_WATCHLIST = universe_mod.CORE
 
 
 def _runs_root() -> str:
@@ -68,9 +127,12 @@ class Run:
     horizon: int
     task_id: Optional[str] = None
     status: str = "building"
+    spec: dict = dataclasses.field(default_factory=dict)
     dataset: dict = dataclasses.field(default_factory=dict)
     verification: dict = dataclasses.field(default_factory=dict)
     evaluation: dict = dataclasses.field(default_factory=dict)
+    controls: dict = dataclasses.field(default_factory=dict)
+    walk_forward: dict = dataclasses.field(default_factory=dict)
     verdict: str = ""
     signals: list = dataclasses.field(default_factory=list)
     trust: dict = dataclasses.field(default_factory=dict)
@@ -86,7 +148,12 @@ class Run:
     @classmethod
     def load(cls, run_id: str) -> "Run":
         with open(os.path.join(_run_dir(run_id), STATE_FILE), encoding="utf-8") as fh:
-            return cls(**json.load(fh))
+            raw = json.load(fh)
+        # Runs written by an earlier version are missing fields added since.
+        # Dropping unknown keys and defaulting absent ones means old runs stay
+        # readable instead of making the whole list page fail to render.
+        known = {f.name for f in dataclasses.fields(cls)}
+        return cls(**{k: v for k, v in raw.items() if k in known})
 
     @property
     def bundle_path(self) -> str:
@@ -96,8 +163,14 @@ class Run:
     def has_model(self) -> bool:
         return os.path.exists(self.bundle_path)
 
+    @property
+    def cut_date(self) -> Optional[pd.Timestamp]:
+        """The split this run was built on. Scoring must reuse it."""
+        raw = (self.dataset or {}).get("cut_date")
+        return pd.Timestamp(raw) if raw else None
 
-def list_runs() -> list[Run]:
+
+def list_runs() -> list:
     """Newest first. A directory that will not parse is skipped, not fatal."""
     root = _runs_root()
     if not os.path.isdir(root):
@@ -116,21 +189,36 @@ def list_runs() -> list[Run]:
 
 def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
           period: str = "10y", test_fraction: float = 0.2,
-          steps: int = 4000, client: Client | None = None) -> Run:
+          target: str = labels_mod.RELATIVE,
+          spec: dataset_mod.Spec | None = None,
+          steps: int | None = None, client: Client | None = None,
+          run_controls: bool = True, folds: int = 6) -> Run:
     """Build a dataset from live prices and send it to HelloWorldAi.
 
     The test half never leaves this machine. HelloWorldAi gets the training rows
     only, so the score this project reports is measured on data no model in the
     chain has ever seen -- including through the coordinator's own verification,
     which holds back a random slice of whatever it is given.
+
+    Pass `spec` to choose which feature blocks go in -- switching one off and
+    re-running is how its contribution gets measured rather than assumed. The
+    keyword arguments are the common case and are ignored when `spec` is given.
+
+    `steps` defaults to whatever the dataset size deserves -- see `steps_for`.
+    A fixed step count is a fixed number of *samples*, which is a shrinking
+    number of passes as the panel widens, and an undertrained model looks
+    exactly like a model with nothing to learn.
     """
     client = client or Client()
-    symbols = list(watchlist or DEFAULT_WATCHLIST)
+    symbols = universe_mod.resolve(watchlist) if watchlist else default_watchlist()
 
     run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    spec = spec or dataset_mod.Spec(target=target, horizon=horizon,
+                                    test_fraction=test_fraction)
+
     run = Run(run_id=run_id,
               created=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-              watchlist=symbols, horizon=horizon)
+              watchlist=symbols, horizon=horizon, spec=spec.to_dict())
     run.save()
 
     try:
@@ -138,14 +226,50 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
         if not frames:
             raise ValueError("no price history could be fetched for any symbol")
 
-        splits, cut = dataset_mod.build_panel(
-            frames, horizon=horizon, test_fraction=test_fraction)
-        x_train, y_train, scaler = dataset_mod.combine(splits)
+        splits, cut, report = dataset_mod.build_panel(frames, spec)
+        x_train, y_train, scaler = dataset_mod.combine(
+            splits, report["feature_names"])
 
-        description = dataset_mod.describe(splits, scaler)
-        description["cut_date"] = cut.date().isoformat()
-        description["horizon"] = horizon
+        description = dataset_mod.describe(splits, scaler, spec, report, cut)
         run.dataset = description
+
+        # --- what a model has to beat, measured here, before anything is sent --
+        if run_controls:
+            try:
+                # The same width, depth and step count as the job about to
+                # be submitted, so the control is a control.
+                run.controls = baseline_mod.run_controls(
+                    splits, report["feature_names"],
+                    hidden=64, depth=2, steps=steps)
+                run.walk_forward = baseline_mod.walk_forward(
+                    frames, spec, folds=folds)
+                run.save()
+            except Exception as exc:                    # noqa: BLE001
+                logger.warning("Controls failed, continuing: %s", exc)
+                run.controls = {"error": str(exc)}
+
+        # Now that the rows exist, work out how much training they deserve.
+        training_steps = steps if steps is not None else steps_for(len(y_train))
+        description["steps"] = training_steps
+        description["epochs"] = round(
+            training_steps * BATCH_SIZE / max(len(y_train), 1), 2)
+
+        # --- what a model has to beat, measured here, before anything is sent --
+        #
+        # Same width, depth, batch and step count as the job about to be
+        # submitted, so the control is a control. This is also the cheapest
+        # place to discover that the step count is wrong for the panel size.
+        if run_controls:
+            try:
+                run.controls = baseline_mod.run_controls(
+                    splits, report["feature_names"], hidden=64, depth=2,
+                    steps=training_steps, batch=BATCH_SIZE)
+                run.walk_forward = baseline_mod.walk_forward(
+                    frames, spec, folds=folds)
+                run.save()
+            except Exception as exc:                    # noqa: BLE001
+                logger.warning("Controls failed, continuing: %s", exc)
+                run.controls = {"error": str(exc)}
 
         blob = dataset_mod.pack_for_helloworld(x_train, y_train)
         description["bytes_sent"] = len(blob)
@@ -161,7 +285,8 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
         run.task_id = client.submit(
             dataset_id=artifact_id,
             model_name=f"trader-{run_id}",
-            steps=steps,
+            steps=training_steps,
+            batch_size=BATCH_SIZE,
             hidden_dim=64,
             depth=2,
             node_id=node_id,
@@ -181,11 +306,7 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
 # --- collecting ------------------------------------------------------------
 
 def collect(run: Run, *, client: Client | None = None) -> Run:
-    """Fetch and process the model if the job has finished. Safe to repeat.
-
-    This is the automatic half: called on a timer, it picks up whatever has
-    completed since the last pass and leaves everything else untouched.
-    """
+    """Fetch and process the model if the job has finished. Safe to repeat."""
     if run.status in ("done", "failed") or not run.task_id:
         return run
 
@@ -235,7 +356,7 @@ def collect(run: Run, *, client: Client | None = None) -> Run:
     return run
 
 
-def collect_all(*, client: Client | None = None) -> list[Run]:
+def collect_all(*, client: Client | None = None) -> list:
     """One pass over every unfinished run. What the watcher calls."""
     client = client or Client()
     return [collect(run, client=client) for run in list_runs()
@@ -248,27 +369,54 @@ def _process(run: Run) -> None:
     """Score the model out of time, then read today's signal from it."""
     model = model_mod.load_bundle_file(run.bundle_path)
     scaler = dataset_mod.Scaler.from_dict(run.dataset["scaler"])
+    spec = dataset_mod.Spec.from_dict(run.spec or {})
 
-    frames = prices_mod.load_many(run.watchlist,
-                                  period="10y")
-    splits, _ = dataset_mod.build_panel(
-        frames, horizon=run.horizon,
-        test_fraction=1.0 - _train_fraction(run))
+    cut = run.cut_date
+    if cut is None:
+        raise ValueError(
+            "this run recorded no cut date, so its test set cannot be "
+            "reproduced. Re-deriving one would grade the model on a different "
+            "split than it was trained for.")
+
+    frames = prices_mod.load_many(run.watchlist, period="10y")
+
+    # The split this run was built on, not a fresh one. See the module docstring.
+    splits, report = dataset_mod.split_at(
+        dataset_mod.prepare(frames, spec), cut)
+
+    # If the panel is not the one that trained, the score is not the one that
+    # was advertised. Say so rather than quietly grading something else.
+    trained_on = set(run.dataset.get("symbols") or [])
+    scoring = {s.symbol for s in splits}
+    if trained_on and scoring != trained_on:
+        logger.warning(
+            "Scoring panel differs from the trained panel: added %s, lost %s",
+            sorted(scoring - trained_on), sorted(trained_on - scoring))
+        run.dataset["panel_drift"] = {
+            "added": sorted(scoring - trained_on),
+            "lost": sorted(trained_on - scoring),
+        }
+        # Grade only what was trained on, so the number means what it says.
+        splits = [s for s in splits if s.symbol in trained_on]
+        if not splits:
+            raise ValueError("none of the trained symbols could be rebuilt")
 
     # --- the honest score: rows that were never sent anywhere ---
-    x_test = np.concatenate([s.x_test for s in splits])
-    y_test = np.concatenate([s.y_test for s in splits])
-    returns = np.concatenate([s.forward_returns_test for s in splits])
+    (x_test, y_test, returns, dates), symbols = dataset_mod.test_matrix(
+        splits, scaler)
 
-    probabilities = model.probabilities(scaler.apply(x_test))[:, 1]
-    result = evaluate_mod.evaluate(probabilities, y_test, returns)
+    probabilities = model.probabilities(x_test)[:, 1]
+    train_up_share = (run.dataset.get("train") or {}).get("up_share")
+    result = evaluate_mod.evaluate(probabilities, y_test, returns, dates, symbols,
+                                   train_up_share=train_up_share)
 
     run.evaluation = result.to_dict()
     run.verdict = evaluate_mod.verdict(result)
 
     # Whether anything below is worth printing. Decided once, from the
-    # out-of-time score, and every per-symbol call is gated on it.
-    trust = explain_mod.assess(run.evaluation)
+    # out-of-time score, the noise floor and the walk-forward.
+    trust = explain_mod.assess(run.evaluation, controls=run.controls,
+                               walk_forward=run.walk_forward)
     run.trust = trust.to_dict()
 
     # What the model attends to in general, which is how a network that has
@@ -276,37 +424,48 @@ def _process(run: Run) -> None:
     run.learnt = explain_mod.what_it_learnt(model, scaler, x_test)
 
     # --- and what it says about today ---
-    run.signals = _todays_signals(model, scaler, frames, trust)
+    run.signals = _todays_signals(model, scaler, frames, spec, trust)
 
 
-def _train_fraction(run: Run) -> float:
-    train = run.dataset.get("train", {}).get("rows", 0)
-    test = run.dataset.get("test", {}).get("rows", 0)
-    total = train + test
-    return (train / total) if total else 0.8
-
-
-def _todays_signals(model, scaler, frames: dict, trust=None) -> list[dict]:
+def _todays_signals(model, scaler, frames: dict, spec, trust=None) -> list:
     """The most recent finished session, per symbol.
 
     This is the row with features and no label -- the one prediction exists for.
+    Built through the same assembly the training rows went through, so the
+    columns are in the same order and mean the same things. Reading only
+    features.py here would silently drop the macro, cross-sectional and event
+    blocks and hand the model a third of a row.
     """
     signals = []
 
-    for symbol, prices in sorted(frames.items()):
+    try:
+        assembled, names, _ = dataset_mod.assemble(frames, spec)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("Could not assemble today's rows: %s", exc)
+        return signals
+
+    expected = list(scaler.feature_names)
+
+    for symbol in sorted(assembled):
         try:
-            x_frame = features_mod.build(prices)
-            if x_frame.empty:
+            frame = assembled[symbol]
+            if frame.empty:
                 continue
 
-            latest = x_frame.iloc[[-1]]
-            row = latest[features_mod.FEATURE_NAMES].to_numpy(dtype=np.float32)
+            missing = [n for n in expected if n not in frame.columns]
+            if missing:
+                logger.warning("%s is missing %s today; no signal", symbol, missing)
+                continue
+
+            latest = frame.iloc[[-1]]
+            row = latest[expected].to_numpy(dtype=np.float32)
             probability = float(model.probabilities(scaler.apply(row))[0, 1])
 
             verdict, because = (explain_mod.rank(probability, trust)
                                 if trust is not None else (explain_mod.UNSURE, ""))
 
             reasons = explain_mod.contributions(model, scaler, row)
+            prices = frames.get(symbol)
 
             signals.append({
                 "verdict": verdict,
@@ -320,7 +479,8 @@ def _todays_signals(model, scaler, frames: dict, trust=None) -> list[dict]:
                 "all_contributions": reasons,
                 "symbol": symbol,
                 "as_of": latest.index[-1].date().isoformat(),
-                "close": round(float(prices["close"].iloc[-1]), 4),
+                "close": (round(float(prices["close"].iloc[-1]), 4)
+                          if prices is not None and len(prices) else None),
                 "probability_up": round(probability, 4),
                 # Confidence, not a recommendation. The strength is how far from
                 # a coin flip the model is, and the UI shows it as that.
@@ -333,3 +493,20 @@ def _todays_signals(model, scaler, frames: dict, trust=None) -> list[dict]:
             logger.warning("No signal for %s: %s", symbol, exc)
 
     return signals
+
+
+# --- the news store --------------------------------------------------------
+
+def collect_news(watchlist: Sequence[str] | None = None) -> dict:
+    """One append-only pass over the news store. Called by the watcher.
+
+    Separate from `collect_all` because it is on a different clock: models
+    finish every few hours, news arrives all day, and the store is only worth
+    anything if it is written to continuously from now on. See news.py for why
+    it cannot be backfilled later.
+    """
+    symbols = universe_mod.resolve(watchlist) if watchlist else default_watchlist()
+    added = news_mod.collect(symbols)
+    return {"added": sum(added.values()),
+            "symbols": len([s for s, n in added.items() if n]),
+            "readiness": news_mod.readiness(symbols)}

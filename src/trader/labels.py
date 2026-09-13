@@ -7,15 +7,46 @@ label can never be mistaken for a rolling window that creates a feature.
 
 The label on day t describes what happened *after* day t. It is not knowable on
 day t, which is the point: that is what there would be value in predicting.
+
+There are two targets here, and choosing between them is the most consequential
+decision in the project.
+
+**Absolute direction** -- will this close higher tomorrow -- is the obvious one
+and it is close to unanswerable. Roughly 52% of daily moves in a large-cap panel
+are up, so a model that learns nothing and answers "up" every time scores 52%,
+and gradient descent finds that constant long before it finds anything subtle.
+Measured here, repeatedly: up-rate 0.98, accuracy equal to the class balance,
+every feature influence under 0.01. The model was not failing to learn. It had
+learned the only thing reliably there, which is the drift.
+
+**Relative direction** -- will this name finish in the top half of its peers --
+removes the drift by construction. The classes are 50/50 on every single date,
+so no constant answer can score above chance, and the market factor that
+dominates absolute returns cancels out of the target entirely. What is left is
+the part the company is responsible for, which is the part the features describe
+and the part a long/short book is paid for.
+
+That does not conjure a signal that is not there. It makes the absence of one
+legible instead of hiding it behind 52%, and it makes any signal that does exist
+reachable instead of drowned. Both targets are kept, because the comparison
+between them is itself informative and the honest reading of this project is
+still that neither has produced an edge.
 """
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 UP, DOWN = 1, 0
 CLASS_NAMES = ["down", "up"]        # index == label value
 
+ABSOLUTE = "absolute"
+RELATIVE = "relative"
+TARGETS = (ABSOLUTE, RELATIVE)
+
+
+# --- one symbol at a time --------------------------------------------------
 
 def direction(prices: pd.DataFrame, *, horizon: int = 1,
               threshold: float = 0.0) -> pd.Series:
@@ -55,3 +86,87 @@ def forward_return(prices: pd.DataFrame, *, horizon: int = 1) -> pd.Series:
     """
     close = prices["close"]
     return (close.shift(-horizon) / close - 1.0).rename("forward_return")
+
+
+# --- the whole panel at once -----------------------------------------------
+#
+# A relative label cannot be computed one symbol at a time: "top half of its
+# peers" needs the peers. These take the panel and hand back date x symbol
+# frames that dataset.py splits up again.
+
+def forward_return_panel(frames: dict, *, horizon: int = 1) -> pd.DataFrame:
+    """Every symbol's forward return, on one date index."""
+    return pd.DataFrame({
+        symbol: forward_return(prices, horizon=horizon)
+        for symbol, prices in frames.items()
+    }).sort_index()
+
+
+def relative_forward_return(panel: pd.DataFrame) -> pd.DataFrame:
+    """Each symbol's forward return with the panel's average taken out.
+
+    This is what a market-neutral book actually earns: long the names expected
+    to lead, short the ones expected to lag, and the index move cancels. It is
+    also the return that pairs with the relative label, and evaluating a
+    relative model against absolute returns would credit it for market drift it
+    never predicted.
+    """
+    return panel.sub(panel.mean(axis=1), axis=0)
+
+
+def relative_direction(panel: pd.DataFrame, *,
+                       neutral_band: float = 0.0) -> pd.DataFrame:
+    """1 if this symbol finishes in the top half of the panel, else 0.
+
+    Ranked per date, so the classes are balanced on every date rather than on
+    average -- which matters, because a target that is 50/50 overall but 70/30
+    inside the test window hands back exactly the baseline problem this was
+    meant to remove.
+
+    `neutral_band` drops the middle of the cross-section: at 0.1, names ranking
+    between 0.45 and 0.55 become NaN and are dropped. The days a name lands in
+    the middle of its peers are the days there was nothing to know, and training
+    on them teaches the model to reproduce noise. It costs rows, so it is off by
+    default and worth trying rather than assuming.
+    """
+    if not 0.0 <= neutral_band < 1.0:
+        raise ValueError("neutral_band must be in [0, 1)")
+
+    # rank over columns: only same-date values, no time axis involved at all.
+    ranked = panel.rank(axis=1, pct=True)
+
+    # A date with too few names to rank is not a cross-section.
+    ranked = ranked.where(panel.notna().sum(axis=1) >= 3)
+
+    label = (ranked > 0.5).astype("float64")
+    label[ranked.isna()] = np.nan
+
+    if neutral_band > 0.0:
+        low, high = 0.5 - neutral_band / 2.0, 0.5 + neutral_band / 2.0
+        label[(ranked > low) & (ranked < high)] = np.nan
+
+    return label
+
+
+def build_panel_labels(frames: dict, *, horizon: int = 1, target: str = RELATIVE,
+                       threshold: float = 0.0,
+                       neutral_band: float = 0.0) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(labels, returns-to-grade-on) for the whole panel, for either target.
+
+    One entry point so that a caller cannot pair a relative label with absolute
+    returns, which would be a quiet and very flattering mistake.
+    """
+    if target not in TARGETS:
+        raise ValueError(f"target must be one of {TARGETS}, not {target!r}")
+
+    panel = forward_return_panel(frames, horizon=horizon)
+
+    if target == RELATIVE:
+        graded = relative_forward_return(panel)
+        return relative_direction(panel, neutral_band=neutral_band), graded
+
+    labels = pd.DataFrame({
+        symbol: direction(prices, horizon=horizon, threshold=threshold)
+        for symbol, prices in frames.items()
+    }).sort_index()
+    return labels, panel

@@ -16,6 +16,13 @@ so a price series reflects what a holder actually experienced.
 bar that keeps changing until the close. Training on it means training on a
 number that was not knowable, and a signal generated from it is generated from
 the future. Rows are dropped unless the session they describe has ended.
+
+**A cache is only valid for the period it was fetched for.** This one drew
+blood. A short fetch of AAPL was cached early on, and every run afterwards asked
+for ten years, got two, and never noticed -- the symbol quietly fell out of the
+panel because it had no rows before the cut date, and nine names trained where
+ten were reported. So the cache records what it covers and is refetched when it
+covers less than it is asked for.
 """
 
 from __future__ import annotations
@@ -23,6 +30,8 @@ from __future__ import annotations
 import datetime as dt
 import logging
 import os
+import re
+from concurrent import futures
 from typing import Iterable
 
 import pandas as pd
@@ -40,6 +49,46 @@ CACHE_DIR = os.environ.get(
 
 class PriceError(Exception):
     """Raised when a symbol cannot be turned into a usable price history."""
+
+
+# How much slack to allow before calling a cache short. Exchanges have holidays,
+# listings begin mid-window, and a stock that IPO'd four years ago can never
+# satisfy a ten-year request however many times it is refetched.
+CACHE_TOLERANCE_DAYS = 45
+
+
+def _period_days(period: str) -> float | None:
+    """Roughly how many calendar days `period` asks for, or None if open-ended.
+
+    Only needs to be close. It exists to tell two years from ten, not to be a
+    calendar.
+    """
+    text = str(period).strip().lower()
+    if text in ("max", "ytd", ""):
+        return None
+
+    match = re.fullmatch(r"(\d+)\s*(d|wk|mo|y)", text)
+    if not match:
+        return None
+
+    count = int(match.group(1))
+    return count * {"d": 1.0, "wk": 7.0, "mo": 30.44, "y": 365.25}[match.group(2)]
+
+
+def _covers_period(frame: pd.DataFrame, period: str) -> bool:
+    """Does this cached frame actually span what was asked for?
+
+    A frame that starts later than requested is either a short fetch that got
+    cached (refetch it) or a symbol that did not exist yet (refetching will not
+    help, and the caller finds out either way). Answering "no" costs one HTTP
+    request; answering "yes" wrongly costs a symbol, silently.
+    """
+    wanted = _period_days(period)
+    if wanted is None or frame.empty:
+        return True
+
+    span = (frame.index[-1] - frame.index[0]).days
+    return span >= wanted - CACHE_TOLERANCE_DAYS
 
 
 def _cache_path(symbol: str) -> str:
@@ -113,8 +162,12 @@ def load(symbol: str, *, period: str = "10y", refresh: bool = False) -> pd.DataF
     if not refresh and os.path.exists(path):
         try:
             cached = pd.read_csv(path, index_col="date", parse_dates=["date"])
-            logger.debug("%s: %d rows from cache", symbol, len(cached))
-            return _drop_unfinished_session(cached)
+            if _covers_period(cached, period):
+                logger.debug("%s: %d rows from cache", symbol, len(cached))
+                return _drop_unfinished_session(cached)
+            logger.info(
+                "Cache for %s covers %s..%s, which is short of %s; refetching",
+                symbol, cached.index[0].date(), cached.index[-1].date(), period)
         except Exception as exc:                       # noqa: BLE001
             logger.warning("Cache for %s unreadable (%s); refetching", symbol, exc)
 
@@ -136,6 +189,12 @@ def load(symbol: str, *, period: str = "10y", refresh: bool = False) -> pd.DataF
     return frame
 
 
+# How many symbols to fetch at once. These are I/O-bound waits on somebody
+# else's server, so a few in flight is most of the win; a large pool mostly
+# buys rate limiting. Cached symbols never reach the pool at all.
+FETCH_WORKERS = int(os.environ.get("TRADER_FETCH_WORKERS", "6"))
+
+
 def load_many(symbols: Iterable[str], *, period: str = "10y",
               refresh: bool = False) -> dict[str, pd.DataFrame]:
     """Prices for several symbols, skipping the ones that fail.
@@ -143,11 +202,34 @@ def load_many(symbols: Iterable[str], *, period: str = "10y",
     One delisted ticker in a watchlist should not stop the run; it should be
     reported and left out, because a silent gap in a universe is the kind of
     thing that turns into a mystery three steps later.
+
+    Fetched a few at a time and with progress logged. A few hundred symbols
+    one at a time is several silent minutes on the first run, which is
+    indistinguishable from being hung.
     """
+    symbols = list(symbols)
     out: dict[str, pd.DataFrame] = {}
-    for symbol in symbols:
-        try:
-            out[symbol] = load(symbol, period=period, refresh=refresh)
-        except Exception as exc:                       # noqa: BLE001
-            logger.warning("Skipping %s: %s", symbol, exc)
+    failed: list[str] = []
+
+    def one(symbol: str):
+        return symbol, load(symbol, period=period, refresh=refresh)
+
+    with futures.ThreadPoolExecutor(max_workers=max(FETCH_WORKERS, 1)) as pool:
+        pending = [pool.submit(one, symbol) for symbol in symbols]
+        for done, future in enumerate(futures.as_completed(pending), start=1):
+            try:
+                symbol, frame = future.result()
+                out[symbol] = frame
+            except Exception as exc:                   # noqa: BLE001
+                failed.append(str(exc))
+                logger.warning("Skipping a symbol: %s", exc)
+
+            if len(symbols) > 20 and done % 25 == 0:
+                logger.info("Prices: %d/%d", done, len(symbols))
+
+    missing = sorted(set(symbols) - set(out))
+    if missing:
+        logger.warning("No price history for %d symbol(s): %s",
+                       len(missing), missing)
+
     return out
