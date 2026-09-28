@@ -39,6 +39,8 @@ import threading
 
 from . import pipeline as pipeline_mod
 from . import prices as prices_mod
+from . import news as news_mod
+from . import universe as universe_mod
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,14 @@ STALE_SECONDS = 5 * 60
 # How many cycles to keep in the state file, so the page can show what it has
 # been doing without the file growing forever.
 HISTORY = 20
+
+# How many symbols to ask for news on per cycle, rotating through the universe.
+# The store is append-only and idempotent by item id, so asking often is free
+# except for the requests -- and asking rarely loses items that scroll off the
+# provider before anybody looked. A slice of forty at a half-hourly cycle gives
+# every name in a 238-symbol universe about eight passes a day without making
+# eleven thousand requests to do it.
+NEWS_PER_CYCLE = 40
 
 _lock = threading.Lock()
 # Every read-modify-write of the state file goes through this. Without it the
@@ -169,6 +179,41 @@ def last_closed_session() -> str | None:
     return str(frame.index[-1].date()) if len(frame) else None
 
 
+def collect_news(watchlist=None) -> dict:
+    """Ask for news on the next slice of the universe, and remember where to
+    resume.
+
+    This is the one thing in the loop that genuinely gets better by waiting.
+    The store cannot be backfilled -- an archive fetched next year has been
+    re-ranked by what turned out to matter, and its timestamps are frequently
+    ingestion times -- so the only honest version is built forwards from today.
+    What is stored is the whole item, title and summary and source, not a
+    count: the features can be recomputed from the archive later, the archive
+    cannot.
+    """
+    try:
+        symbols = (universe_mod.resolve(watchlist) if watchlist
+                   else pipeline_mod.default_watchlist())
+        if not symbols:
+            return {"asked": 0}
+
+        start = int(_read().get("news_offset") or 0) % len(symbols)
+        slice_ = [symbols[(start + i) % len(symbols)]
+                  for i in range(min(NEWS_PER_CYCLE, len(symbols)))]
+
+        result = pipeline_mod.collect_news(slice_)
+        _update(news_offset=(start + len(slice_)) % len(symbols))
+
+        readiness = result.get("readiness") or {}
+        return {"asked": len(slice_), "added": result.get("added", 0),
+                "items": readiness.get("items"),
+                "history_days": readiness.get("history_days"),
+                "ready": readiness.get("ready")}
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("Could not collect news this cycle: %s", exc)
+        return {"asked": 0, "error": str(exc)}
+
+
 def cycle(*, backend: str = "local", watchlist=None, trained_for: str | None = None,
           force: bool = False) -> dict:
     """Collect, settle, and train if a session has closed since the last one.
@@ -185,6 +230,8 @@ def cycle(*, backend: str = "local", watchlist=None, trained_for: str | None = N
     except Exception as exc:                            # noqa: BLE001
         logger.warning("Collection failed this cycle: %s", exc)
         out["collected"], out["error"] = 0, f"collect: {exc}"
+
+    out["news"] = collect_news(watchlist)
 
     settled = pipeline_mod.settle_paper(watchlist)
     out["settled"] = settled.get("settled", 0)
@@ -272,9 +319,14 @@ def _loop(*, interval_minutes: float, backend: str, watchlist) -> None:
                 changes["trained_for"] = done["trained_for"]
             current = _update(**changes)
 
-        logger.info("Cycle %d: %s", current["cycles"],
-                    done.get("skipped") or done.get("error")
-                    or f"trained {done.get('trained')} ({done.get('status')})")
+        news = done.get("news") or {}
+        logger.info(
+            "Cycle %d: %s%s", current["cycles"],
+            done.get("skipped") or done.get("error")
+            or f"trained {done.get('trained')} ({done.get('status')})",
+            (f" | news +{news.get('added', 0)} from {news.get('asked', 0)} symbols, "
+             f"store at {news.get('history_days', 0)} of "
+             f"{news_mod.MIN_HISTORY_DAYS} days") if news.get("asked") else "")
 
         if not _wait(interval_minutes * 60.0):
             break

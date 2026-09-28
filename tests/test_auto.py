@@ -65,6 +65,9 @@ def scheduler(tmp_path, monkeypatch):
     monkeypatch.setattr(auto.pipeline_mod, "settle_paper", settle)
     monkeypatch.setattr(auto.pipeline_mod, "follow_book",
                         lambda *a, **k: {"note": "stubbed"})
+    # The news pass reaches the provider; an auto test must not.
+    monkeypatch.setattr(auto.pipeline_mod, "collect_news",
+                        lambda symbols: {"added": 0, "readiness": {}})
     monkeypatch.setattr(auto, "last_closed_session", lambda: "2026-09-25")
 
     yield calls
@@ -266,3 +269,55 @@ def test_the_page_refuses_an_unknown_backend(client):
     refused = client.post("/api/auto/start", json={"backend": "gpu-farm"})
     assert refused.status_code == 400
     assert auto.running() is False
+
+
+# --- the one thing that gets better by waiting ---------------------------------
+#
+# The news store cannot be backfilled: an archive fetched next year has been
+# re-ranked by what turned out to matter, and its timestamps are often ingestion
+# times. So the only honest version is built forwards, which means the collector
+# has to actually run.
+
+def test_every_cycle_asks_for_news(scheduler, monkeypatch):
+    asked = []
+    monkeypatch.setattr(auto.pipeline_mod, "collect_news",
+                        lambda symbols: asked.append(list(symbols)) or
+                        {"added": 3, "readiness": {"items": 9, "history_days": 2}})
+    monkeypatch.setattr(auto.pipeline_mod, "default_watchlist",
+                        lambda: [f"S{i}" for i in range(100)])
+    monkeypatch.setattr(auto, "NEWS_PER_CYCLE", 10)
+
+    out = auto.cycle(trained_for="2026-09-25")
+
+    assert out["news"]["asked"] == 10
+    assert out["news"]["added"] == 3
+    assert asked[0] == [f"S{i}" for i in range(10)]
+
+
+def test_it_works_through_the_universe_rather_than_the_same_names(scheduler,
+                                                                  monkeypatch):
+    asked = []
+    monkeypatch.setattr(auto.pipeline_mod, "collect_news",
+                        lambda symbols: asked.append(list(symbols)) or {"added": 0})
+    monkeypatch.setattr(auto.pipeline_mod, "default_watchlist",
+                        lambda: [f"S{i}" for i in range(25)])
+    monkeypatch.setattr(auto, "NEWS_PER_CYCLE", 10)
+
+    for _ in range(3):
+        auto.collect_news()
+
+    assert asked[0][0] == "S0" and asked[1][0] == "S10" and asked[2][0] == "S20"
+    # And it wraps rather than running off the end.
+    assert len(asked[2]) == 10
+    assert asked[2][-1] == "S4"
+
+
+def test_a_news_failure_does_not_stop_the_cycle(scheduler, monkeypatch):
+    def explode(symbols):
+        raise RuntimeError("the provider said no")
+
+    monkeypatch.setattr(auto.pipeline_mod, "collect_news", explode)
+    out = auto.cycle(trained_for=None)
+
+    assert "the provider said no" in out["news"]["error"]
+    assert out["trained"] is not None, "the cycle gave up because news failed"

@@ -25,6 +25,14 @@ function signed(value, digits = 1) {
   return value > 0 ? `+${shown}%` : `${shown}%`;
 }
 
+// A plain signed number. A t-statistic is not a percentage, and running one
+// through `signed` printed the gate's own hurdle as "-318.50%".
+function value(number, digits = 2) {
+  if (number === null || number === undefined) return "—";
+  const shown = Number(number).toFixed(digits);
+  return Number(number) > 0 ? `+${shown}` : shown;
+}
+
 // --- the pieces of a run ---------------------------------------------------
 
 function statusPill(status) {
@@ -283,6 +291,37 @@ function signalsPanel(run) {
   return panel;
 }
 
+// Why the gate said what it said, in a few words. The full reason is a
+// paragraph and belongs underneath; the card needs the conclusion.
+const WHY = {
+  makes_money: "accurate, but it loses money",
+  beats_chance: "its edge is inside what chance produces",
+  beats_baseline: "no better than always guessing the common direction",
+  beats_noise_floor: "its edge is smaller than the spread between seeds",
+  consistent_across_time: "its edge shows up in one window, not most",
+  model_varies: "it answers the same way nearly every day",
+  enough_days: "too few days graded to say anything",
+  enough_effective_rows: "too little independent evidence",
+};
+
+function verdictLine(run) {
+  const evaluation = run.evaluation || {};
+  if (!evaluation.rows) return null;
+
+  const trust = run.trust || {};
+  const failed = (trust.checks || []).find((check) => !check.passed);
+  const why = failed ? (WHY[failed.name] || failed.name.replace(/_/g, " ")) : "";
+
+  const line = el("p", "run-verdict");
+  line.appendChild(el("span", trust.trusted ? "up" : "down",
+    trust.trusted ? "Gate open" : "Gate shut"));
+  line.appendChild(el("span", null, why ? ` — ${why}.` : "."));
+  line.appendChild(el("span", "run-numbers",
+    `${signed(evaluation.edge)} edge · open→close t `
+    + `${value(evaluation.executable_tstat)} · ${evaluation.days || 0} days graded`));
+  return line;
+}
+
 function runCard(run) {
   const card = el("article", "run");
 
@@ -291,14 +330,12 @@ function runCard(run) {
   title.appendChild(el("h2", null, run.run_id));
   title.appendChild(el("div", "run-sub",
     `${run.watchlist.length} symbols · ${run.horizon}-day horizon`
-    + (run.task_id ? ` · job ${run.task_id.slice(0, 16)}…` : "")));
+    + (run.backend ? ` · ${run.backend}` : "")));
   head.appendChild(title);
   head.appendChild(statusPill(run.status));
   card.appendChild(head);
 
-  if (run.error) {
-    card.appendChild(el("p", "error", run.error));
-  }
+  if (run.error) card.appendChild(el("p", "error", run.error));
 
   const progress = progressLine(run);
   if (progress) card.appendChild(progress);
@@ -311,10 +348,18 @@ function runCard(run) {
       `Trained here only — HelloWorldAi was not reachable: ${run.remote_error}`));
   }
 
-  [datasetPanel(run), verificationPanel(run), evaluationPanel(run),
-   signalsPanel(run)]
-    .filter(Boolean)
-    .forEach((panel) => card.appendChild(panel));
+  const verdict = verdictLine(run);
+  if (verdict) card.appendChild(verdict);
+  if (run.verdict) card.appendChild(el("p", "run-reading", run.verdict));
+
+  const panels = [datasetPanel(run), verificationPanel(run), evaluationPanel(run),
+                  signalsPanel(run)].filter(Boolean);
+  if (panels.length) {
+    const fold = el("details", "fold");
+    fold.appendChild(el("summary", null, "The working"));
+    panels.forEach((panel) => fold.appendChild(panel));
+    card.appendChild(fold);
+  }
 
   return card;
 }

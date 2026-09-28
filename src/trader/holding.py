@@ -503,6 +503,70 @@ def _exit(holding: dict, cash: float, frames: dict) -> dict | None:
     return _append(entry)["exit"]
 
 
+def log(limit: int = 40) -> list:
+    """The record as sentences, newest first.
+
+    Every line in the ledger is already an event with a date on it, so the log
+    is not a separate thing to maintain -- it is the same record, read aloud.
+    A page that says "bought Investor B on the 28th because the model called it
+    up, sells on the 19th of December" is worth more than four panels of
+    statistics, and it cannot drift from the truth because it is the truth.
+    """
+    lines = []
+    for entry in _read():
+        if "plan" in entry:
+            plan = entry["plan"]
+            names = ", ".join(
+                f"{b['symbol']} ({float(b['probability_up']):.1%} up)"
+                for b in plan["buy"])
+            lines.append({
+                "when": plan["as_of"], "kind": "decided",
+                "text": f"Decided to buy {names}, from the close of "
+                        f"{plan['as_of']}. It fills at the next open.",
+            })
+        elif "fill" in entry:
+            fill = entry["fill"]
+            names = ", ".join(f"{b['symbol']} at {b['price']:g}"
+                              for b in fill["bought"])
+            lines.append({
+                "when": fill["session"], "kind": "bought",
+                "text": f"Bought {names}. {fill['fees']:.2f} in costs, "
+                        f"{fill['cash_after']:.2f} left in cash.",
+            })
+        elif "watch" in entry:
+            watch = entry["watch"]
+            reading = {"intact": "still holds", "drifting": "is weakening",
+                       "broken": "has broken"}.get(watch["status"], watch["status"])
+            lines.append({
+                "when": watch.get("session") or watch["at"][:10],
+                "kind": watch["status"],
+                "text": f"The case for {watch['symbol']} {reading}: "
+                        f"{watch['note']}."
+                        + (" Holding anyway -- a warning is free and a trade is not."
+                           if watch["status"] == "broken" else ""),
+            })
+        elif "renew" in entry:
+            renew = entry["renew"]
+            lines.append({
+                "when": renew["from_session"], "kind": "kept",
+                "text": f"Reviewed {renew['symbol']} and kept it -- still called "
+                        f"up at {float(renew['probability_up']):.1%}. Nothing "
+                        f"traded, nothing paid.",
+            })
+        elif "exit" in entry:
+            closed = entry["exit"]
+            names = ", ".join(
+                f"{s['symbol']} at {s['price']:g} ({s['gross_return']:+.1%})"
+                for s in closed["sold"])
+            lines.append({
+                "when": closed["session"], "kind": "sold",
+                "text": f"Sold {names}. {closed['profit']:+.2f} after costs, "
+                        f"{closed['cash_after']:.2f} in cash.",
+            })
+
+    return list(reversed(lines))[:limit]
+
+
 def account(frames: dict | None = None, *, today=None) -> dict:
     """What the page shows: the pick, the plan to sell, and what it has done."""
     current = state()
@@ -549,6 +613,7 @@ def account(frames: dict | None = None, *, today=None) -> dict:
         "waiting_to_buy": plan,
         "position": position,
         "closed": closed[-10:],
+        "log": log(),
         "schedule": ", ".join(sorted({
             broker_mod.resolve(schedule_for(p["symbol"])).name
             for p in ((holding or {}).get("bought")

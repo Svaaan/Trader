@@ -456,3 +456,38 @@ def test_the_warning_is_forgotten_when_the_position_is(store, panel):
                     run=ReasonedRun([reasoned(symbols[1], 0.95, {"rsi_14": 0.04})]))
     assert holding.state()["holding"] is None
     assert holding.state()["watch"] is None
+
+
+# --- the record, read aloud ----------------------------------------------------
+
+def test_the_log_says_what_it_did_in_order(store, panel):
+    symbols = sorted(panel)
+    dates = bought_on(store, panel, symbols[0], {"rsi_14": 0.03}, every=20)
+    holding.advance(panel, book={"rebalance_every": 20}, today=dates[-38],
+                    run=ReasonedRun([reasoned(symbols[0], 0.41, {"rsi_14": 0.03})]))
+    holding.advance(panel, book={"rebalance_every": 20}, today=dates[-19],
+                    run=ReasonedRun([reasoned(symbols[1], 0.95, {"rsi_14": 0.04})]))
+
+    entries = holding.log()
+    kinds = [e["kind"] for e in entries]
+    assert kinds == ["sold", "broken", "bought", "decided"], kinds
+
+    newest = entries[0]
+    assert newest["text"].startswith(f"Sold {symbols[0]} at")
+    assert "after costs" in newest["text"]
+    assert all(e["when"] for e in entries)
+
+
+def test_the_log_explains_a_warning_without_claiming_it_acted(store, panel):
+    symbols = sorted(panel)
+    dates = bought_on(store, panel, symbols[0], {"rsi_14": 0.03}, every=60)
+    holding.advance(panel, book={"rebalance_every": 60}, today=dates[-38],
+                    run=ReasonedRun([reasoned(symbols[0], 0.41, {"rsi_14": 0.03})]))
+
+    warning = [e for e in holding.log() if e["kind"] == "broken"][0]
+    assert "has broken" in warning["text"]
+    assert "Holding anyway" in warning["text"]
+
+
+def test_an_empty_record_logs_nothing(store):
+    assert holding.log() == []

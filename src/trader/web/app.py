@@ -289,6 +289,9 @@ def api_runs():
             "controls": r.controls,
             "walk_forward": r.walk_forward,
             "verdict": r.verdict,
+            # The gate, so the card can lead with the conclusion rather than
+            # with a grid of numbers the reader has to add up themselves.
+            "trust": r.trust,
             "signals": r.signals,
             "error": r.error,
             "has_model": r.has_model,

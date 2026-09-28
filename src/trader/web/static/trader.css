@@ -687,3 +687,124 @@ main {
 
 .table tr.is-ok td:first-child { color: var(--up); }
 .table tr.is-bad td:first-child { color: var(--down); }
+
+
+/* --- the decision, which is the point of the page ---------------------- */
+
+.decision {
+    padding: 1.75rem 1.5rem;
+    border: 1px solid var(--border-strong);
+    border-radius: 10px;
+    background: var(--surface);
+}
+
+.decision-label {
+    margin: 0;
+    font-size: 0.75rem;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-faint);
+}
+
+.decision-headline {
+    margin: 0.35rem 0 0.6rem;
+    font-size: 1.9rem;
+    font-family: var(--mono);
+    letter-spacing: -0.02em;
+}
+
+.decision-line { margin: 0 0 0.35rem; color: var(--text); }
+.decision-next { margin: 0 0 0.35rem; color: var(--accent); }
+.decision-soft { margin: 0.5rem 0 0; color: var(--warn); font-size: 0.875rem; }
+
+.decision-warn {
+    margin: 0.75rem 0 0;
+    padding: 0.6rem 0.75rem;
+    border-left: 2px solid var(--warn);
+    color: var(--warn);
+    font-size: 0.875rem;
+}
+
+.decision-rule {
+    margin: 1rem 0 0;
+    padding-top: 0.85rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.8125rem;
+    color: var(--text-faint);
+}
+
+/* --- the log ----------------------------------------------------------- */
+
+.log { margin: 0; padding: 0; list-style: none; }
+
+.log-line {
+    display: flex;
+    gap: 1rem;
+    padding: 0.6rem 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.875rem;
+}
+
+.log-line:last-child { border-bottom: none; }
+
+.log-when {
+    flex: 0 0 6.5rem;
+    font-family: var(--mono);
+    font-size: 0.8125rem;
+    color: var(--text-faint);
+}
+
+.log-text { color: var(--text-muted); }
+.log-line.is-bought .log-text, .log-line.is-sold .log-text { color: var(--text); }
+.log-line.is-broken .log-text { color: var(--warn); }
+.log-line.is-decided .log-text { color: var(--accent); }
+
+/* --- everything that is measurement rather than decision --------------- */
+
+.fold {
+    margin-top: 1.5rem;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--surface);
+    padding: 0 1.25rem;
+}
+
+.fold summary {
+    padding: 0.9rem 0;
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 0.875rem;
+}
+
+.fold[open] summary { border-bottom: 1px solid var(--border); margin-bottom: 1rem; }
+.fold > *:last-child { margin-bottom: 1.25rem; }
+
+
+/* --- a run, led by its conclusion -------------------------------------- */
+
+.run-verdict {
+    margin: 0.9rem 1.25rem 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.4rem;
+    font-size: 0.95rem;
+}
+
+.run-numbers {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 0.75rem;
+    color: var(--text-faint);
+}
+
+.run-reading {
+    margin: 0.35rem 1.25rem 0;
+    font-size: 0.875rem;
+    color: var(--text-muted);
+}
+
+.run .fold {
+    margin: 1rem 1.25rem 1.25rem;
+    background: var(--surface-2);
+}
