@@ -174,6 +174,53 @@ P&L page will then show you the consequences of.
 The ledger records even while the gate is shut, marked `shadow`. A forward
 record of a model with no edge is exactly how you learn it still has none.
 
+### The overnight drift: real, unconditional, and smaller than the spread
+
+If the edge sits in the gap, the obvious question is whether to trade the gap —
+buy at the close, sell at the open. The pattern is real and it is in this data.
+Ten years, 238 names, every session, standard errors clustered by session:
+
+| leg | per row | t | annualised |
+|---|---|---|---|
+| overnight, close(t) → open(t+1) | **+4.5 bp** | **+3.77** | **+11.9%** |
+| intraday, open(t) → close(t) | +1.6 bp | +1.33 | +4.1% |
+| the whole day | +6.0 bp | +3.34 | +16.4% |
+
+About three quarters of what a holder earns arrives while the market is shut.
+It is uneven across names — 71% of symbols have a positive average night, and
+the extremes are wide: AVGO +30 bp a night (t +2.68), RTX +16 bp (t +3.40),
+against ADBE −17 bp and ACN −17 bp (t ≈ −2.3). `labels.overnight_return` and
+`labels.intraday_return` are in the codebase so this can be re-measured rather
+than believed.
+
+Three things stop it being a strategy here.
+
+**It is unconditional, so the model is not needed** — and worse, the model
+subtracts. Over the test period, holding every name every night earned +8.9% a
+year gross. The same nights filtered by the model's direction earned +3.6%
+(t 1.03), and its confident long calls earned **−34.8%** (t −0.47). Taking the
+position a session later, so nothing trades at a price the signal used, gives
++6.0% for the full book; the confident long slice reads +105.8% a year on 1,185
+rows with a **t of 1.31**, which is the same small-slice mirage the search has
+now produced twice.
+
+**A night is a full round trip.** The drift is 4.5 bp. The bid-ask spread this
+project charges — 5 bp a side, 10 bp there and back — is more than twice it,
+before any commission. At Avanza Mini on Stockholm the commission alone is 50 bp
+a round trip, eleven times the gap.
+
+**Commission-free is not cost-free.** The Stockholm names are the one place a
+€500 account pays no commission (Avanza Start), and their gap is the same size
+as everyone else's: +4.6 bp a night, t +3.21, +12.3% a year gross. But Start
+allows 500 free trades in twelve months, which a 12-name book turning over
+nightly spends in **20 sessions**, and the spread is still there underneath.
+
+What would actually settle it is intraday data this project does not have. The
+pattern you see described — flat or down through the session, with the move
+arriving around the open — is about the first thirty to sixty minutes, and
+daily bars carry one open and one close. Minute bars for a handful of names
+would answer it; nothing in the current pipeline can.
+
 ### What a trade actually costs at Nordnet or Avanza
 
 Five basis points a side is spread and slippage. It is not commission, and a
@@ -769,6 +816,54 @@ only the money hurdle speaks for a one-sided book.
 
 ---
 
+## The first thing that beat doing nothing
+
+Every strategy here died of turnover rather than of signal, so the obvious test
+was the one nobody had run: keep the same model and stop trading it so often.
+Scored in money at a 500 account with Avanza's real commission — `book.py`
+simulates the account forward, and a book that runs out of money stops.
+
+The benchmark is deliberately dumb. Buying names at random and holding to the
+end returns **+11.7% a year** for under 17 of fees, and every daily strategy
+loses to it: the model's top five rebalanced every session pays **504 of
+commission on a 500 account and ends at zero.**
+
+Because a book of five names rebalanced eight times is eight decisions, each
+trial is also run against 200 random books with the identical trade pattern,
+count and cost. That permutation percentile — not the Sharpe — is what judges a
+concentrated book. Trials 27 to 32, pre-registered, on validation:
+
+| book | final | trades | fees | beat random | buy & hold | verdict |
+|---|---|---|---|---|---|---|
+| top 1, every 20 | $613 | 30 | $99 | 78% | $602 | no |
+| top 1, every 60 | **$919** | 12 | $51 | 94% | $602 | no — under the 95% bar |
+| top 3, every 20 | $661 | 90 | $143 | 98% | $634 | qualifies |
+| top 3, every 60 | $724 | 36 | $58 | 91% | $634 | no |
+| top 5, every 20 | $611 | 152 | $200 | **100%** | $654 | no — lost to doing nothing |
+| **top 5, every 60** | **$772** | 54 | $73 | **99%** | $654 | **committed** |
+
+Two rows matter more than the winner. **Top 5 every 20 beat 100% of matched
+random books and still lost to doing nothing**, because rotating that often
+burns 200 of a 500 account in fees — picking well and trading too much is worse
+than not picking at all. And **top 1 every 60 made the most money and was
+rejected** at 94% against a 95% bar, which is the rule working rather than the
+biggest number being chosen afterwards.
+
+The committed book was checked for the obvious failure: on the sealed period it
+made +89.3% before costs over eight rebalances, and **removing its single best
+holding (AMD, +63.9%) still leaves +71.8%**, with seven of eight periods
+positive across mixed sectors and countries. It replicated on validation, which
+the model never trained on, at the 99th percentile.
+
+**The seal stays shut for it.** The low-turnover idea was found by looking at
+the sealed period, so opening it would be a search rather than a test. The next
+honest test is forward paper trading at 500 — where the ledger is already
+running and cannot be mined. Fourteen decisions is not a track record, the
+percentile holds cost and trade count constant but not risk, and the test
+period was a rising market.
+
+---
+
 ## Searching without spending the test set
 
 A model trains in seconds now, so trying three hundred configurations is an
@@ -928,6 +1023,8 @@ prices.py     daily OHLCV, split-adjusted, cached -- checked against the period
    |          asked for, and not re-asked of a provider that just answered
 broker.py     what Nordnet and Avanza charge: percentage or minimum, plus
    |          currency -- and what that does to a book of small positions
+book.py       a book walked forward in money, and the percentile against the
+   |          same trade pattern picked at random
 auto.py       the scheduler: collect, settle, and train when a session closes
 features.py   18 per-symbol indicators, every one computable at that close
 cross.py      9 -- where this name sits among its peers, lagged one session
@@ -1040,7 +1137,7 @@ times the old default, which is a real request of somebody else's GPU.
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-272 tests. The look-ahead ones test the property rather than the implementation
+279 tests. The look-ahead ones test the property rather than the implementation
 — features computed on a truncated history must match the full one — and there
 is a test that deliberately introduces a centred rolling window to confirm the
 property test can still fail. The macro, cross-sectional and event blocks each

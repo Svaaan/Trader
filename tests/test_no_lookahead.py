@@ -431,3 +431,31 @@ def test_a_weekend_does_not_count_as_stale(prices):
 
     friday = prices.index[-1].date()
     assert prices_mod._is_current(prices, today=friday + dt.timedelta(days=3))
+
+
+# --- the two legs of a day ----------------------------------------------------
+
+def test_a_day_is_exactly_its_two_legs(prices):
+    """Compounding the gap and the session has to give the close-to-close move,
+    or one of the three is measuring something else."""
+    overnight = labels.overnight_return(prices)
+    intraday = labels.intraday_return(prices).shift(-1)
+    whole = labels.forward_return(prices, horizon=1)
+
+    combined = (1 + overnight) * (1 + intraday) - 1
+    pair = pd.concat([combined, whole], axis=1).dropna()
+    assert len(pair) > 900
+    np.testing.assert_allclose(pair.iloc[:, 0], pair.iloc[:, 1], atol=1e-12)
+
+
+def test_the_gap_only_ever_looks_forward(prices):
+    """It is priced from tomorrow's open, so truncating history must not move
+    any row that survives."""
+    full = labels.overnight_return(prices)
+    truncated = labels.overnight_return(prices.iloc[:900])
+
+    shared = truncated.dropna().index
+    np.testing.assert_allclose(full.reindex(shared).to_numpy(),
+                               truncated.reindex(shared).to_numpy(), atol=1e-12)
+    # And the last row cannot be known: there is no next open yet.
+    assert np.isnan(full.iloc[-1])

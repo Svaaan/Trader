@@ -149,6 +149,10 @@ def do_run(args) -> int:
         book_axes["min_probability"] = _numbers(args.min_probability, float)
     if args.top_n:
         book_axes["top_n"] = _numbers(args.top_n)
+    if args.rebalance_every:
+        book_axes["rebalance_every"] = _numbers(args.rebalance_every)
+    if args.account:
+        book_axes["account"] = _numbers(args.account, float)
 
     if not options and not book_axes:
         print("Nothing to vary. Give at least one of --macro, --cross, "
@@ -259,10 +263,11 @@ def do_open(args) -> int:
         return 1
 
     spec = dataset.Spec.from_dict(committed["spec"])
-    prepared = dataset.prepare(_load(args.universe), spec)
+    frames = _load(args.universe)
+    prepared = dataset.prepare(frames, spec)
     cut = search_mod.three_way_cut(prepared, test_fraction=spec.test_fraction)
 
-    out = search_mod.open_test_set(prepared, cut)
+    out = search_mod.open_test_set(prepared, cut, frames=frames)
     scores = out["scores"]
 
     print(f"\nSealed period from {cut.test_start.date()}: "
@@ -301,6 +306,11 @@ def main() -> int:
                      help="only rows it is this sure about, e.g. 0.55,0.58")
     run.add_argument("--top-n", dest="top_n",
                      help="hold this many per session, e.g. 5,10")
+    run.add_argument("--rebalance-every", dest="rebalance_every",
+                     help="sessions between rebalances, e.g. 20,60 (default 1)")
+    run.add_argument("--account", dest="account",
+                     help="score in money at this account size, e.g. 500 -- "
+                          "turns on real commission, with its minimum")
     run.add_argument("--note", help="what you were trying, kept in the ledger")
     run.set_defaults(func=do_run)
 

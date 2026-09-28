@@ -103,7 +103,8 @@ def test_a_trial_never_records_a_test_score(sealed, offline_spec):
     assert set(entry["validation"]) <= {
         "accuracy", "baseline", "edge", "executable_sharpe",
         "executable_tstat", "rows", "effective_rows", "edge_standard_error",
-        "edge_comparable", "days"}
+        "edge_comparable", "days", "final_equity", "fees", "trades",
+        "rebalances", "random_percentile", "random_median", "hold_median"}
     assert "test" not in json.dumps(entry).lower().replace("test_fraction", "")
 
 
@@ -338,7 +339,8 @@ def test_the_seal_scores_the_book_that_was_committed(sealed, prepared,
     opening = search.open_test_set(prepared, search.three_way_cut(prepared))
     assert opening["scores"]["book"]["long_only"] is True
     assert opening["scores"]["up_rate"] == 1.0
-    assert search.seal_state()["committed"]["book"] == book
+    assert search.seal_state()["committed"]["book"] == {**search.DEFAULT_BOOK,
+                                                        **book}
 
 
 def test_a_search_over_books_runs_one_trial_each(sealed, offline_spec):
@@ -364,3 +366,96 @@ def test_a_one_sided_book_has_no_edge_to_compare(prepared):
     assert long_only["edge_comparable"] is False
     assert long_only["edge"] == 0.0
     assert both["edge_comparable"] is True
+
+
+# --- a book scored in money ----------------------------------------------------
+#
+# A minimum fee is not a percentage: the same strategy is free at one account
+# size and fatal at another. Measured on the real panel, the model's top five
+# rebalanced every session paid 504 of commission on a 500 account and ended at
+# zero; the same five every sixty sessions paid 92 and ended at 792.
+
+def money_panel(sessions=120, names=8, seed=3):
+    rng = np.random.default_rng(seed)
+    dates = pd.bdate_range("2024-01-01", periods=sessions)
+    columns = [f"S{i}" for i in range(names)]
+    return pd.DataFrame(rng.normal(0.0005, 0.01, size=(sessions, names)),
+                        index=dates, columns=columns)
+
+
+def test_carrying_a_position_costs_nothing_and_trading_it_costs_real_money():
+    from trader import book
+
+    moves = money_panel()
+    held = [{"S0": 1.0} for _ in range(len(moves))]
+    churned = [{"S0" if i % 2 else "S1": 1.0} for i in range(len(moves))]
+
+    quiet = book.simulate(held, moves, account=500.0)
+    busy = book.simulate(churned, moves, account=500.0)
+
+    assert quiet["trades"] == 2                      # in at the start, out at the end
+    assert busy["trades"] > 100
+    assert busy["fees"] > 20 * quiet["fees"]
+
+
+def test_an_account_that_runs_out_of_money_stops():
+    from trader import book
+
+    moves = money_panel(sessions=400)
+    # Twenty names rebalanced every session on a tiny account: the minimum fee
+    # alone is more than the account holds.
+    churn = []
+    for index in range(len(moves)):
+        picked = list(moves.columns[(index % 2)::2])
+        churn.append({name: 1.0 / len(picked) for name in picked})
+
+    out = book.simulate(churn, moves, account=50.0)
+    assert out["broke"] is True
+    assert out["final"] == 0.0
+
+
+def test_the_rebalance_interval_decides_how_often_it_trades():
+    from trader import book
+
+    moves = money_panel(sessions=120)
+    signal = pd.DataFrame([
+        {"date": date, "symbol": name, "p": 0.5 + (index % 7) / 20}
+        for index, date in enumerate(moves.index) for name in moves.columns])
+
+    daily = book.targets(signal, list(moves.index), top=2, every=1)
+    monthly = book.targets(signal, list(moves.index), top=2, every=20)
+
+    assert len(monthly) == len(daily) == len(moves)
+    # Between rebalances the book is simply held.
+    assert monthly[5] == monthly[1]
+    assert (book.simulate(monthly, moves)["trades"]
+            < book.simulate(daily, moves)["trades"])
+
+
+def test_the_percentile_is_measured_against_the_same_trade_pattern():
+    from trader import book
+
+    moves = money_panel()
+    against = book.percentile(1e9, moves, top=3, every=20, draws=25, seed=1)
+    assert against["beaten"] == 1.0
+    assert against["draws"] == 25
+    assert against["worst_tenth"] <= against["median"] <= against["best_tenth"]
+
+    hopeless = book.percentile(0.0, moves, top=3, every=20, draws=25, seed=1)
+    assert hopeless["beaten"] == 0.0
+
+
+def test_a_money_trial_records_what_the_account_did(sealed, offline_spec):
+    panel = synthetic_panel()
+    out = search.run_search(panel, [{}], base=offline_spec,
+                            books=[{"long_only": True, "top_n": 2,
+                                    "rebalance_every": 20, "account": 500.0}])
+
+    assert out["ran"] == 1
+    recorded = search.read_trials()[0]["validation"]
+    assert recorded["final_equity"] is not None
+    assert recorded["trades"] > 0
+    assert 0.0 <= recorded["random_percentile"] <= 1.0
+    assert recorded["hold_median"] is not None
+    # An account cannot be scored on an accuracy it never had a baseline for.
+    assert recorded["edge_comparable"] is False

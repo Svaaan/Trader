@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 
 from . import baseline as baseline_mod
+from . import book as book_mod
 from . import dataset as dataset_mod
 from . import evaluate as evaluate_mod
 from . import labels as labels_mod
@@ -74,7 +75,8 @@ VALIDATION_FRACTION = 0.2
 # short. `min_probability` keeps only rows the model is at least that sure
 # about (and their mirror on the short side unless `long_only`); `top_n` keeps
 # that many per session, by confidence.
-DEFAULT_BOOK = {"min_probability": 0.5, "long_only": False, "top_n": None}
+DEFAULT_BOOK = {"min_probability": 0.5, "long_only": False, "top_n": None,
+                "rebalance_every": 1, "account": None}
 
 # Below this many rows a book is not a strategy, it is a handful of days.
 MIN_BOOK_ROWS = 100
@@ -170,7 +172,81 @@ def _describe_book(book: dict | None) -> str:
         parts.append(f"p>={book['min_probability']:g}")
     if book.get("top_n"):
         parts.append(f"top {book['top_n']}")
+    if (book.get("rebalance_every") or 1) > 1:
+        parts.append(f"every {book['rebalance_every']}")
+    if book.get("account"):
+        parts.append(f"{book['account']:g} account")
     return ", ".join(parts) or "every row, long and short"
+
+
+def _score_in_money(prepared, cut: Cut, spec, *, period: str, book: dict,
+                    fitted: tuple, frames: dict) -> dict:
+    """Score a book the way an account experiences it: dollars and real fees.
+
+    Used when the book names an account size, because then the cost of a trade
+    stops being a percentage. Everything else about a trial stays the same --
+    it is the same fitted model, the same rows, the same period.
+    """
+    test, probabilities, train_up_share = fitted
+    start = cut.validation_start if period == "validation" else cut.test_start
+    stop = cut.test_start if period == "validation" else None
+
+    closes = pd.DataFrame({s: f["close"] for s, f in frames.items()}).sort_index()
+    closes = closes.loc[closes.index >= start]
+    if stop is not None:
+        closes = closes.loc[closes.index < stop]
+    closes = closes.dropna(axis=1, how="all")
+    if len(closes) < 40:
+        raise ValueError(f"only {len(closes)} sessions on the {period} period")
+
+    moves = closes.pct_change(fill_method=None).fillna(0.0)
+    sessions = list(closes.index)
+
+    signal = pd.DataFrame({"date": test.dates, "symbol": test.symbols,
+                           "p": np.asarray(probabilities).ravel()})
+    top = int(book.get("top_n") or 5)
+    every = max(int(book.get("rebalance_every") or 1), 1)
+    account = float(book.get("account") or book_mod.DEFAULT_ACCOUNT)
+
+    books = book_mod.targets(signal, sessions, top=top,
+                             long_only=bool(book.get("long_only")), every=every)
+    run = book_mod.simulate(books, moves, account=account)
+    against = book_mod.percentile(run["final"], moves, top=top, every=every,
+                                  account=account, seed=len(sessions))
+    holding = book_mod.buy_and_hold(moves, count=top, account=account,
+                                    seed=len(sessions))
+
+    held_rows = sum(len(day) for day in books)
+    series = run["returns"]
+    years = len(sessions) / 252.0
+
+    return {
+        "rows": held_rows,
+        "days": len(sessions),
+        "effective_rows": len(sessions),      # a book decides once a session
+        "accuracy": None,
+        "baseline_accuracy": None,
+        "edge": 0.0,
+        "edge_standard_error": None,
+        # A book that only ever goes long has nothing to compare an accuracy
+        # against; what it has instead is the money and the percentile.
+        "edge_comparable": False,
+        "executable_sharpe": round(evaluate_mod._sharpe(series, 1), 3),
+        "executable_tstat": round(evaluate_mod._tstat(series, 1), 3),
+        "executable_annualised": round(
+            (max(run["final"], 0.0) / account) ** (1 / years) - 1, 4)
+        if years > 0 else 0.0,
+        "final_equity": round(run["final"], 2),
+        "fees": round(run["fees"], 2),
+        "trades": run["trades"],
+        "rebalances": len(sessions) // every,
+        "broke": run["broke"],
+        "random_percentile": round(against["beaten"], 3),
+        "random_median": against["median"],
+        "hold_median": holding["median"],
+        "book": {**DEFAULT_BOOK, **book},
+        "book_rows": held_rows,
+    }
 
 
 def _fit_for(prepared, cut: Cut, spec, *, period: str, seed: int = 0) -> tuple:
@@ -198,15 +274,23 @@ def _fit_for(prepared, cut: Cut, spec, *, period: str, seed: int = 0) -> tuple:
 
 def _score_on(prepared, cut: Cut, spec, *, period: str,
               seed: int = 0, book: dict | None = None,
-              fitted: tuple | None = None) -> dict:
+              fitted: tuple | None = None, frames: dict | None = None) -> dict:
     """Fit on the training period and score on validation or test.
 
     The model never sees rows at or after whichever boundary it is being scored
     against, which is the only thing that makes either number mean anything.
     """
-    test, probabilities, train_up_share = (
-        fitted or _fit_for(prepared, cut, spec, period=period, seed=seed))
+    fitted = fitted or _fit_for(prepared, cut, spec, period=period, seed=seed)
 
+    settings = {**DEFAULT_BOOK, **(book or {})}
+    if settings.get("account"):
+        if not frames:
+            raise ValueError(
+                "scoring a book in money needs the price frames it holds")
+        return _score_in_money(prepared, cut, spec, period=period,
+                               book=settings, fitted=fitted, frames=frames)
+
+    test, probabilities, train_up_share = fitted
     dates, symbols = test.dates, test.symbols
     y, returns, reachable = test.y, test.returns, test.executable
 
@@ -278,6 +362,15 @@ def record_trial(spec, scores: dict, *, note: str = "",
             "edge_standard_error": scores.get("edge_standard_error"),
             # False when the book is one-sided: see _score_on.
             "edge_comparable": scores.get("edge_comparable", True),
+            # Only for books scored in money -- see book.py. The percentile is
+            # what a concentrated book is actually judged on.
+            "final_equity": scores.get("final_equity"),
+            "fees": scores.get("fees"),
+            "trades": scores.get("trades"),
+            "rebalances": scores.get("rebalances"),
+            "random_percentile": scores.get("random_percentile"),
+            "random_median": scores.get("random_median"),
+            "hold_median": scores.get("hold_median"),
             "days": scores.get("days"),
         },
     }
@@ -428,7 +521,8 @@ def commit(spec, *, why: str, book: dict | None = None) -> dict:
     return state["committed"]
 
 
-def open_test_set(prepared, cut: Cut, *, seed: int = 0) -> dict:
+def open_test_set(prepared, cut: Cut, *, seed: int = 0,
+                  frames: dict | None = None) -> dict:
     """Score the committed configuration on the sealed period. Once.
 
     Refuses without a commit, and records every opening. A second opening is
@@ -446,7 +540,7 @@ def open_test_set(prepared, cut: Cut, *, seed: int = 0) -> dict:
 
     spec = dataset_mod.Spec.from_dict(committed["spec"])
     scores = _score_on(prepared, cut, spec, period="test", seed=seed,
-                       book=committed.get("book"))
+                       book=committed.get("book"), frames=frames)
 
     trials = committed.get("after_trials", 0)
     correction = corrected_threshold(
@@ -576,7 +670,7 @@ def run_search(frames: dict, combinations: list, *, base: dataset_mod.Spec | Non
                 try:
                     scores = _score_on(prepared, cut, trial_spec,
                                        period="validation", seed=seed, book=book,
-                                       fitted=fitted)
+                                       fitted=fitted, frames=frames)
                 except Exception as exc:                # noqa: BLE001
                     logger.warning("Trial failed (%s, %s): %s", override,
                                    _describe_book(book), exc)
@@ -584,14 +678,25 @@ def run_search(frames: dict, combinations: list, *, base: dataset_mod.Spec | Non
 
                 entry = record_trial(trial_spec, scores, note=note, book=book)
                 results.append(entry)
-                logger.info(
-                    "Trial %d: %d rows, edge %+.4f, executable sharpe %+.2f "
-                    "t %+.2f  %s | %s",
-                    entry["trial"], scores.get("book_rows") or scores.get("rows"),
-                    scores.get("edge") or 0.0,
-                    scores.get("executable_sharpe") or 0.0,
-                    scores.get("executable_tstat") or 0.0,
-                    override, _describe_book(book))
+                if scores.get("final_equity") is not None:
+                    logger.info(
+                        "Trial %d: %s -> %.2f from %g, %d trades, %.2f fees, "
+                        "beat %.0f%% of random books (median %.2f)",
+                        entry["trial"], _describe_book(book),
+                        scores["final_equity"],
+                        (scores["book"] or {}).get("account") or 0.0,
+                        scores["trades"], scores["fees"],
+                        100 * (scores.get("random_percentile") or 0.0),
+                        scores.get("random_median") or 0.0)
+                else:
+                    logger.info(
+                        "Trial %d: %d rows, edge %+.4f, executable sharpe %+.2f "
+                        "t %+.2f  %s | %s",
+                        entry["trial"], scores.get("book_rows") or scores.get("rows"),
+                        scores.get("edge") or 0.0,
+                        scores.get("executable_sharpe") or 0.0,
+                        scores.get("executable_tstat") or 0.0,
+                        override, _describe_book(book))
 
     return {
         "ran": len(results),

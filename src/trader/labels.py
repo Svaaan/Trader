@@ -145,6 +145,34 @@ def forward_return_panel(frames: dict, *, horizon: int = 1) -> pd.DataFrame:
     }).sort_index()
 
 
+def overnight_return(prices: pd.DataFrame) -> pd.Series:
+    """close(t) -> open(t+1): the gap, on its own.
+
+    The third leg implied by the other two, and the one that turns out to carry
+    the move. Measured on this panel over ten years, every name, every session:
+
+        overnight  close(t) -> open(t+1)   +4.5 bp a night, clustered t +3.77
+        intraday   open(t)  -> close(t)    +1.6 bp a session, t +1.33
+
+    So roughly three quarters of what a holder earns arrives while the market
+    is shut, which is a documented property of equities and not a discovery
+    here. It is also not a strategy: capturing it means a round trip every
+    night, and the bid-ask spread this project charges (5 bp a side, 10 bp
+    there and back) is more than twice the gap itself. The model makes it
+    worse rather than better -- holding every name every night earned +8.9% a
+    year gross over the test period, and the same nights filtered by the
+    model's direction earned +3.6%.
+
+    Here so the claim can be re-measured rather than believed.
+    """
+    return prices["open"].shift(-1) / prices["close"] - 1.0
+
+
+def intraday_return(prices: pd.DataFrame) -> pd.Series:
+    """open(t) -> close(t): the session itself, the other half of the day."""
+    return prices["close"] / prices["open"] - 1.0
+
+
 def executable_return_panel(frames: dict, *, horizon: int = 1) -> pd.DataFrame:
     """The same, for the window that could actually be held."""
     return pd.DataFrame({
