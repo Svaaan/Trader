@@ -171,16 +171,21 @@ def test_a_missing_price_is_dropped_rather_than_counted_flat(ledger, panel):
     every other position toward nothing."""
     symbols = sorted(panel)
     as_of = panel[symbols[0]].index[-10]
+    # The one that goes missing sits at a coin flip, so it carries almost none
+    # of the book and the rest is still nearly all of it. When most of the book
+    # is the part that is missing, the day is left pending instead -- no
+    # position can exceed a quarter of the account, so three of six names can
+    # never be 80% of it. See MIN_SETTLED_WEIGHT and the test below.
     paper.record_intent(FakeRun(as_of.date().isoformat(),
-                                [0.9, 0.1, 0.6, 0.4, 0.55, 0.45], symbols))
+                                [0.97, 0.03, 0.95, 0.05, 0.9, 0.52], symbols))
 
-    partial = {s: panel[s] for s in symbols[:3]}
+    partial = {s: panel[s] for s in symbols[:5]}
     paper.settle(partial)
 
     settlement = [e["settlement"] for e in paper._read_ledger()
                   if "settlement" in e][0]
-    assert settlement["positions"] == 3
-    assert set(settlement["missing"]) == set(symbols[3:])
+    assert settlement["positions"] == 5
+    assert set(settlement["missing"]) == set(symbols[5:])
 
 
 # --- sizing -----------------------------------------------------------------
@@ -288,3 +293,218 @@ def test_divergence_is_quiet_when_they_agree():
                            {"executable_sharpe": -2.5})
     assert not out["diverged"]
     assert "within what a record this short can tell apart" in out["note"]
+
+
+# --- the ledger keeps two kinds of line, and both have to be read as such ------
+#
+# `settle` writes outcomes as new lines beside the intents rather than editing
+# history, which is right -- but it left every reader walking a list of two
+# different shapes. Found by the scheduler in auto.py on its first real cycle:
+# it settled a position, which appended the first settlement line, and every
+# write to the ledger from that moment on raised KeyError('as_of').
+
+def test_an_intent_can_still_be_recorded_once_a_settlement_exists(ledger, panel):
+    """Otherwise the forward record stops growing the day it first pays out,
+    and the only sign is a warning in a log nobody is reading."""
+    symbols = sorted(panel)
+    dates = list(panel[symbols[0]].index)
+
+    paper.record_intent(FakeRun(dates[-10].date().isoformat(),
+                                [0.9, 0.1, 0.6, 0.4, 0.55, 0.45], symbols))
+    assert paper.settle(panel)["settled"] == 1
+
+    written = paper.record_intent(FakeRun(dates[-5].date().isoformat(),
+                                          [0.4, 0.6, 0.45, 0.55, 0.48, 0.52],
+                                          symbols))
+    assert written is not None
+    assert written["as_of"] == dates[-5].date().isoformat()
+
+
+def test_settling_again_does_not_settle_the_same_day_twice(ledger, panel):
+    """A scheduler settles every half hour. Re-marking a day that already has
+    an outcome would append a second settlement and count the same return
+    twice in the P&L."""
+    symbols = sorted(panel)
+    as_of = panel[symbols[0]].index[-10]
+    paper.record_intent(FakeRun(as_of.date().isoformat(),
+                                [0.9, 0.1, 0.6, 0.4, 0.55, 0.45], symbols))
+
+    first = paper.settle(panel)
+    assert first["settled"] == 1
+
+    again = paper.settle(panel)
+    assert again["settled"] == 0
+    assert again["pending"] == 0
+
+    settlements = [e for e in paper._read_ledger() if "settlement" in e]
+    assert len(settlements) == 1
+    assert paper.account()["days"] == 1
+
+
+# --- settling the right book, with the right prices ---------------------------
+#
+# Found by reading the real ledger: an intent over 238 names was settled against
+# ten of them, because `settle_paper` loaded prices for the watchlist it was
+# handed rather than for the symbols in the ledger. The ten carried 3.2% of the
+# book, were renormalised to 100%, and became the P&L page's only day.
+
+def test_a_book_that_is_mostly_unpriced_is_left_pending_not_rescaled(ledger, panel):
+    symbols = sorted(panel)
+    as_of = panel[symbols[0]].index[-10]
+    paper.record_intent(FakeRun(as_of.date().isoformat(),
+                                [0.95, 0.05, 0.9, 0.1, 0.85, 0.15], symbols))
+
+    out = paper.settle({symbols[0]: panel[symbols[0]]})
+
+    assert out["settled"] == 0
+    assert out["pending"] == 1
+    assert not [e for e in paper._read_ledger() if "settlement" in e]
+    assert paper.account()["days"] == 0
+
+
+# --- correcting the record without editing it ---------------------------------
+
+def test_a_voided_intent_is_ignored_by_everything(ledger, panel):
+    """A test fixture once wrote six synthetic symbols into the real ledger.
+    They can never price, so they sat in `pending` for ever."""
+    symbols = sorted(panel)
+    as_of = panel[symbols[0]].index[-10].date().isoformat()
+    paper.record_intent(FakeRun(as_of, [0.9, 0.1, 0.6, 0.4, 0.55, 0.45], symbols))
+
+    paper.void(as_of, reason="written by a test", kind="intent")
+
+    assert paper.settle(panel)["pending"] == 0
+    assert paper.account()["pending"] == 0
+    assert paper.account()["days"] == 0
+
+
+def test_a_voided_settlement_is_dropped_and_can_be_settled_again(ledger, panel):
+    """The correction path for the real one: a day settled against the wrong
+    prices is voided, and the next pass fills it properly."""
+    symbols = sorted(panel)
+    as_of = panel[symbols[0]].index[-10].date().isoformat()
+    paper.record_intent(FakeRun(as_of, [0.97, 0.03, 0.95, 0.52, 0.48, 0.53],
+                                symbols))
+    paper.settle({s: panel[s] for s in symbols[:3]})
+    wrong = paper.account()["return"]
+
+    paper.void(as_of, reason="settled against three of six names",
+               kind="settlement")
+    assert paper.account()["days"] == 0
+
+    assert paper.settle(panel)["settled"] == 1
+    state = paper.account()
+    assert state["days"] == 1
+    assert state["return"] != wrong
+
+    settlement = [e["settlement"] for e in paper._read_ledger()
+                  if "settlement" in e][-1]
+    assert settlement["positions"] == 6
+
+
+def test_the_void_is_appended_like_everything_else(ledger, panel):
+    symbols = sorted(panel)
+    as_of = panel[symbols[0]].index[-10].date().isoformat()
+    paper.record_intent(FakeRun(as_of, [0.9, 0.1, 0.6, 0.4, 0.55, 0.45], symbols))
+
+    path, _ = paper._paths()
+    before = open(path, encoding="utf-8").read()
+    paper.void(as_of, reason="testing", kind="intent")
+    after = open(path, encoding="utf-8").read()
+
+    assert after.startswith(before)
+    assert json.loads(after.splitlines()[-1])["void"]["reason"] == "testing"
+
+
+def test_the_symbols_to_price_come_from_the_ledger(ledger, panel):
+    """What `settle_paper` needs to ask the price feed for is not a watchlist:
+    it is whatever the unsettled entries actually hold."""
+    symbols = sorted(panel)
+    as_of = panel[symbols[0]].index[-10].date().isoformat()
+    paper.record_intent(FakeRun(as_of, [0.9, 0.1, 0.6, 0.4, 0.55, 0.45], symbols))
+
+    assert paper.pending_symbols() == set(symbols)
+
+    paper.settle(panel)
+    assert paper.pending_symbols() == set()
+
+
+def test_a_name_at_an_exact_coin_flip_is_not_in_the_book(panel):
+    """Its weight rounds to zero, so it is not held -- but it was still being
+    written as a position and counted in the hit rate."""
+    symbols = sorted(panel)
+    signals = [{"symbol": s, "probability_up": p, "confidence": abs(p - 0.5) * 2}
+               for s, p in zip(symbols, [0.7, 0.3, 0.6, 0.4, 0.55, 0.5])]
+
+    positions = paper.size_positions(signals)
+
+    assert symbols[5] not in {p.symbol for p in positions}
+    assert len(positions) == 5
+    assert sum(p.weight for p in positions) == pytest.approx(1.0)
+
+
+# --- what a real broker takes --------------------------------------------------
+#
+# The ledger charges five basis points a side, which is spread and slippage and
+# not commission. Avanza and Nordnet charge a percentage or a minimum, whichever
+# is larger, and on a book of 238 names in a 500 account -- a position of about
+# two -- the minimum is the entire cost.
+
+def test_the_minimum_decides_the_bill_on_a_small_position():
+    from trader import broker
+
+    tiny = broker.describe(2.10, "avanza_mini_us")
+    assert tiny["minimum_binds"]
+    # A dollar each way plus currency, against a position of 2.10.
+    assert tiny["round_trip_fraction"] > 0.9
+
+    large = broker.describe(5000.0, "avanza_mini_us")
+    assert not large["minimum_binds"]
+    assert large["round_trip_fraction"] == pytest.approx(2 * (0.0025 + 0.0025),
+                                                         rel=1e-6)
+
+
+def test_the_break_even_is_where_the_percentage_overtakes_the_minimum():
+    from trader import broker
+
+    where = broker.break_even_value("avanza_mini_us")
+    assert where == pytest.approx(1.0 / 0.0025)
+    assert broker.per_side(where, "avanza_mini_us") == pytest.approx(
+        where * 0.0025 + where * 0.0025)
+
+
+def test_a_free_schedule_still_charges_its_currency_markup():
+    from trader import broker
+
+    assert broker.per_side(1000.0, "avanza_start_se") == 0.0
+    assert broker.per_side(1000.0, "nordnet_mini_nordic") == pytest.approx(2.5)
+
+
+def test_an_unknown_schedule_is_refused_by_name():
+    from trader import broker
+
+    with pytest.raises(ValueError, match="unknown schedule"):
+        broker.resolve("my_mates_broker")
+
+
+def test_the_account_prices_itself_against_real_schedules(ledger, panel):
+    symbols = sorted(panel)
+    as_of = panel[symbols[0]].index[-10]
+    paper.record_intent(FakeRun(as_of.date().isoformat(),
+                                [0.9, 0.1, 0.6, 0.4, 0.55, 0.45], symbols))
+    paper.settle(panel)
+
+    state = paper.account()
+    named = {b["schedule"]: b for b in state["brokers"]}
+    assert len(state["brokers"]) == len(paper.DEFAULT_BROKERS)
+
+    spread = [b for b in state["brokers"] if "spread" in b["schedule"]][0]
+    avanza = [b for b in state["brokers"] if "Avanza" in b["schedule"]][0]
+
+    assert avanza["trades"] == 6
+    assert avanza["commission_paid"] > spread["commission_paid"]
+    # Six positions of about 83 each, a dollar minimum a side: the minimum
+    # binds and the bill is far more than the spread-only figure.
+    assert avanza["profit"] < spread["profit"]
+    assert avanza["source"].startswith("avanza.se")
+    assert named[avanza["schedule"]]["break_even_value"] == pytest.approx(400.0)

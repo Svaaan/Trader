@@ -22,8 +22,11 @@
                 {{ coordinator_detail }}
             </span>
             <button type="button" class="btn" id="startRun">Train a new model</button>
+            <button type="button" class="btn" id="autoTrain" data-running="no">Auto-train</button>
         </div>
     </header>
+
+    <p class="auto-state" id="autoState">Auto-training off</p>
 
     <main>
         <section class="intro">

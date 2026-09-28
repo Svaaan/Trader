@@ -112,11 +112,14 @@ def _print_board(rows: list) -> None:
     for entry in rows:
         scores = entry.get("validation") or {}
         spec = entry.get("spec") or {}
-        print(f"  {entry['trial']:>5}  {scores.get('edge') or 0.0:>+8.4f}  "
+        edge = ("     n/a" if scores.get("edge_comparable") is False
+                else f"{scores.get('edge') or 0.0:>+8.4f}")
+        print(f"  {entry['trial']:>5}  {edge}  "
               f"{scores.get('executable_sharpe') or 0.0:>+7.2f}  "
               f"{scores.get('executable_tstat') or 0.0:>+6.2f}  "
               f"{spec.get('target', '?')} h{spec.get('horizon', '?')} "
               f"band {spec.get('neutral_band', 0)} [{_blocks(spec)}]"
+              f"  {search_mod._describe_book(entry.get('book'))}"
               + (f"  -- {entry['note']}" if entry.get("note") else ""))
     print("\n  sharpe and t are open -> close, the window an order can reach. "
           "M/C/E/N = macro, cross, events, news.")
@@ -137,23 +140,40 @@ def do_run(args) -> int:
     if args.neutral_band:
         options["neutral_band"] = _numbers(args.neutral_band, float)
 
-    if not options:
+    # The book is a trading rule over the same fitted model, so every
+    # combination of one costs a trial but no refit.
+    book_axes = {}
+    if args.long_only is not None:
+        book_axes["long_only"] = args.long_only
+    if args.min_probability:
+        book_axes["min_probability"] = _numbers(args.min_probability, float)
+    if args.top_n:
+        book_axes["top_n"] = _numbers(args.top_n)
+
+    if not options and not book_axes:
         print("Nothing to vary. Give at least one of --macro, --cross, "
-              "--events, --horizon, --target or --neutral-band.")
+              "--events, --horizon, --target, --neutral-band, --long-only, "
+              "--min-probability or --top-n.")
         return 2
 
+    # No dataset axis means one configuration -- the base spec -- and the books
+    # are what the search is over.
     combinations = search_mod.grid(**options)
+    books = search_mod.grid(**book_axes) if book_axes else None
+
+    total = len(combinations) * (len(books) if books else 1)
     already = search_mod.count_trials()
-    print(f"{len(combinations)} configurations, on top of {already} already "
-          f"in the ledger.")
-    if already + len(combinations) > MANY_TRIALS:
+    print(f"{total} trial(s) -- {len(combinations)} configuration(s)"
+          + (f" x {len(books)} book(s)" if books else "")
+          + f", on top of {already} already in the ledger.")
+    if already + total > MANY_TRIALS:
         print(f"  Past {MANY_TRIALS} trials the correction eats most of what a "
               f"search can find. `search.py board` shows the bar.")
 
     out = search_mod.run_search(_load(args.universe), combinations,
-                                note=args.note or "")
+                                note=args.note or "", books=books)
 
-    print(f"\nRan {out['ran']} of {len(combinations)}; "
+    print(f"\nRan {out['ran']} of {total}; "
           f"{out['total_trials']} trials in the ledger.")
     _print_board(out["best"])
     return 0 if out["ran"] else 1
@@ -212,11 +232,12 @@ def do_commit(args) -> int:
               f"and the next opening will be reported as a search, not a test.")
 
     spec = dataset.Spec.from_dict(entry["spec"])
-    committed = search_mod.commit(spec, why=args.why)
+    committed = search_mod.commit(spec, why=args.why, book=entry.get("book"))
     print(f"Committed trial {args.trial} after {committed['after_trials']} "
           f"trials.")
     print(f"  {spec.target}, horizon {spec.horizon}, band {spec.neutral_band}, "
           f"blocks [{_blocks(entry['spec'])}]")
+    print(f"  book: {search_mod._describe_book(entry.get('book'))}")
     print(f"  because: {args.why}")
     print("\n`search.py open` scores it on the sealed period.")
     return 0
@@ -274,6 +295,12 @@ def main() -> int:
                      help=f"comma-separated from {sorted(labels.TARGETS)}")
     run.add_argument("--neutral-band", dest="neutral_band",
                      help="comma-separated, e.g. 0,0.002")
+    run.add_argument("--long-only", dest="long_only", type=_switch,
+                     help="hold only what it calls up: on, off, or on,off")
+    run.add_argument("--min-probability", dest="min_probability",
+                     help="only rows it is this sure about, e.g. 0.55,0.58")
+    run.add_argument("--top-n", dest="top_n",
+                     help="hold this many per session, e.g. 5,10")
     run.add_argument("--note", help="what you were trying, kept in the ledger")
     run.set_defaults(func=do_run)
 

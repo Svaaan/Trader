@@ -142,15 +142,24 @@ def _wilson(correct: int, total: int, z: float = 1.96) -> tuple:
 
 
 def _bucket(probabilities: np.ndarray, correct: np.ndarray, net: np.ndarray,
-            low: float, high: float) -> dict:
-    """How the model did on the rows its confidence fell in a band."""
+            low: float, high: float,
+            reachable_net: np.ndarray | None = None) -> dict:
+    """How the model did on the rows its confidence fell in a band.
+
+    Both windows, for the same reason the headline carries both. Measured on
+    the 238-name panel, the rows where the model was most sure returned +1.30%
+    each close to close and -0.04% held from the next open -- 71.8% accurate,
+    and 98.5% of the gross move was the overnight gap. A table showing only the
+    first number reads as an argument for trading exactly those rows.
+    """
     confidence = np.abs(probabilities - 0.5) * 2.0        # 0 = coin flip, 1 = certain
     chosen = (confidence >= low) & (confidence < high)
     count = int(chosen.sum())
 
     out = {"from": round(low, 2), "to": round(high, 2), "rows": count,
            "accuracy": None, "accuracy_interval": (None, None),
-           "mean_net_return": None, "enough": count >= MIN_BUCKET_ROWS}
+           "mean_net_return": None, "mean_executable_return": None,
+           "enough": count >= MIN_BUCKET_ROWS}
 
     if count == 0:
         return out
@@ -159,6 +168,9 @@ def _bucket(probabilities: np.ndarray, correct: np.ndarray, net: np.ndarray,
     # Net, matching the headline. Reporting gross here while the headline was
     # net invited comparing two different quantities as though they agreed.
     out["mean_net_return"] = round(float(net[chosen].mean()), 6)
+    if reachable_net is not None:
+        out["mean_executable_return"] = round(
+            float(np.asarray(reachable_net)[chosen].mean()), 6)
     out["accuracy_interval"] = _wilson(hits, count)
 
     if count >= MIN_BUCKET_ROWS:
@@ -457,7 +469,14 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
     net_rows = (charged["ret"].to_numpy() * charged["position"].to_numpy()
                 - charged["cost"].fillna(0.0).to_numpy() * cost)
 
-    buckets = [_bucket(probabilities, correct, net_rows, low, high)
+    # The same rows over the window an order can reach, charged the same way.
+    reachable_rows = None
+    if executable_returns is not None:
+        reachable = np.asarray(executable_returns, dtype=np.float64).ravel()
+        reachable_rows = (reachable * charged["position"].to_numpy()
+                          - charged["cost"].fillna(0.0).to_numpy() * cost)
+
+    buckets = [_bucket(probabilities, correct, net_rows, low, high, reachable_rows)
                for low, high in [(0.0, 0.1), (0.1, 0.25), (0.25, 0.5), (0.5, 1.01)]]
 
     def annualise(series: pd.Series) -> float:

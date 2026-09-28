@@ -44,6 +44,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from starlette.requests import Request
 
+from .. import auto as auto_mod
 from .. import context as context_mod
 from .. import news as news_mod
 from .. import paper as paper_mod
@@ -104,6 +105,19 @@ class NewRun(BaseModel):
     """Where to train. See trainer.py for why "both" is the useful one."""
 
     backend: str = trainer_mod.BOTH
+
+
+class AutoTrain(BaseModel):
+    """How often to wake, and where to train when a session has closed.
+
+    The interval is how long the loop may sit after a session closes before it
+    notices -- not how often it trains. See auto.py: training again on rows
+    that have not changed produces the same model and another look at the
+    sealed test period.
+    """
+
+    interval_minutes: float = auto_mod.DEFAULT_INTERVAL_MINUTES
+    backend: str = trainer_mod.LOCAL
 
 
 def _newest_done():
@@ -301,6 +315,35 @@ def api_start(background: BackgroundTasks, body: NewRun | None = None):
 
     background.add_task(build_and_train)
     return {"status": "started", "backend": backend}
+
+
+@app.get("/api/auto")
+def api_auto():
+    """What the scheduler is doing, and what it did on its last few cycles."""
+    return auto_mod.state()
+
+
+@app.post("/api/auto/start")
+def api_auto_start(body: AutoTrain | None = None):
+    settings = body or AutoTrain()
+    if settings.backend not in trainer_mod.BACKENDS:
+        return JSONResponse(
+            {"error": f"backend must be one of {list(trainer_mod.BACKENDS)}"},
+            status_code=400)
+    if settings.interval_minutes < 1:
+        return JSONResponse(
+            {"error": "an interval below a minute only re-reads the price "
+                      "cache faster; a session closes once a day"},
+            status_code=400)
+
+    return auto_mod.start(interval_minutes=settings.interval_minutes,
+                          backend=settings.backend)
+
+
+@app.post("/api/auto/stop")
+def api_auto_stop():
+    """Ask it to finish. The cycle in flight completes; nothing new starts."""
+    return auto_mod.stop()
 
 
 @app.post("/api/collect")

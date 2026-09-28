@@ -769,8 +769,17 @@ def record_paper(run: Run, *, top_n: int | None = None) -> dict | None:
 
 
 def settle_paper(watchlist: Sequence[str] | None = None) -> dict:
-    """Fill and mark every paper entry whose session has now happened."""
-    symbols = universe_mod.resolve(watchlist) if watchlist else default_watchlist()
+    """Fill and mark every paper entry whose session has now happened.
+
+    The symbols come from the ledger, not from the watchlist: an entry holds
+    what it holds, and settling a 238-name book against whichever universe the
+    caller happened to pass drops the rest as "missing" and scales what is left
+    up to a full book. That is how the first real settled day came to be 3.2%
+    of its own intent.
+    """
+    symbols = sorted(paper_mod.pending_symbols())
+    if not symbols:
+        symbols = universe_mod.resolve(watchlist) if watchlist else default_watchlist()
     try:
         frames = prices_mod.load_many(symbols, period="2y")
         return paper_mod.settle(frames)

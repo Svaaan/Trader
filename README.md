@@ -21,6 +21,7 @@ cp env/.env.example env/.env      # then put a submitter key in it
 python train.py                   # train here AND on HelloWorldAi, then compare
 python train.py --backend local   # here only: ~30s, no network, no key needed
 python search.py run --horizon 1,5   # try configurations; the test set stays sealed
+python auto.py                    # keep training on a schedule; Ctrl+C stops it
 python run.py                     # the UI, on http://127.0.0.1:8600
 python watch.py --news            # collect finished models, grow the news store
 ```
@@ -172,6 +173,97 @@ P&L page will then show you the consequences of.
 
 The ledger records even while the gate is shut, marked `shadow`. A forward
 record of a model with no edge is exactly how you learn it still has none.
+
+### What a trade actually costs at Nordnet or Avanza
+
+Five basis points a side is spread and slippage. It is not commission, and a
+retail Nordic broker does not charge in basis points — it charges a percentage
+**or a minimum, whichever is larger**, plus a currency markup on anything not
+priced in your own currency. On a book of this shape the minimum is the entire
+story.
+
+Read off the brokers' own price pages on 2026-09-28 (`broker.py` carries each
+source and date; classes and tiers change, and yours may differ):
+
+| | percentage | minimum per side | currency markup |
+|---|---|---|---|
+| Avanza Start, Stockholm main list | 0% | 0 kr | — |
+| Avanza Mini, Stockholm | 0.25% | 1 kr | — |
+| Avanza Start **and** Mini, US | 0.25% | 1 USD | 0.25% each way |
+| Avanza Small, US | 0.15% | 6 USD | 0.25% each way |
+| Nordnet Mini, Nordic | 0.25% | 1 kr | — |
+| Nordnet Mini, outside the Nordics | 0.25% | 9 kr | 0.25% each way |
+| Nordnet Liten, outside the Nordics | 0.15% | 49 kr | 0.25% each way |
+
+Avanza's currency figure is their own: the automatic exchange spread is 0.5%
+round trip, "alltså 0,25% åt vardera håll". Nordnet were running free Nordic
+trading for new customers until 2027-06-30, after which Mini applies.
+
+**The paper account holds 238 names on $500, so a position is $2.10.** One
+round trip:
+
+| | per side | round trip | as a share of the position |
+|---|---|---|---|
+| spread only (what the backtest charges) | $0.001 | $0.002 | **0.1%** |
+| Nordnet Mini (outside the Nordics) | $0.95 | $1.90 | **90.5%** |
+| Avanza Mini (US) | $1.005 | $2.01 | **95.7%** |
+| Avanza Small (US) | $6.005 | $12.01 | **572%** |
+
+Priced over the one real settled day, the book pays **$476.50 in commission at
+Avanza Mini** and ends the day at $22.50. The ledger, charging spread only,
+recorded −$1.00. That is not a bad fill or a tuning problem: below **$400 a
+position** the minimum decides the bill, so halving the position doubles the
+cost as a share of it, and a 238-name book does not clear that until the
+account is about **$95,000**.
+
+So the honest reading is that the strategy's *shape* is unaffordable at this
+size, independently of whether the signal is any good. Three ways out, and
+their arithmetic:
+
+* **Hold fewer names.** Keeping the cost under 1% of a position needs ~$400 a
+  position, which at $500 is **one name**. The concentration measurements say
+  that is the worst version of this book, not the best.
+* **Trade the market you are billed in.** The Stockholm names in the universe
+  (12 of 241) cost **nothing** at Avanza Start and carry no currency markup —
+  the one shape a $500 account survives. But Start allows 500 free trades in
+  twelve months, and a 12-name book turning over daily spends that in **21
+  sessions**; after that it is Mini at 0.50% a round trip, which is **127% a
+  year in cost alone** at a one-day horizon.
+* **Hold longer.** The same 0.50% over a 20-session hold is 6.4% a year rather
+  than 127%. The search already tested longer horizons: the losses shrink
+  because the edge shrinks with them.
+
+The P&L page now prices the record against real schedules beside its own
+spread-only figure, and `broker.py` will do it for any position size.
+
+### What auditing the first real day found
+
+The first settled day was wrong, and three separate things were behind it.
+
+**It was settled against the wrong prices.** `settle_paper` loaded prices for
+whatever watchlist it was handed rather than for the symbols in the entry, so a
+238-name book was filled from ten of them; the other 228 were dropped as
+"missing" and the ten — **3.2% of the book, scaled up 31.5×** — became the only
+day on the page. The symbols now come from the ledger itself, and a book with
+less than `MIN_SETTLED_WEIGHT` (80%) of its weight priced is left pending
+instead of rescaled. Dropping one name that did not price is still right; making
+a day out of a thirtieth of a book is not.
+
+**A test had written six synthetic symbols into the real ledger**, where they
+sat unsettlable in `pending` for ever.
+
+**A name at an exact coin flip was carried as a position** with weight 0.0. It
+could not make or lose anything, but it counted in the hit rate — 117 of 238
+instead of 116 of 237.
+
+Corrections are appended, never edited: `paper.void(as_of, reason=..., kind=...)`
+writes a line that strikes out an intent or a settlement, and a voided
+settlement is filled again on the next pass. Both real corrections are in the
+ledger with their reasons. The rebuilt day was then **checked against the raw
+prices independently** — recomputed −0.00200294 against the stored −0.00200293,
+filled on 2026-09-14 (the session after the signal), 238 weights summing to
+1.000000, none above 0.0170 against the 0.25 cap, and every direction matching
+its probability. The page agrees: $499.00, −$1.00, one settled day, one pending.
 
 ---
 
@@ -554,6 +646,129 @@ which is where the next section found a hole.
 
 ---
 
+## Training on a schedule, and why it is paced by sessions
+
+The **Auto-train** button on the runs page, and `python auto.py`, run the same
+loop: wake on a timer, and each time collect anything HelloWorldAi has finished,
+settle the paper positions whose session has now happened, and train — but only
+if a session has closed since the last time it trained. **Stop auto-training**
+stops it; the cycle in flight finishes, nothing new starts. The command line and
+the page can stop each other, through a marker file rather than a field, so a
+heartbeat cannot overwrite the request.
+
+The pacing is the whole design, and it is not a performance argument:
+
+* **It stops itself.** Early stopping halts around step 1,000 of a 36,000
+  budget. Training to the ceiling scored 51.1% against 53.7% — more training
+  made it worse.
+* **The same rows give the same model**, up to the seed, and the seed spread
+  (1.8 points) is wider than any edge measured here.
+* **Every run scores on the sealed test period.** A loop that retrains every ten
+  minutes looks at that period every ten minutes, which is exactly what the
+  trial ledger counts. Twenty identical runs are one piece of evidence and
+  nineteen extra chances to catch a lucky one.
+
+So the interval is how long it may sit after a session closes before it notices,
+not how often it trains. What genuinely does want a schedule is the other half:
+the paper ledger only grows forwards, and settling yesterday is the one thing
+here that improves purely by waiting. The scheduler cannot import the search
+module, so an overnight loop can never spend the trial budget — there is a test
+for that.
+
+Its first real cycle found a bug worth the whole exercise. `settle` writes
+outcomes as new lines beside the intents rather than editing history, and both
+writers then read the file as if every line were an intent: `record_intent`
+raised `KeyError('as_of')` on the first settlement line, and `settle` would have
+re-settled every day on every pass, appending a second outcome and counting the
+return twice. **The forward ledger had stopped growing the day it first paid
+out**, and the only sign was one warning line. Both are fixed and both have
+regression tests.
+
+---
+
+## Is the gate too strict? What it turned down, measured
+
+The gate has never opened, so the fair question is whether it is refusing money.
+Working backwards over the 464 sealed sessions of run `20260928-165234`, which
+passed seven of the eight hurdles and failed only on money:
+
+| confidence | rows | accuracy | close→close | **open→close** |
+|---|---|---|---|---|
+| 0.00–0.10 | 97,184 | 50.5% | −0.09% | **−0.10%** |
+| 0.10–0.25 | 9,665 | 52.7% | +0.02% | **−0.06%** |
+| 0.25–0.50 | 280 | **71.8%** | **+1.30%** | **−0.04%** |
+| 0.50+ | 24 | **100%** | **+4.23%** | **−0.49%** |
+
+Per row, net of costs. The rows where the model was most sure were **71.8%
+right**, and the 24 it was surest about were **right every single time** — and
+both lose money held from the next open, because **98.5% of that gross move is
+the overnight gap**. The confidence table on the analysis page now carries both
+columns for that reason; it used to show only the first.
+
+Every book built from the calls it suppressed loses over the same period:
+
+| book | close→close | **open→close** | Sharpe | t |
+|---|---|---|---|---|
+| everything (what the run scored) | −18.9% | **−24.5%** | −6.87 | −9.32 |
+| confidence ≥ 0.25 | +66.6% | **−44.1%** | −0.98 | −0.56 |
+| up calls only (p ≥ 0.58) | −24.9% | **−72.1%** | −2.55 | −2.31 |
+| top 5 by confidence each session | +15.0% | **−19.6%** | −1.15 | −1.56 |
+| top 10 by confidence each session | +4.0% | **−22.0%** | −1.72 | −2.33 |
+
+Annualised, net, equal weight per session.
+
+One number in that audit did look like a lost opportunity, and it is worth
+saying why it is not. The 1,214 up calls (p ≥ 0.58, 57.1% right) earn **+0.18%
+per call** over the *reachable* window — unlike everything else here, most of
+their move is not overnight. But per call is not a book: those calls arrive 2 to
+a session at the median and 127 at the maximum, so weighting them equally levers
+up the busy days. Equal weight per session, the same calls return −0.29% a day.
+And clustered by session — the only honest standard error, since calls in one
+session share a market — the per-call edge has a **t of 1.01**. The naive t,
+which treats 1,214 correlated calls as independent, would have read 2.79. That
+is the difference between "worth testing" and "worth trading", and it is the
+same correction the accuracy hurdle needed.
+
+So: the gate is not too strict. It rejected the one thing that decides it, and
+every subset of what it rejected loses money over the window an order can reach.
+
+### The long-only slice, tested properly, does not survive
+
+That one slice was worth a pre-registered trial, so it got one — trials 21 to 26
+in the ledger, on the validation period, which the audit had never touched. The
+hypothesis was stated first, and so was the rule: commit the book with the
+highest executable t among those clearing both t ≥ 2 and the corrected accuracy
+bar; otherwise commit nothing.
+
+| book | rows | open→close Sharpe | t |
+|---|---|---|---|
+| long only, p ≥ 0.55 | 13,364 | −3.07 | −3.70 |
+| long only, p ≥ 0.58 | 4,360 | −1.55 | −1.86 |
+| long only, p ≥ 0.62 | 811 | −0.96 | −0.95 |
+| long and short, p ≥ 0.55 | 20,764 | −3.29 | −3.98 |
+| long and short, p ≥ 0.58 | 6,873 | −2.12 | −2.55 |
+| long and short, p ≥ 0.62 | 1,529 | −1.41 | −1.50 |
+
+**Nothing qualified, so nothing was committed and the seal stayed shut.** Being
+pickier loses less — Sharpe climbs from −3.07 to −0.96 as the threshold rises —
+and long-only beats long-and-short at every threshold, which is the audit's
+finding reappearing. Neither ever crosses zero. The +0.18% per call that started
+this was the per-call weighting, and a clustered t of 1.01 had already said so.
+
+Note what the seal could not do here. **The hypothesis came from the sealed
+rows**, so opening them for it would not have been a test; validation was the
+honest ground, and the only clean test left for an idea of this shape is forward
+paper trading.
+
+One trap this search exposed: a long-only book shows an edge of **exactly
+zero against a bar of exactly zero**, and clears the accuracy hurdle trivially.
+It only ever says up, and the baseline is always up, so accuracy minus baseline
+is identically zero on every row — not a zero edge, no comparison at all. Trials
+now record `edge_comparable`, the board prints `n/a` rather than a number, and
+only the money hurdle speaks for a one-sided book.
+
+---
+
 ## Searching without spending the test set
 
 A model trains in seconds now, so trying three hundred configurations is an
@@ -579,6 +794,13 @@ reason**. Deciding before looking is the difference between a test and a
 search. A second opening is allowed — forbidding it would just mean deleting a
 file — but it needs `--again`, it is counted, and the reading says plainly that
 it is no longer a test.
+
+**The book is searchable too.** `--long-only`, `--min-probability` and
+`--top-n` change what is held rather than what is built, so they score the same
+fitted model and cost one fit for all of them — but each is its own trial and
+its own look, because choosing between them on the same rows is a search like
+any other. A committed configuration carries its book, so the sealed period
+scores what was actually chosen.
 
 **The trial count sets the bar.** Looking `n` times and keeping the best means
 at least one false pass with probability 1 − 0.95ⁿ: 19% at four trials, 99% by
@@ -704,6 +926,9 @@ shows its sources without prose and everything else works unchanged.
 universe.py   which symbols, and why width is the point
 prices.py     daily OHLCV, split-adjusted, cached -- checked against the period
    |          asked for, and not re-asked of a provider that just answered
+broker.py     what Nordnet and Avanza charge: percentage or minimum, plus
+   |          currency -- and what that does to a book of small positions
+auto.py       the scheduler: collect, settle, and train when a session closes
 features.py   18 per-symbol indicators, every one computable at that close
 cross.py      9 -- where this name sits among its peers, lagged one session
 macro.py      up to 16 -- the state of the world, from unrevised market data, lagged
@@ -768,8 +993,12 @@ and say so; on a relative target that makes little difference, on an absolute
 one their bar is too low. The other hurdles always stood behind it, which is
 why it never opened the gate.
 
-**One macro series has stopped updating, and the block now has 15 columns.**
-The provider's ^VIX3M history ends on 2026-07-17 while ^VIX runs on. The macro
+**A macro series stopped updating for two months, and the block handled it.**
+Between 2026-07-17 and 2026-09-25 the provider served no new ^VIX3M while ^VIX
+ran on; it has since resumed, and the column is back without anyone touching the
+code — the price cache rechecked, the series was no longer behind the others,
+and the block went back to 16 columns. What follows is what happens while a
+series is frozen, which is now tested rather than hypothetical. The macro
 block used to forward-fill every series onto one calendar without limit, so for
 39 sessions `vix_term_slope` divided a July close by a current one — on the end
 of the sealed test period and on every live signal. `pct_change` was doing the
@@ -787,12 +1016,12 @@ complete rows, today's included. Dropping the column keeps all 536,221 and the
 cut date where it was. A gap inside a series that resumes is filled for five
 sessions, left blank past that and reported; none has happened.
 
-What this costs: `vix_term_slope` is gone until the provider resumes or another
-source for three-month volatility is found. Models trained with it produce no
-signal (the page already refuses a row missing a trained feature), and a run
-waiting to be scored refuses by name rather than failing on a shape mismatch.
-The 20 trials in the search ledger were scored with the frozen column in place,
-so macro trials from here on are not strictly comparable with those.
+What it costs while a series is out: that column is gone, so models trained
+with it produce no signal (the page already refuses a row missing a trained
+feature), and a run waiting to be scored refuses by name rather than failing on
+a shape mismatch. The 20 trials in the search ledger were scored during the
+frozen window, with `vix_term_slope` carrying a July close; trials from here on
+are not strictly comparable with those.
 
 **Costs past one session are approximate.** Turnover is still charged day to
 day on overlapping positions, where a book that rebalances every h sessions
@@ -811,7 +1040,7 @@ times the old default, which is a real request of somebody else's GPU.
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-234 tests. The look-ahead ones test the property rather than the implementation
+272 tests. The look-ahead ones test the property rather than the implementation
 — features computed on a truncated history must match the full one — and there
 is a test that deliberately introduces a centred rolling window to confirm the
 property test can still fail. The macro, cross-sectional and event blocks each

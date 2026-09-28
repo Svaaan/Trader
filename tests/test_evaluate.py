@@ -492,3 +492,30 @@ def test_a_model_that_ignores_the_baseline_carries_both_noises():
         train_up_share=0.5, cost=0.0)
     assert result.edge_standard_error == pytest.approx(
         np.sqrt(0.5 / (days * names)), rel=0.15)
+
+
+def test_the_confidence_buckets_carry_both_windows():
+    """The top bucket on the real panel is 71.8% right, +1.30% a row close to
+    close and -0.04% held from the next open. A table with only the first
+    number is an argument for trading exactly those rows."""
+    rng = np.random.default_rng(11)
+    days, names = 120, 6
+    calendar = pd.bdate_range("2024-01-01", periods=days)
+    dates = np.repeat(calendar, names)
+    symbols = np.tile([f"S{i}" for i in range(names)], days)
+
+    probs = rng.random(days * names)
+    # The graded window pays when it is confident; the reachable one does not.
+    confident = np.abs(probs - 0.5) * 2 >= 0.5
+    graded = np.where(confident, 0.02, 0.0) * np.where(probs > 0.5, 1, -1)
+    reachable = np.full(days * names, 0.0)
+    labels = (graded * np.where(probs > 0.5, 1, -1) > 0).astype(int)
+
+    result = evaluate.evaluate(probs, labels, graded, dates, symbols,
+                               executable_returns=reachable,
+                               train_up_share=0.5, cost=0.0)
+
+    top = [b for b in result.by_confidence if b["from"] == 0.5][0]
+    assert top["mean_net_return"] > 0.01
+    assert top["mean_executable_return"] == pytest.approx(0.0, abs=1e-9)
+    assert all("mean_executable_return" in b for b in result.by_confidence)

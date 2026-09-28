@@ -103,7 +103,7 @@ def test_a_trial_never_records_a_test_score(sealed, offline_spec):
     assert set(entry["validation"]) <= {
         "accuracy", "baseline", "edge", "executable_sharpe",
         "executable_tstat", "rows", "effective_rows", "edge_standard_error",
-        "days"}
+        "edge_comparable", "days"}
     assert "test" not in json.dumps(entry).lower().replace("test_fraction", "")
 
 
@@ -269,3 +269,98 @@ def test_a_measured_standard_error_sets_the_search_bar():
 
     fallback = search.corrected_threshold(1, baseline=0.5, effective_rows=10_000)
     assert fallback["naive"] == pytest.approx(1.96 * 0.005, abs=1e-4)
+
+
+# --- the book: what is traded, as opposed to what is built ---------------------
+#
+# The audit of the sealed period found one slice whose edge was not already gone
+# by the opening bell: long-only, high threshold. Testing that is a search over
+# trading rules rather than over datasets -- same model, same rows, different
+# subset held -- so it is its own axis, and each one costs a trial.
+
+def test_a_long_only_book_holds_nothing_short(prepared):
+    cut = search.three_way_cut(prepared)
+    scores = search._score_on(prepared, cut, prepared.spec, period="validation",
+                              book={"long_only": True, "min_probability": 0.52})
+
+    assert scores["up_rate"] == 1.0
+    assert scores["book"]["long_only"] is True
+    assert scores["book_rows"] < scores.get("rows", 0) + scores["book_rows"]
+
+
+def test_a_threshold_holds_fewer_rows_than_everything(prepared):
+    cut = search.three_way_cut(prepared)
+    everything = search._score_on(prepared, cut, prepared.spec,
+                                  period="validation")
+    picky = search._score_on(prepared, cut, prepared.spec, period="validation",
+                             book={"min_probability": 0.52})
+
+    assert picky["rows"] < everything["rows"]
+    assert everything["book"] == search.DEFAULT_BOOK
+
+
+def test_a_book_too_small_to_be_a_strategy_is_refused(prepared):
+    cut = search.three_way_cut(prepared)
+    with pytest.raises(ValueError, match="not a strategy"):
+        search._score_on(prepared, cut, prepared.spec, period="validation",
+                         book={"min_probability": 0.999})
+
+
+def test_top_n_keeps_that_many_a_session(prepared):
+    cut = search.three_way_cut(prepared)
+    scores = search._score_on(prepared, cut, prepared.spec, period="validation",
+                              book={"top_n": 2})
+
+    assert scores["rows"] <= scores["days"] * 2
+
+
+def test_the_book_is_recorded_with_the_trial(sealed, offline_spec):
+    book = {"long_only": True, "min_probability": 0.58, "top_n": None}
+    entry = search.record_trial(offline_spec, {"accuracy": 0.51}, book=book)
+
+    assert entry["book"]["long_only"] is True
+    assert entry["book"]["min_probability"] == 0.58
+    assert search.read_trials()[0]["book"] == entry["book"]
+
+
+def test_a_trial_without_a_book_records_the_default(sealed, offline_spec):
+    entry = search.record_trial(offline_spec, {"accuracy": 0.51})
+    assert entry["book"] == search.DEFAULT_BOOK
+
+
+def test_the_seal_scores_the_book_that_was_committed(sealed, prepared,
+                                                     offline_spec):
+    """Committing a configuration without its trading rule would test something
+    nobody chose."""
+    book = {"long_only": True, "min_probability": 0.52, "top_n": None}
+    search.commit(prepared.spec, why="the one slice that is reachable", book=book)
+
+    opening = search.open_test_set(prepared, search.three_way_cut(prepared))
+    assert opening["scores"]["book"]["long_only"] is True
+    assert opening["scores"]["up_rate"] == 1.0
+    assert search.seal_state()["committed"]["book"] == book
+
+
+def test_a_search_over_books_runs_one_trial_each(sealed, offline_spec):
+    panel = synthetic_panel()
+    out = search.run_search(panel, [{}], base=offline_spec,
+                            books=[{"long_only": True, "min_probability": 0.52},
+                                   {"min_probability": 0.52}])
+
+    assert out["ran"] == 2
+    assert search.count_trials() == 2
+    assert {t["book"]["long_only"] for t in search.read_trials()} == {True, False}
+
+
+def test_a_one_sided_book_has_no_edge_to_compare(prepared):
+    """Long only means every call is up, and the baseline is always up, so the
+    difference is identically zero and clears any bar trivially."""
+    cut = search.three_way_cut(prepared)
+    long_only = search._score_on(prepared, cut, prepared.spec,
+                                 period="validation",
+                                 book={"long_only": True, "min_probability": 0.52})
+    both = search._score_on(prepared, cut, prepared.spec, period="validation")
+
+    assert long_only["edge_comparable"] is False
+    assert long_only["edge"] == 0.0
+    assert both["edge_comparable"] is True

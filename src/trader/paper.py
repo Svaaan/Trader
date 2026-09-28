@@ -57,6 +57,8 @@ import os
 import numpy as np
 import pandas as pd
 
+from . import broker as broker_mod
+
 logger = logging.getLogger(__name__)
 
 LEDGER_DIR = os.environ.get(
@@ -75,6 +77,23 @@ STARTING_CASH = 500.0
 
 # Charged on the value traded, each way. The same figure evaluate.py uses.
 COST_PER_SIDE = 0.0005
+
+# How much of a book has to price before the day counts. A name that did not
+# price is dropped and the rest renormalised, which is right for one or two --
+# counting them flat would dilute everything else toward nothing. It is not
+# right for most of the book: the real ledger settled a 238-name intent against
+# ten of them, because the prices came from a watchlist rather than from the
+# entry, and those ten carried 3.2% of the weight and were scaled up 31.5x into
+# the only day the P&L page had. Below this, the day is left pending instead.
+MIN_SETTLED_WEIGHT = 0.8
+
+# The brokers the P&L page prices the record against. Real schedules, read off
+# their own pages; see broker.py.
+DEFAULT_BROKERS = ("spread_only", "avanza_mini_us", "nordnet_mini_foreign")
+
+# Below this a position is not in the book at all. The ledger stores weights to
+# six decimals, so anything under this is a line that claims a holding of zero.
+MIN_POSITION_WEIGHT = 1e-6
 
 
 @dataclasses.dataclass
@@ -109,6 +128,74 @@ def _read_ledger() -> list:
             except json.JSONDecodeError:
                 logger.warning("Skipping an unparseable ledger line")
     return entries
+
+
+def _view() -> tuple:
+    """What the ledger says now, reading its lines in order.
+
+    Three kinds of line share the file -- intents, settlements, and voids -- and
+    the state is whatever the last line about a date says. A void clears what
+    came before it for that date; anything appended afterwards stands again,
+    which is what makes a day settled against the wrong prices fixable without
+    editing history.
+
+    Returns (intents by date, live settlements by date, voided intent dates).
+    """
+    intents: dict = {}
+    settlements: dict = {}
+    voided: set = set()
+
+    for entry in _read_ledger():
+        if not isinstance(entry, dict):
+            continue
+        if "void" in entry:
+            as_of = (entry["void"] or {}).get("as_of")
+            settlements.pop(as_of, None)
+            if (entry["void"] or {}).get("kind") == "intent":
+                intents.pop(as_of, None)
+                voided.add(as_of)
+            continue
+        if "settlement" in entry:
+            settlements[entry["settlement"]["as_of"]] = entry["settlement"]
+        elif "as_of" in entry:
+            intents[entry["as_of"]] = entry
+            voided.discard(entry["as_of"])
+
+    return intents, settlements, voided
+
+
+def void(as_of: str, *, reason: str, kind: str = "settlement") -> dict:
+    """Strike one date out of the record, by appending rather than deleting.
+
+    `kind="settlement"` drops the outcome and leaves the intent to be settled
+    again -- for a day filled against the wrong prices. `kind="intent"` drops
+    both, for an entry that should never have been written at all, such as the
+    six synthetic symbols a test once wrote into the real ledger.
+
+    The reason is required and kept. A record that can be silently corrected is
+    not a forward record, so the correction is a line in it.
+    """
+    if kind not in ("settlement", "intent"):
+        raise ValueError("kind must be 'settlement' or 'intent'")
+
+    entry = {"void": {"as_of": as_of, "kind": kind, "reason": reason},
+             "written_utc": dt.datetime.now(dt.timezone.utc).isoformat(
+                 timespec="seconds")}
+    _append(entry)
+    logger.warning("Voided the %s for %s: %s", kind, as_of, reason)
+    return entry
+
+
+def pending_symbols() -> set:
+    """Every symbol an unsettled entry holds -- what settling needs priced.
+
+    The prices to settle with are named by the ledger, not by whatever universe
+    happens to be configured when the scheduler wakes up.
+    """
+    intents, settlements, _ = _view()
+    return {position["symbol"]
+            for as_of, entry in intents.items() if as_of not in settlements
+            for position in entry.get("positions", [])}
 
 
 def _append(entry: dict) -> None:
@@ -206,7 +293,11 @@ def size_positions(signals: list, *, top_n: int | None = None,
     for position, weight in zip(positions, weights):
         position.weight = float(weight)
 
-    return positions
+    # A name the model puts at an exact coin flip gets a weight that rounds to
+    # nothing, and a position nobody holds is not a position: it was counted in
+    # the ledger as one, and in the hit rate, where it moved the first real
+    # settled day from 116 of 237 to 117 of 238.
+    return [p for p in positions if p.weight >= MIN_POSITION_WEIGHT]
 
 
 # --- writing the forward record --------------------------------------------
@@ -224,7 +315,10 @@ def record_intent(run, *, top_n: int | None = None, long_short: bool = True,
         return None
 
     as_of = max(s["as_of"] for s in signals)
-    if any(entry["as_of"] == as_of for entry in _read_ledger()):
+    # .get, not [...]: settlement lines live in the same file and carry no
+    # signal date. Reading one as an intent raised KeyError and stopped the
+    # ledger growing from the first payout onwards.
+    if any(entry.get("as_of") == as_of for entry in _read_ledger()):
         logger.info("Paper ledger already has an entry for %s", as_of)
         return None
 
@@ -261,8 +355,13 @@ def settle(frames: dict, *, now: dt.datetime | None = None) -> dict:
     sides pay `COST_PER_SIDE`. Anything whose session has not happened yet is
     left alone and picked up on a later pass.
     """
-    entries = _read_ledger()
-    unsettled = [e for e in entries if not e.get("settled")]
+    # Settled means "has a live settlement line", which is the only thing that
+    # survives a void. The lines on disk keep "settled": false for ever, so
+    # reading that field settled every day again on every pass, appending a
+    # second outcome and counting the return twice.
+    intents, settlements, _ = _view()
+    unsettled = [entry for as_of, entry in sorted(intents.items())
+                 if as_of not in settlements]
     if not unsettled:
         return {"settled": 0, "pending": 0}
 
@@ -306,8 +405,15 @@ def settle(frames: dict, *, now: dt.datetime | None = None) -> dict:
             continue
 
         # A position whose price never arrived is dropped and the rest
-        # renormalised, rather than silently counted as flat.
+        # renormalised, rather than silently counted as flat -- but only while
+        # most of the book is there. See MIN_SETTLED_WEIGHT.
         held = sum(m["weight"] for m in marks)
+        if held < MIN_SETTLED_WEIGHT:
+            logger.warning(
+                "Not settling %s: only %.1f%% of the book priced (%d of %d "
+                "names). Leaving it pending rather than scaling the rest up.",
+                entry["as_of"], held * 100, len(marks), len(entry["positions"]))
+            continue
         scale = 1.0 / held if held > 0 else 0.0
         day_return = sum(m["contribution"] for m in marks) * scale
 
@@ -332,16 +438,15 @@ def settle(frames: dict, *, now: dt.datetime | None = None) -> dict:
                      "written_utc": (now or dt.datetime.now(dt.timezone.utc))
                      .isoformat(timespec="seconds")})
 
-        # And the intent lines are marked settled in a rewritten index rather
-        # than by editing history.
-        _mark_settled({r["as_of"] for r in results})
-
     return {"settled": settled_count,
             "pending": len(unsettled) - settled_count}
 
 
 def _mark_settled(dates: set) -> None:
-    """Record which intents have outcomes, without touching the ledger.
+    """Kept for ledgers written before settlement lines became the record.
+
+    Nothing reads this any more: whether a date is settled is whether a live
+    settlement line exists for it, which is the one answer a void can change.
 
     The ledger is append-only on purpose, so "which of these is done" lives in
     a separate index that can be rebuilt from the ledger at any time.
@@ -373,31 +478,63 @@ def _settled_dates() -> set:
         return set()
 
 
-def _read_ledger_with_state() -> list:
-    settled = _settled_dates()
-    entries = []
-    for entry in _read_ledger():
-        if "settlement" in entry:
-            entries.append(entry)
-            continue
-        entry = dict(entry)
-        entry["settled"] = entry["as_of"] in settled
-        entries.append(entry)
-    return entries
-
-
 # --- reading it back --------------------------------------------------------
 
-def account(starting_cash: float = STARTING_CASH) -> dict:
+def commission_drag(settlements: list, starting_cash: float,
+                    schedule=None, rates: dict | None = None) -> dict:
+    """What a real broker would have taken out of this record.
+
+    The ledger charges spread only. A retail broker charges a percentage or a
+    minimum, whichever is larger, and on a book this wide the minimum is the
+    whole story: 238 names in a 500 account is a position of about 2, against
+    a minimum of a dollar a side. Costed per position per day, because the
+    book is re-entered every session.
+    """
+    schedule = broker_mod.resolve(schedule)
+    cash, paid, trades = starting_cash, 0.0, 0
+    curve = []
+
+    for day in settlements:
+        marks = day.get("marks") or []
+        # Weights are of the book, and the book is whatever cash there is.
+        held = sum(abs(m.get("weight") or 0.0) for m in marks) or 1.0
+        charge = sum(
+            broker_mod.round_trip(
+                broker_mod.position_value(cash, (m.get("weight") or 0.0) / held),
+                schedule, rates=rates)
+            for m in marks)
+
+        gross = cash * (1.0 + day["return"])
+        cash = gross - charge
+        paid += charge
+        trades += len(marks)
+        curve.append({"session": day["session"], "equity": round(cash, 2),
+                      "commission": round(charge, 2)})
+
+    return {
+        "schedule": schedule.name,
+        "source": schedule.source,
+        "checked": schedule.checked,
+        "cash": round(cash, 2),
+        "profit": round(cash - starting_cash, 2),
+        "commission_paid": round(paid, 2),
+        "trades": trades,
+        "commission_per_trade": round(paid / trades, 4) if trades else 0.0,
+        "break_even_value": round(
+            broker_mod.break_even_value(schedule, rates=rates), 2),
+        "equity": curve,
+    }
+
+
+def account(starting_cash: float = STARTING_CASH, *, schedules=None) -> dict:
     """The equity curve and everything a P&L page needs, with error bars.
 
     The statistics carry the same discipline as the rest of the project: a few
     weeks of paper trading cannot distinguish a strategy from a coin however
     good the total looks, and this says so rather than printing a percentage.
     """
-    settlements = [e["settlement"] for e in _read_ledger()
-                   if isinstance(e, dict) and "settlement" in e]
-    settlements.sort(key=lambda s: s["session"])
+    _, live, _ = _view()
+    settlements = sorted(live.values(), key=lambda s: s["session"])
 
     if not settlements:
         # The full shape, not a stub. An empty ledger is the normal state on
@@ -408,7 +545,7 @@ def account(starting_cash: float = STARTING_CASH) -> dict:
                 "profit": 0.0, "return": 0.0, "days": 0, "wins": 0,
                 "hit_rate": None, "sharpe": 0.0, "tstat": 0.0,
                 "max_drawdown": 0.0, "shadow_days": 0, "equity": [],
-                "pending": _pending_count(),
+                "pending": _pending_count(), "brokers": [],
                 "verdict": "Nothing has settled yet."}
 
     equity, cash = [], starting_cash
@@ -448,13 +585,18 @@ def account(starting_cash: float = STARTING_CASH) -> dict:
         "equity": equity,
         "pending": _pending_count(),
         "verdict": _verdict(days, tstat, cash - starting_cash),
+        # What the same days would have cost at a real broker. The ledger's own
+        # numbers charge spread only; these charge commission with its minimum,
+        # which is what decides a book of small positions.
+        "brokers": [commission_drag(settlements, starting_cash, name)
+                    for name in (schedules if schedules is not None
+                                 else DEFAULT_BROKERS)],
     }
 
 
 def _pending_count() -> int:
-    settled = _settled_dates()
-    return sum(1 for e in _read_ledger()
-               if "settlement" not in e and e["as_of"] not in settled)
+    intents, settlements, _ = _view()
+    return sum(1 for as_of in intents if as_of not in settlements)
 
 
 def _verdict(days: int, tstat: float, profit: float) -> str:

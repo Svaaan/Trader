@@ -243,6 +243,20 @@ main {
 
 /* --- controls --- */
 
+.auto-state {
+    margin: 0 2rem 0.75rem;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+}
+
+.auto-state.is-running {
+    color: var(--up);
+}
+
+.btn.is-running {
+    border-color: var(--up);
+}
+
 .btn {
   padding: 0.55rem 0.95rem;
   border: none;

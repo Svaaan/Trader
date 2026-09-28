@@ -173,6 +173,47 @@ function curvePanel(account) {
 
 // --- assembly ---------------------------------------------------------------
 
+function brokerPanel(account) {
+  const brokers = account.brokers || [];
+  if (!brokers.length) return null;
+
+  const panel = el("section", "panel");
+  panel.appendChild(el("h3", null, "What a real broker would have taken"));
+
+  const table = el("table", "table");
+  const head = el("tr");
+  ["Where", "Trades", "Per trade", "Commission", "Ends with", "Minimum binds below"]
+    .forEach((h) => head.appendChild(el("th", null, h)));
+  table.appendChild(head);
+
+  brokers.forEach((broker) => {
+    const row = el("tr");
+    row.appendChild(el("td", null, broker.schedule));
+    row.appendChild(el("td", null, (broker.trades || 0).toLocaleString()));
+    row.appendChild(el("td", null, money(broker.commission_per_trade)));
+    row.appendChild(el("td", null, money(broker.commission_paid)));
+    const ends = el("td", broker.profit < 0 ? "is-down" : "is-up",
+      `${money(broker.cash)} (${money(broker.profit)})`);
+    row.appendChild(ends);
+    row.appendChild(el("td", null,
+      Number.isFinite(broker.break_even_value) ? money(broker.break_even_value) : "—"));
+    table.appendChild(row);
+  });
+  panel.appendChild(table);
+
+  const real = brokers.find((b) => b.source && !b.source.startsWith("evaluate"));
+  if (real) {
+    panel.appendChild(el("p", "note",
+      `A percentage or a minimum, whichever is larger — so below `
+      + `${money(real.break_even_value)} a position, every trade costs the same and `
+      + `halving the position doubles the cost as a share of it. This book holds `
+      + `every name it has an opinion on, which makes each position small. `
+      + `Read off ${real.source} on ${real.checked}; they change, and your class `
+      + `and tier may differ.`));
+  }
+  return panel;
+}
+
 async function refresh() {
   const host = document.getElementById("pnl");
 
@@ -195,7 +236,8 @@ async function refresh() {
       `Filled at the open after each signal, closed at that session's close, `
       + `${pct(body.cost_per_side, 2)} charged each way.`));
 
-    [standingPanel(account), divergencePanel(body), curvePanel(account)]
+    [standingPanel(account), brokerPanel(account), divergencePanel(body),
+     curvePanel(account)]
       .filter(Boolean)
       .forEach((panel) => host.appendChild(panel));
 

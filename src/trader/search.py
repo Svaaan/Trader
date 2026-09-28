@@ -65,6 +65,20 @@ SEAL_FILE = "seal.json"
 # interleaving with the rows the model fits.
 VALIDATION_FRACTION = 0.2
 
+# The book: which of the model's rows are actually traded. Separate from the
+# Spec, which says what the model is built from -- these change nothing about
+# the model and everything about what is done with it, so a search over them
+# needs no reassembly and no refit.
+#
+# The default is what every trial before this one scored: every row, long and
+# short. `min_probability` keeps only rows the model is at least that sure
+# about (and their mirror on the short side unless `long_only`); `top_n` keeps
+# that many per session, by confidence.
+DEFAULT_BOOK = {"min_probability": 0.5, "long_only": False, "top_n": None}
+
+# Below this many rows a book is not a strategy, it is a handful of days.
+MIN_BOOK_ROWS = 100
+
 
 @dataclasses.dataclass
 class Cut:
@@ -111,12 +125,59 @@ def three_way_cut(prepared, *, test_fraction: float = 0.2,
                test_start=dates[min(max(test_at, 2), len(dates) - 1)])
 
 
-def _score_on(prepared, cut: Cut, spec, *, period: str,
-              seed: int = 0) -> dict:
-    """Fit on the training period and score on validation or test.
+def _book_rows(probabilities, dates, book: dict | None):
+    """Which rows this book would actually hold.
 
-    The model never sees rows at or after whichever boundary it is being scored
-    against, which is the only thing that makes either number mean anything.
+    Returns a boolean mask, or None for "all of them". Selection happens after
+    the model is fitted and never touches training, so every book in a search
+    scores the same network -- the difference between them is a trading rule,
+    not a different model.
+    """
+    book = {**DEFAULT_BOOK, **(book or {})}
+    probabilities = np.asarray(probabilities, dtype=np.float64).ravel()
+
+    minimum = float(book.get("min_probability") or 0.5)
+    long_only = bool(book.get("long_only"))
+    top_n = book.get("top_n")
+
+    if long_only:
+        keep = probabilities >= max(minimum, 0.5 + 1e-12)
+    elif minimum > 0.5:
+        keep = (probabilities >= minimum) | (probabilities <= 1.0 - minimum)
+    else:
+        keep = np.ones(len(probabilities), dtype=bool)
+
+    if top_n:
+        confidence = np.abs(probabilities - 0.5)
+        frame = pd.DataFrame({"date": pd.DatetimeIndex(dates),
+                              "confidence": confidence, "keep": keep})
+        # The n most confident of whatever survived the threshold, per session.
+        ranked = (frame[frame["keep"]].groupby("date")["confidence"]
+                  .rank(method="first", ascending=False))
+        chosen = np.zeros(len(probabilities), dtype=bool)
+        chosen[ranked.index[ranked <= int(top_n)]] = True
+        keep = chosen
+
+    return None if keep.all() else keep
+
+
+def _describe_book(book: dict | None) -> str:
+    book = {**DEFAULT_BOOK, **(book or {})}
+    parts = []
+    if book.get("long_only"):
+        parts.append("long only")
+    if (book.get("min_probability") or 0.5) > 0.5:
+        parts.append(f"p>={book['min_probability']:g}")
+    if book.get("top_n"):
+        parts.append(f"top {book['top_n']}")
+    return ", ".join(parts) or "every row, long and short"
+
+
+def _fit_for(prepared, cut: Cut, spec, *, period: str, seed: int = 0) -> tuple:
+    """Fit once and hand back what any book needs to be scored.
+
+    Separate from scoring so that a search over trading rules pays for one fit
+    rather than one per rule: the model does not know what will be held.
     """
     if period == "validation":
         splits, _ = dataset_mod.split_at(prepared, cut.validation_start)
@@ -129,19 +190,52 @@ def _score_on(prepared, cut: Cut, spec, *, period: str,
     if not graded:
         raise ValueError(f"nothing left to score on the {period} period")
 
-    x_train, y_train, scaler = dataset_mod.combine(
-        graded, prepared.feature_names)
+    x_train, y_train, scaler = dataset_mod.combine(graded, prepared.feature_names)
     test = dataset_mod.test_matrix(graded, scaler)
-
     model = baseline_mod.fit_mlp(x_train, y_train, steps=20_000, seed=seed)
-    probabilities = model.probabilities(test.x)
+    return test, model.probabilities(test.x), float(y_train.mean())
+
+
+def _score_on(prepared, cut: Cut, spec, *, period: str,
+              seed: int = 0, book: dict | None = None,
+              fitted: tuple | None = None) -> dict:
+    """Fit on the training period and score on validation or test.
+
+    The model never sees rows at or after whichever boundary it is being scored
+    against, which is the only thing that makes either number mean anything.
+    """
+    test, probabilities, train_up_share = (
+        fitted or _fit_for(prepared, cut, spec, period=period, seed=seed))
+
+    dates, symbols = test.dates, test.symbols
+    y, returns, reachable = test.y, test.returns, test.executable
+
+    keep = _book_rows(probabilities, dates, book)
+    if keep is not None:
+        if int(keep.sum()) < MIN_BOOK_ROWS:
+            raise ValueError(
+                f"the book ({_describe_book(book)}) holds {int(keep.sum())} "
+                f"rows on the {period} period, which is not a strategy")
+        probabilities = probabilities[keep]
+        y, returns, reachable = y[keep], returns[keep], reachable[keep]
+        dates, symbols = dates[keep], symbols[keep]
 
     result = evaluate_mod.evaluate(
-        probabilities, test.y, test.returns, test.dates, test.symbols,
-        executable_returns=test.executable,
-        train_up_share=float(y_train.mean()), horizon=test.horizon)
+        probabilities, y, returns, dates, symbols,
+        executable_returns=reachable,
+        train_up_share=train_up_share, horizon=test.horizon)
 
-    return result.to_dict()
+    scores = result.to_dict()
+    scores["book"] = {**DEFAULT_BOOK, **(book or {})}
+    scores["book_rows"] = int(len(y))
+    # A book that only ever says up is graded against a baseline that only ever
+    # says up, so accuracy minus baseline is identically zero on every row --
+    # not an edge of zero, no comparison at all. It clears any accuracy bar
+    # trivially (0 >= 0), which is why that has to be said out loud: on such a
+    # book only the money hurdle carries information.
+    one_sided = bool((probabilities > 0.5).all() or (probabilities <= 0.5).all())
+    scores["edge_comparable"] = not one_sided
+    return scores
 
 
 def _truncate_before(split, stop: pd.Timestamp):
@@ -151,7 +245,8 @@ def _truncate_before(split, stop: pd.Timestamp):
 
 # --- the ledger -------------------------------------------------------------
 
-def record_trial(spec, scores: dict, *, note: str = "") -> dict:
+def record_trial(spec, scores: dict, *, note: str = "",
+                 book: dict | None = None) -> dict:
     """Append one configuration and what it scored on validation.
 
     Append-only. The count is the whole point: it is what turns "1.08 points
@@ -165,6 +260,8 @@ def record_trial(spec, scores: dict, *, note: str = "") -> dict:
         "trial": count_trials() + 1,
         "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "spec": spec.to_dict() if hasattr(spec, "to_dict") else dict(spec),
+        # What was traded, beside what was built. A trial is the pair.
+        "book": {**DEFAULT_BOOK, **(book or scores.get("book") or {})},
         "note": note,
         # Deliberately only the validation numbers. A trial that recorded a
         # test score would be a trial that had opened the test set.
@@ -179,6 +276,8 @@ def record_trial(spec, scores: dict, *, note: str = "") -> dict:
             # same day are nowhere near two hundred independent observations.
             "effective_rows": scores.get("effective_rows"),
             "edge_standard_error": scores.get("edge_standard_error"),
+            # False when the book is one-sided: see _score_on.
+            "edge_comparable": scores.get("edge_comparable", True),
             "days": scores.get("days"),
         },
     }
@@ -302,7 +401,7 @@ def seal_state() -> dict:
         return {"opened": [], "committed": None}
 
 
-def commit(spec, *, why: str) -> dict:
+def commit(spec, *, why: str, book: dict | None = None) -> dict:
     """Declare the configuration you are taking to the test set, and why.
 
     Required before `open_test_set` will do anything. The point is not
@@ -317,6 +416,7 @@ def commit(spec, *, why: str) -> dict:
     state["committed"] = {
         "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "spec": spec.to_dict() if hasattr(spec, "to_dict") else dict(spec),
+        "book": {**DEFAULT_BOOK, **(book or {})},
         "why": why,
         "after_trials": count_trials(),
     }
@@ -345,7 +445,8 @@ def open_test_set(prepared, cut: Cut, *, seed: int = 0) -> dict:
             "the test set -- deciding after looking is not a test.")
 
     spec = dataset_mod.Spec.from_dict(committed["spec"])
-    scores = _score_on(prepared, cut, spec, period="test", seed=seed)
+    scores = _score_on(prepared, cut, spec, period="test", seed=seed,
+                       book=committed.get("book"))
 
     trials = committed.get("after_trials", 0)
     correction = corrected_threshold(
@@ -427,12 +528,17 @@ def grid(**options) -> list:
 
 def run_search(frames: dict, combinations: list, *, base: dataset_mod.Spec | None = None,
                test_fraction: float = 0.2, seed: int = 0,
-               note: str = "") -> dict:
+               note: str = "", books: list | None = None) -> dict:
     """Score every configuration on validation, and never on test.
 
     The panel is assembled once per distinct feature-block combination rather
     than once per trial: assembling is minutes and fitting is seconds, so doing
     it per trial would spend the entire budget on rebuilding the same columns.
+
+    `books` are trading rules applied to the same fitted model -- long-only, a
+    probability threshold, a position count. Each one is its own trial and its
+    own look, because choosing between them on the same rows is a search like
+    any other; they simply cost no refit.
     """
     base = base or dataset_mod.Spec()
     results = []
@@ -460,17 +566,32 @@ def run_search(frames: dict, combinations: list, *, base: dataset_mod.Spec | Non
             trial_spec = dataset_mod.Spec(
                 **{**dataclasses.asdict(base), **override})
             try:
-                scores = _score_on(prepared, cut, trial_spec,
-                                   period="validation", seed=seed)
+                fitted = _fit_for(prepared, cut, trial_spec,
+                                  period="validation", seed=seed)
             except Exception as exc:                    # noqa: BLE001
-                logger.warning("Trial failed (%s): %s", override, exc)
+                logger.warning("Could not fit %s: %s", override, exc)
                 continue
 
-            entry = record_trial(trial_spec, scores, note=note)
-            results.append(entry)
-            logger.info("Trial %d: edge %+.4f, executable sharpe %+.2f  %s",
-                        entry["trial"], scores.get("edge") or 0.0,
-                        scores.get("executable_sharpe") or 0.0, override)
+            for book in (books or [None]):
+                try:
+                    scores = _score_on(prepared, cut, trial_spec,
+                                       period="validation", seed=seed, book=book,
+                                       fitted=fitted)
+                except Exception as exc:                # noqa: BLE001
+                    logger.warning("Trial failed (%s, %s): %s", override,
+                                   _describe_book(book), exc)
+                    continue
+
+                entry = record_trial(trial_spec, scores, note=note, book=book)
+                results.append(entry)
+                logger.info(
+                    "Trial %d: %d rows, edge %+.4f, executable sharpe %+.2f "
+                    "t %+.2f  %s | %s",
+                    entry["trial"], scores.get("book_rows") or scores.get("rows"),
+                    scores.get("edge") or 0.0,
+                    scores.get("executable_sharpe") or 0.0,
+                    scores.get("executable_tstat") or 0.0,
+                    override, _describe_book(book))
 
     return {
         "ran": len(results),

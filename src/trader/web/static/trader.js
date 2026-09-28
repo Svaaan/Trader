@@ -208,7 +208,7 @@ function evaluationPanel(run) {
     panel.appendChild(el("h4", null, "By how sure it was"));
     const table = el("table", "table");
     const head = el("tr");
-    ["Confidence", "Rows", "Accuracy", "Range", "Mean net return"].forEach((h) =>
+    ["Confidence", "Rows", "Accuracy", "Range", "Close → close", "Open → close"].forEach((h) =>
       head.appendChild(el("th", null, h)));
     table.appendChild(head);
 
@@ -224,6 +224,9 @@ function evaluationPanel(run) {
       row.appendChild(el("td", null,
         low === null ? "—" : `${percent(low)} – ${percent(high)}`));
       row.appendChild(el("td", null, signed(bucket.mean_net_return, 3)));
+      row.appendChild(el("td", bucket.mean_executable_return < 0 ? "is-down" : null,
+        bucket.mean_executable_return === null || bucket.mean_executable_return === undefined
+          ? "—" : signed(bucket.mean_executable_return, 3)));
       table.appendChild(row);
     });
     panel.appendChild(table);
@@ -231,7 +234,10 @@ function evaluationPanel(run) {
       "A model worth anything is better on the days it commits. Flat across "
       + "these rows means the confidence number carries no information. "
       + "Accuracy is withheld on buckets too small to mean anything, and the "
-      + "range beside it is how wide the honest interval actually is."));
+      + "range beside it is how wide the honest interval actually is. The last "
+      + "column is the only one an order can reach: on this panel the most "
+      + "confident rows are 71.8% right and still lose money held from the "
+      + "next open, because the move happens overnight."));
   }
 
   return panel;
@@ -340,6 +346,59 @@ async function refresh() {
   }
 }
 
+function describeAuto(state) {
+  if (!state.running) {
+    if (state.stopped_because) return `Auto-training off — ${state.stopped_because}`;
+    if (state.stopped_at) return `Auto-training off since ${state.stopped_at.replace("T", " ")}`;
+    return "Auto-training off";
+  }
+
+  const last = state.last || {};
+  const did = last.error ? `last cycle failed: ${last.error}`
+    : last.trained ? `trained ${last.trained}`
+    : last.skipped ? "idle — no new session to train on"
+    : "starting";
+  const checks = `${state.cycles || 0} check${state.cycles === 1 ? "" : "s"}`;
+  return `Auto-training on, every ${state.interval_minutes} min — ${checks}, ${did}`;
+}
+
+async function refreshAuto() {
+  try {
+    const response = await fetch("/api/auto");
+    if (!response.ok) return;
+    const state = await response.json();
+
+    const button = document.getElementById("autoTrain");
+    button.textContent = state.running ? "Stop auto-training" : "Auto-train";
+    button.dataset.running = state.running ? "yes" : "no";
+    button.classList.toggle("is-running", Boolean(state.running));
+
+    const line = document.getElementById("autoState");
+    line.textContent = describeAuto(state);
+    line.className = state.running ? "auto-state is-running" : "auto-state";
+  } catch {
+    /* the runs panel already reports a dead server */
+  }
+}
+
+document.getElementById("autoTrain").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const stopping = button.dataset.running === "yes";
+  button.disabled = true;
+
+  try {
+    const response = await fetch(stopping ? "/api/auto/stop" : "/api/auto/start",
+      { method: "POST" });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || `server returned ${response.status}`);
+  } catch (error) {
+    document.getElementById("autoState").textContent = error.message;
+  } finally {
+    button.disabled = false;
+    await refreshAuto();
+  }
+});
+
 async function refreshStatus() {
   try {
     const response = await fetch("/api/status");
@@ -374,5 +433,7 @@ document.getElementById("startRun").addEventListener("click", async (event) => {
 
 refresh();
 refreshStatus();
+refreshAuto();
 setInterval(refresh, POLL_MS);
 setInterval(refreshStatus, POLL_MS);
+setInterval(refreshAuto, POLL_MS);
