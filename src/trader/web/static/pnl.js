@@ -208,6 +208,25 @@ function bookPanel(book) {
         ? `Sells on ${held.review_on} — ${held.sessions_left} session(s) away. `
           + `Held ${held.held_sessions} so far, and nothing is traded in between.`
         : `The review session has arrived: it sells at the next open.`));
+
+    const because = held.bought_because || [];
+    if (because.length) {
+      state.appendChild(el("p", "note",
+        `It bought on: ${because.map((d) => d.feature.replace(/_/g, " ")).join(", ")}.`));
+    }
+
+    const watch = held.watch;
+    if (watch) {
+      const line = el("p", watch.status === "broken" ? "error"
+        : watch.status === "drifting" ? "note" : "note");
+      line.textContent = watch.status === "broken"
+        ? `⚠ The case has broken — ${watch.note}. It is holding anyway: a warning `
+          + `is free, and changing its mind costs a round trip it has not earned.`
+        : watch.status === "drifting"
+          ? `Drifting — ${watch.note}.`
+          : `On its pattern — ${watch.note}.`;
+      state.appendChild(line);
+    }
     if (held.trusted === false) {
       state.appendChild(el("p", "note",
         "Recorded while the gate was shut, so this is a record of what it would "

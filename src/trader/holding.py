@@ -59,6 +59,18 @@ SCHEDULES = {"ST": "avanza_mini_se", "CO": "avanza_mini_se",
 SCHEDULE = "avanza_mini_us"
 SPREAD = 0.0005
 
+# How many of the reasons behind a buy are remembered as "the pattern". The
+# model gives a contribution per feature; these are the ones that actually
+# pushed the answer up, biggest first.
+PATTERN_SIZE = 5
+
+# When the pattern is called broken. Both are definitions rather than tuned
+# numbers: below half, the model no longer says up at all, and below half the
+# drivers agreeing, most of what it bought on has gone. Neither has been tested
+# as a reason to trade -- see `watch`.
+CALLS_IT_UP = 0.5
+AGREEMENT_BROKEN = 0.5
+
 
 def schedule_for(symbol: str) -> str:
     """The price list this symbol is billed on, from where it is listed."""
@@ -96,7 +108,7 @@ def state() -> dict:
     Returns the plan waiting to be filled (if any), the position being held (if
     any), everything already closed, and the cash.
     """
-    cash, plan, holding, closed = STARTING_CASH, None, None, []
+    cash, plan, holding, closed, watched = STARTING_CASH, None, None, [], None
 
     for entry in _read():
         if "plan" in entry:
@@ -105,12 +117,22 @@ def state() -> dict:
             holding = entry["fill"]
             cash = entry["fill"]["cash_after"]
             plan = None
+        elif "watch" in entry:
+            watched = entry["watch"]
+        elif "renew" in entry:
+            # A review that confirmed the same name. Nothing traded, nothing
+            # paid; the only thing that moves is when it next decides.
+            if holding:
+                holding = {**holding, "session": entry["renew"]["from_session"],
+                           "renewed": entry["renew"]["at"]}
         elif "exit" in entry:
             closed.append(entry["exit"])
             cash = entry["exit"]["cash_after"]
             holding = None
+            watched = None
 
-    return {"cash": cash, "plan": plan, "holding": holding, "closed": closed}
+    return {"cash": cash, "plan": plan, "holding": holding, "closed": closed,
+            "watch": watched}
 
 
 def _sessions_between(frames: dict, symbol: str, start, end) -> int:
@@ -127,6 +149,66 @@ def _next_session(frames: dict, symbol: str, after):
         return None
     later = frame.index[frame.index > pd.Timestamp(after)]
     return later[0] if len(later) else None
+
+
+def _pattern_of(signal: dict) -> list:
+    """The reasons that pushed this name up, biggest first.
+
+    Only the ones arguing for the position. A feature that pushed *against* it
+    and lost is not part of the case for buying, so it is not part of the case
+    breaking either.
+    """
+    contributions = signal.get("all_contributions") or signal.get("reasons") or []
+    pushing = [c for c in contributions if float(c.get("effect") or 0.0) > 0]
+    pushing.sort(key=lambda c: -float(c["effect"]))
+    return [{"feature": c["feature"],
+             "effect": round(float(c["effect"]), 6),
+             "z": round(float(c.get("z") or 0.0), 3)}
+            for c in pushing[:PATTERN_SIZE]]
+
+
+def _compare(pattern: list, signal: dict, bought_at: float) -> dict:
+    """Is the case it bought on still the case?
+
+    Not a trading rule and not a prediction: it re-reads today's reasons for the
+    name already held and says how much of the original argument survives. A
+    warning costs nothing, and at this account size a change of mind costs a
+    round trip -- so the two are kept apart on purpose.
+    """
+    now = float(signal.get("probability_up") or 0.0)
+    today = {c["feature"]: float(c.get("effect") or 0.0)
+             for c in (signal.get("all_contributions") or [])}
+
+    kept, lost = [], []
+    for driver in pattern or []:
+        still = today.get(driver["feature"], 0.0)
+        (kept if still > 0 else lost).append({
+            "feature": driver["feature"],
+            "was": driver["effect"], "now": round(still, 6)})
+
+    counted = len(kept) + len(lost)
+    agreement = (len(kept) / counted) if counted else 1.0
+
+    if now < CALLS_IT_UP:
+        status = "broken"
+        note = (f"the model no longer calls it up ({now:.3f} against "
+                f"{bought_at:.3f} when it bought)")
+    elif agreement < AGREEMENT_BROKEN:
+        status = "broken"
+        note = (f"{len(lost)} of {counted} reasons it bought on have gone "
+                f"({', '.join(l['feature'] for l in lost[:3])})")
+    elif agreement < 1.0 or now < bought_at:
+        status = "drifting"
+        note = (f"{len(kept)} of {counted} reasons still hold, probability "
+                f"{now:.3f} against {bought_at:.3f}")
+    else:
+        status = "intact"
+        note = f"every reason it bought on still holds ({now:.3f})"
+
+    return {"status": status, "note": note, "probability_now": round(now, 4),
+            "probability_at_entry": round(bought_at, 4),
+            "agreement": round(agreement, 3),
+            "kept": kept, "lost": lost}
 
 
 def symbols_to_price() -> set:
@@ -183,22 +265,46 @@ def plan_next(run, *, book: dict | None = None) -> dict | None:
         "buy": [{"symbol": s["symbol"],
                  "weight": round(1.0 / len(chosen), 6),
                  "probability_up": s["probability_up"],
-                 "confidence": s.get("confidence")} for s in chosen],
+                 "confidence": s.get("confidence"),
+                 # Why it wants this one, kept so that later it can be asked
+                 # whether the reason is still there.
+                 "pattern": _pattern_of(s)} for s in chosen],
     }}
     logger.info("Plan: buy %s at the next open (from %s)",
                 ", ".join(s["symbol"] for s in chosen), as_of)
     return _append(entry)["plan"]
 
 
-def advance(frames: dict, *, book: dict | None = None, today=None) -> dict:
-    """Fill a waiting plan, or sell a position whose review date has arrived.
+def _candidate(run, book: dict) -> dict | None:
+    """What the model would buy today, if it were asked. Only used at a review."""
+    signals = [s for s in (getattr(run, "signals", None) or [])
+               if s.get("probability_up") is not None]
+    if not signals:
+        return None
+    best = max(signals, key=lambda s: float(s["probability_up"]))
+    if book.get("long_only", True) and float(best["probability_up"]) <= 0.5:
+        return None
+    return best
+
+
+def advance(frames: dict, *, book: dict | None = None, today=None,
+            run=None) -> dict:
+    """Fill a waiting plan, or review a position whose date has arrived.
 
     Called on a schedule. Does nothing most days, which is the entire point of
     the strategy it is recording.
+
+    A review is not automatically a sale. Pass the latest run and it will ask
+    what the model would buy now: the same name means nothing is traded and the
+    next review moves out, a different name means one round trip, and nothing
+    worth buying means cash. Selling in order to buy the same stock back would
+    pay a round trip to stand still -- and the strategy that was tested never
+    did that, because it only ever charged for a change.
     """
     book = {**BOOK, **(book or {})}
     current = state()
-    out = {"filled": None, "exited": None, "holding": None, "note": None}
+    out = {"filled": None, "exited": None, "holding": None, "note": None,
+           "renewed": None, "watch": None}
 
     if current["plan"] and not current["holding"]:
         filled = _fill(current["plan"], current["cash"], frames)
@@ -210,16 +316,36 @@ def advance(frames: dict, *, book: dict | None = None, today=None) -> dict:
 
     holding = current["holding"]
     if holding:
+        if run is not None:
+            out["watch"] = watch(holding, run,
+                                 (current.get("watch") or {}).get("status"))
         due = _sessions_left(holding, frames, today=today)
         out["holding"] = {**holding, "sessions_left": due["left"],
                           "review_on": due["review_on"],
                           "held_sessions": due["held"]}
         if due["left"] <= 0:
-            exited = _exit(holding, current["cash"], frames)
-            if exited:
-                out["exited"] = exited
-                out["holding"] = None
-                out["note"] = "sold: the review session arrived"
+            held_names = {p["symbol"] for p in holding["bought"]}
+            candidate = _candidate(run, book) if run is not None else None
+
+            if candidate and candidate["symbol"] in held_names and len(held_names) == 1:
+                renewed = _renew(holding, candidate, due)
+                out["renewed"] = renewed
+                out["holding"] = {**holding, "session": renewed["from_session"],
+                                  "sessions_left": int(book["rebalance_every"]),
+                                  "review_on": None}
+                out["note"] = (
+                    f"reviewed and kept {candidate['symbol']}: the model still "
+                    f"calls it up ({float(candidate['probability_up']):.3f}), so "
+                    f"nothing was traded and nothing was paid")
+            else:
+                exited = _exit(holding, current["cash"], frames)
+                if exited:
+                    out["exited"] = exited
+                    out["holding"] = None
+                    out["note"] = (
+                        f"sold at the review: the model now prefers "
+                        f"{candidate['symbol']}" if candidate
+                        else "sold at the review: nothing is called up, so cash")
         else:
             out["note"] = (f"holding {', '.join(p['symbol'] for p in holding['bought'])}"
                            f", {due['left']} session(s) until it decides again")
@@ -243,6 +369,10 @@ def _fill(plan: dict, cash: float, frames: dict) -> dict | None:
             "price": round(float(row["open"]), 6),
             "value": round(value, 4), "fee": round(fee, 4),
             "shares": round((value - fee) / float(row["open"]), 8),
+            # Carried from the plan: what it thought, and why. Without these
+            # the position cannot be asked later whether its case still holds.
+            "probability_up": position.get("probability_up"),
+            "pattern": position.get("pattern") or [],
         })
         spent += fee
 
@@ -279,6 +409,59 @@ def _sessions_left(holding: dict, frames: dict, today=None) -> dict:
     return {"left": max(every - held, 0),
             "review_on": review.date().isoformat() if review is not None else None,
             "held": held}
+
+
+def watch(holding: dict, run, last_status: str | None) -> dict | None:
+    """Re-read the case for what is held, and say so when it changes.
+
+    Deliberately writes nothing unless the verdict changes: a record of events
+    is useful, a daily diary of "still fine" is not. It never trades, and that
+    is now measured rather than assumed.
+
+    Tested on the validation window, paired -- identical picks, identical
+    entries, only the exit differing. The case broke in seven of seven
+    episodes, and **holding on from the break returned +8.65% on average**
+    (median +3.96%, t +3.31), better in every single one. The money agrees:
+    holding to review ended at 1,027 on 14 trades and 56 of fees, while selling
+    on a break and switching ended at 495 on 122 trades and 326 of fees -- two
+    thirds of the account spent on acting on the warning.
+
+    So a break is worth knowing and is not worth trading. If anybody wires this
+    to an exit later, it has to beat that pairing first.
+    """
+    bought = (holding.get("bought") or [{}])[0]
+    signals = {s["symbol"]: s for s in (getattr(run, "signals", None) or [])}
+    signal = signals.get(bought.get("symbol"))
+    if signal is None:
+        return None
+
+    verdict = _compare(bought.get("pattern") or [], signal,
+                       float(bought.get("probability_up") or 0.0))
+    if verdict["status"] == last_status:
+        return verdict
+
+    _append({"watch": {
+        "at": _now(), "symbol": bought.get("symbol"),
+        "session": signal.get("as_of"), **verdict,
+    }})
+    logger.info("Watching %s: %s -- %s", bought.get("symbol"),
+                verdict["status"], verdict["note"])
+    return verdict
+
+
+def _renew(holding: dict, candidate: dict, due: dict) -> dict:
+    """Record a review that confirmed the position. No trade, no fee."""
+    entry = {"renew": {
+        "at": _now(),
+        "symbol": candidate["symbol"],
+        "probability_up": candidate["probability_up"],
+        "held_since": holding["session"],
+        # The clock restarts from the session the review fell on.
+        "from_session": due["review_on"] or holding["session"],
+    }}
+    logger.info("Reviewed and kept %s (%.3f): nothing traded",
+                candidate["symbol"], float(candidate["probability_up"]))
+    return _append(entry)["renew"]
 
 
 def _exit(holding: dict, cash: float, frames: dict) -> dict | None:
@@ -341,6 +524,8 @@ def account(frames: dict | None = None, *, today=None) -> dict:
             })
         position = {
             "since": holding["session"], "book": holding["book"],
+            "watch": current.get("watch"),
+            "bought_because": (holding["bought"][0].get("pattern") or []),
             "trusted": holding.get("trusted"), "marks": marks,
             "held_sessions": due["held"], "sessions_left": due["left"],
             "review_on": due["review_on"],

@@ -247,3 +247,212 @@ def test_a_name_is_billed_where_it_is_listed(store, panel):
     assert swedish < american
     # No currency to cross for a Swedish share held in a Swedish account.
     assert broker.resolve(holding.schedule_for("INVE-B.ST")).fx_per_side == 0.0
+
+
+# --- what happens at a review --------------------------------------------------
+#
+# A review is not automatically a sale. Selling in order to buy the same stock
+# back pays a round trip to stand still, and the strategy that was tested never
+# did it -- the simulation only ever charged for a change.
+
+def held_for(panel, symbols, every=20):
+    dates = sessions_of(panel)
+    holding.plan_next(FakeRun(dates[-40].date().isoformat(), [(symbols[0], 0.9)]),
+                      book={"rebalance_every": every})
+    holding.advance(panel, book={"rebalance_every": every}, today=dates[-39])
+    return dates
+
+
+def test_a_review_that_still_likes_the_name_trades_nothing(store, panel):
+    symbols = sorted(panel)
+    dates = held_for(panel, symbols)
+    lines = len(holding._read())
+
+    out = holding.advance(panel, book={"rebalance_every": 20}, today=dates[-19],
+                          run=FakeRun(dates[-19].date().isoformat(),
+                                      [(symbols[0], 0.88), (symbols[1], 0.4)]))
+
+    assert out["exited"] is None
+    assert out["renewed"]["symbol"] == symbols[0]
+    assert "nothing was traded" in out["note"]
+    # Lines may be appended -- a review is an event, and so is a change in the
+    # watch -- but none of them may be a trade.
+    trades = [e for e in holding._read() if "fill" in e or "exit" in e]
+    assert len(trades) == 1, "it traded at a review that changed nothing"
+    assert holding.account(panel, today=dates[-19])["fees"] == pytest.approx(
+        holding.state()["holding"]["fees"])
+    assert len(holding._read()) > lines
+
+
+def test_a_review_that_prefers_another_name_sells(store, panel):
+    symbols = sorted(panel)
+    dates = held_for(panel, symbols)
+
+    out = holding.advance(panel, book={"rebalance_every": 20}, today=dates[-19],
+                          run=FakeRun(dates[-19].date().isoformat(),
+                                      [(symbols[0], 0.51), (symbols[1], 0.93)]))
+
+    assert out["renewed"] is None
+    assert out["exited"] is not None
+    assert symbols[1] in out["note"]
+    assert holding.state()["holding"] is None
+
+
+def test_a_review_with_nothing_worth_buying_goes_to_cash(store, panel):
+    symbols = sorted(panel)
+    dates = held_for(panel, symbols)
+
+    out = holding.advance(panel, book={"rebalance_every": 20}, today=dates[-19],
+                          run=FakeRun(dates[-19].date().isoformat(),
+                                      [(s, 0.4) for s in symbols]))
+
+    assert out["exited"] is not None
+    assert "nothing is called up" in out["note"]
+
+
+def test_a_renewed_position_waits_another_full_interval(store, panel):
+    symbols = sorted(panel)
+    dates = held_for(panel, symbols)
+    holding.advance(panel, book={"rebalance_every": 20}, today=dates[-19],
+                    run=FakeRun(dates[-19].date().isoformat(), [(symbols[0], 0.9)]))
+
+    # The clock restarts from the review session, so it is not due again.
+    out = holding.advance(panel, book={"rebalance_every": 20}, today=dates[-10],
+                          run=FakeRun(dates[-10].date().isoformat(),
+                                      [(symbols[1], 0.99)]))
+    assert out["exited"] is None
+    assert out["holding"]["sessions_left"] > 0
+
+
+def test_it_ignores_the_model_entirely_between_reviews(store, panel):
+    """The deafness is the strategy: a better-looking name tomorrow is not a
+    reason to pay a round trip today."""
+    symbols = sorted(panel)
+    dates = held_for(panel, symbols, every=60)
+    lines = len(holding._read())
+
+    for day in range(1, 10):
+        out = holding.advance(panel, book={"rebalance_every": 60},
+                              today=dates[-39 + day],
+                              run=FakeRun(dates[-39 + day].date().isoformat(),
+                                          [(symbols[1], 0.99)]))
+        assert out["exited"] is None and out["renewed"] is None
+
+    assert len(holding._read()) == lines
+
+
+# --- watching the case it bought on --------------------------------------------
+#
+# A warning is free and a change of mind is a round trip, so the two are kept
+# apart: this re-reads today's reasons for the name already held and says how
+# much of the original argument survives. It never trades on what it finds.
+
+def reasoned(symbol, probability, drivers):
+    """A signal carrying per-feature contributions, the way a run records them."""
+    return {"symbol": symbol, "as_of": "2026-09-25",
+            "probability_up": probability,
+            "confidence": abs(probability - 0.5) * 2,
+            "all_contributions": [{"feature": name, "effect": effect, "z": -1.0}
+                                  for name, effect in drivers.items()]}
+
+
+class ReasonedRun:
+    run_id = "run-2"
+    trust = {"trusted": False, "reason": "test"}
+
+    def __init__(self, signals):
+        self.signals = signals
+
+
+def bought_on(store, panel, symbol, drivers, probability=0.9, every=60):
+    dates = sessions_of(panel)
+    run = ReasonedRun([reasoned(symbol, probability, drivers)])
+    run.signals[0]["as_of"] = dates[-40].date().isoformat()
+    holding.plan_next(run, book={"rebalance_every": every})
+    holding.advance(panel, book={"rebalance_every": every}, today=dates[-39])
+    return dates
+
+
+def test_it_remembers_why_it_bought(store, panel):
+    symbols = sorted(panel)
+    bought_on(store, panel, symbols[0], {"rsi_14": 0.03, "volatility_20d": 0.02,
+                                         "gold_return_20d": -0.05})
+
+    pattern = holding.state()["holding"]["bought"][0]["pattern"]
+    # Only the reasons that argued for the buy.
+    assert [d["feature"] for d in pattern] == ["rsi_14", "volatility_20d"]
+
+
+def test_an_intact_pattern_says_so_without_writing_every_day(store, panel):
+    symbols = sorted(panel)
+    dates = bought_on(store, panel, symbols[0], {"rsi_14": 0.03, "volatility_20d": 0.02})
+    same = ReasonedRun([reasoned(symbols[0], 0.9, {"rsi_14": 0.03,
+                                                   "volatility_20d": 0.02})])
+
+    first = holding.advance(panel, book={"rebalance_every": 60},
+                            today=dates[-38], run=same)
+    lines = len(holding._read())
+    second = holding.advance(panel, book={"rebalance_every": 60},
+                             today=dates[-37], run=same)
+
+    assert first["watch"]["status"] == "intact"
+    assert second["watch"]["status"] == "intact"
+    assert len(holding._read()) == lines, "it wrote a diary entry for no news"
+
+
+def test_a_broken_pattern_warns_and_does_not_sell(store, panel):
+    """The point of the whole thing: notice, say so, hold anyway."""
+    symbols = sorted(panel)
+    dates = bought_on(store, panel, symbols[0], {"rsi_14": 0.03, "volatility_20d": 0.02})
+
+    gone = ReasonedRun([reasoned(symbols[0], 0.62, {"rsi_14": -0.01,
+                                                    "volatility_20d": -0.02})])
+    out = holding.advance(panel, book={"rebalance_every": 60}, today=dates[-38],
+                          run=gone)
+
+    assert out["watch"]["status"] == "broken"
+    assert "have gone" in out["watch"]["note"]
+    assert out["exited"] is None, "a warning is not a reason to pay a round trip"
+    assert holding.state()["holding"] is not None
+
+
+def test_the_model_turning_against_it_is_a_break(store, panel):
+    symbols = sorted(panel)
+    dates = bought_on(store, panel, symbols[0], {"rsi_14": 0.03})
+
+    turned = ReasonedRun([reasoned(symbols[0], 0.41, {"rsi_14": 0.03})])
+    out = holding.advance(panel, book={"rebalance_every": 60}, today=dates[-38],
+                          run=turned)
+
+    assert out["watch"]["status"] == "broken"
+    assert "no longer calls it up" in out["watch"]["note"]
+    assert out["exited"] is None
+
+
+def test_a_weakening_case_reads_as_drifting(store, panel):
+    symbols = sorted(panel)
+    dates = bought_on(store, panel, symbols[0], {"rsi_14": 0.03, "volatility_20d": 0.02})
+
+    weaker = ReasonedRun([reasoned(symbols[0], 0.7, {"rsi_14": 0.03,
+                                                     "volatility_20d": -0.01})])
+    out = holding.advance(panel, book={"rebalance_every": 60}, today=dates[-38],
+                          run=weaker)
+
+    assert out["watch"]["status"] == "drifting"
+    assert out["watch"]["agreement"] == pytest.approx(0.5)
+
+
+def test_the_warning_is_forgotten_when_the_position_is(store, panel):
+    """A warning belongs to a position. Selling ends both."""
+    symbols = sorted(panel)
+    dates = bought_on(store, panel, symbols[0], {"rsi_14": 0.03}, every=20)
+
+    holding.advance(panel, book={"rebalance_every": 20}, today=dates[-38],
+                    run=ReasonedRun([reasoned(symbols[0], 0.41, {"rsi_14": 0.03})]))
+    assert holding.state()["watch"]["status"] == "broken"
+
+    # The review arrives and the model prefers something else, so it sells.
+    holding.advance(panel, book={"rebalance_every": 20}, today=dates[-19],
+                    run=ReasonedRun([reasoned(symbols[1], 0.95, {"rsi_14": 0.04})]))
+    assert holding.state()["holding"] is None
+    assert holding.state()["watch"] is None

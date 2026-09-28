@@ -788,7 +788,13 @@ def follow_book(run=None, watchlist: Sequence[str] | None = None) -> dict:
             return {"note": "nothing planned or held"}
 
         frames = prices_mod.load_many(sorted(symbols), period="2y")
-        return holding_mod.advance(frames)
+        step = holding_mod.advance(frames, run=run)
+
+        # A review that sold leaves the book in cash with today's opinion still
+        # in hand, so it can choose again in the same pass.
+        if step.get("exited") and run is not None:
+            holding_mod.plan_next(run)
+        return step
     except Exception as exc:                            # noqa: BLE001
         logger.warning("Could not move the held book forward: %s", exc)
         return {"error": str(exc)}

@@ -816,6 +816,55 @@ only the money hurdle speaks for a one-sided book.
 
 ---
 
+## The committed book, and why it does not panic
+
+`/pnl` follows what the search committed: long only, one position, reviewed
+every sixty sessions, priced at the market each name is actually billed on.
+Three kinds of line, appended and never rewritten — `plan` (what it wants to
+buy, written before the price exists), `fill` (what it paid, at the first open
+after the plan) and `exit` (what it sold for, on the session the plan named).
+
+Between reviews it is **deaf on purpose**. New signals arrive every day and are
+ignored, because at this account size every change of mind is a round trip and
+twice-monthly second-guessing is about 15% a year in fees. At the review it
+either keeps the name — costing nothing, the clock restarting — switches, or
+goes to cash if nothing is called up. An early version sold at every review and
+rebought, paying a round trip to stand still; the strategy that was simulated
+never did that, because it only ever charged for a change.
+
+### It notices when its reasons stop being true, and holds anyway
+
+A buy is made on a pattern: the features that pushed the probability up. Those
+are recorded at entry, and every day the same name is re-read. The verdict is
+`intact`, `drifting`, or `broken` — broken meaning the model no longer calls it
+up at all, or most of the reasons it bought on have stopped arguing for it. It
+is written down only when it changes, and shown on the page in plain words.
+
+**It never trades on it**, and that is measured rather than assumed. Paired on
+the validation window — identical picks, identical entries, only the exit rule
+differing:
+
+| rule | ends with | trades | fees |
+|---|---|---|---|
+| **hold to review (committed)** | **$1,028** | 14 | $56 |
+| exit when the model turns, then switch | $671 | 58 | $178 |
+| exit when the model turns, then cash | $401 | 52 | $131 |
+| exit when the pattern breaks, then switch | $495 | 122 | $326 |
+| exit when the pattern breaks, then cash | $669 | 86 | $278 |
+
+And episode by episode, which is the honest version of the question: the
+pattern broke in **seven of seven** episodes, and holding on from the break
+returned **+8.65% on average** (median +3.96%, t +3.31) — better in **every
+one**. The breaks were real and they were not warnings of further losses.
+
+Seven episodes is not a law, and the window was a rising market. But both the
+money and the pairing point the same way, and the fee arithmetic settles it:
+acting on the warning spends two thirds of the account on trades. So a break is
+worth knowing and is not worth trading, which is the whole reason the warning
+and the action are separate things here.
+
+---
+
 ## The first thing that beat doing nothing
 
 Every strategy here died of turnover rather than of signal, so the obvious test
@@ -1025,6 +1074,8 @@ broker.py     what Nordnet and Avanza charge: percentage or minimum, plus
    |          currency -- and what that does to a book of small positions
 book.py       a book walked forward in money, and the percentile against the
    |          same trade pattern picked at random
+holding.py    the committed book as a forward record: plan, fill, hold, review
+   |          -- and the watch that says when its reasons stopped being true
 auto.py       the scheduler: collect, settle, and train when a session closes
 features.py   18 per-symbol indicators, every one computable at that close
 cross.py      9 -- where this name sits among its peers, lagged one session
@@ -1137,7 +1188,7 @@ times the old default, which is a real request of somebody else's GPU.
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-279 tests. The look-ahead ones test the property rather than the implementation
+304 tests. The look-ahead ones test the property rather than the implementation
 — features computed on a truncated history must match the full one — and there
 is a test that deliberately introduces a centred rolling window to confirm the
 property test can still fail. The macro, cross-sectional and event blocks each
