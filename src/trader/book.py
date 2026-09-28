@@ -42,9 +42,13 @@ DEFAULT_ACCOUNT = 500.0
 # commission is nothing -- this is the entire cost.
 DEFAULT_SPREAD = evaluate_mod.DEFAULT_COST
 
-# How many random books to compare against. Enough that a 95th percentile means
-# something and the whole search still finishes in a couple of minutes.
-DRAWS = 200
+# How many random books to compare against. Two hundred was not enough and it
+# cost a real decision: a book measured at 94% on 200 draws -- and rejected for
+# missing a 95% bar -- came back at 96.2% (95.4-97.1) on two thousand. The
+# standard error on a 95th percentile is about 1.5 points at 200 draws and 0.5
+# at 2,000, so a hard threshold needs the latter. A search of a dozen books
+# still finishes in a couple of minutes.
+DRAWS = 2000
 
 
 def targets(signal: pd.DataFrame, sessions, *, top: int, long_only: bool = True,

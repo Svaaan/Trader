@@ -46,6 +46,8 @@ from starlette.requests import Request
 
 from .. import auto as auto_mod
 from .. import context as context_mod
+from .. import holding as holding_mod
+from .. import prices as prices_mod
 from .. import news as news_mod
 from .. import paper as paper_mod
 from .. import pipeline
@@ -241,6 +243,25 @@ def api_pnl_settle(background: BackgroundTasks):
     """Fill anything whose session has happened. Safe to call repeatedly."""
     background.add_task(pipeline.settle_paper)
     return {"status": "settling"}
+
+
+@app.get("/api/book")
+def api_book():
+    """The committed book: what it holds, and when it decides again."""
+    try:
+        symbols = sorted(holding_mod.symbols_to_price())
+        frames = prices_mod.load_many(symbols, period="2y") if symbols else {}
+        return holding_mod.account(frames)
+    except Exception as exc:                            # noqa: BLE001
+        logger.exception("Could not read the held book")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.post("/api/book/advance")
+def api_book_advance(background: BackgroundTasks):
+    """Fill what is planned, or sell if the review session has arrived."""
+    background.add_task(pipeline.follow_book)
+    return {"status": "working"}
 
 
 @app.get("/api/runs")

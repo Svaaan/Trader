@@ -190,6 +190,17 @@ def cycle(*, backend: str = "local", watchlist=None, trained_for: str | None = N
     out["settled"] = settled.get("settled", 0)
     out["pending"] = settled.get("pending", 0)
 
+    # The committed book: fill what was planned, sell when the review session
+    # arrives. Most days this does nothing, which is the strategy.
+    step = pipeline_mod.follow_book()
+    out["book"] = {k: v for k, v in step.items() if k != "holding"}
+    if step.get("holding"):
+        out["holding"] = {
+            "symbols": [p["symbol"] for p in step["holding"].get("bought", [])],
+            "sessions_left": step["holding"].get("sessions_left"),
+            "review_on": step["holding"].get("review_on"),
+        }
+
     session = last_closed_session()
     out["session"] = session
 

@@ -63,6 +63,8 @@ def scheduler(tmp_path, monkeypatch):
     monkeypatch.setattr(auto.pipeline_mod, "start", train)
     monkeypatch.setattr(auto.pipeline_mod, "collect_all", collect_all)
     monkeypatch.setattr(auto.pipeline_mod, "settle_paper", settle)
+    monkeypatch.setattr(auto.pipeline_mod, "follow_book",
+                        lambda *a, **k: {"note": "stubbed"})
     monkeypatch.setattr(auto, "last_closed_session", lambda: "2026-09-25")
 
     yield calls
@@ -249,7 +251,8 @@ def test_the_page_can_start_and_stop_it(client):
 
     stopped = client.post("/api/auto/stop")
     assert stopped.status_code == 200
-    assert stopped.json()["running"] is False
+    assert stopped.json()["stop_requested"] is True
+    assert wait_until(lambda: not auto.running()), "the loop never stopped"
 
 
 def test_the_page_refuses_a_pointless_interval(client):

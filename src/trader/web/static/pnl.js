@@ -173,6 +173,89 @@ function curvePanel(account) {
 
 // --- assembly ---------------------------------------------------------------
 
+function bookPanel(book) {
+  if (!book || book.error) return null;
+
+  const panel = el("section", "panel");
+  panel.appendChild(el("h3", null, "The committed book"));
+
+  const rule = book.book || {};
+  panel.appendChild(el("p", "note",
+    `Long only, top ${rule.top_n}, reviewed every ${rule.rebalance_every} sessions, `
+    + `at ${book.schedule}. It buys at the first open after it decides, and sells `
+    + `at the open of the session it said it would — not on the day the number looks good.`));
+
+  const grid = el("div", "figures");
+  grid.appendChild(figure("Account", money(book.equity),
+    `from ${money(book.starting_cash)}`));
+  grid.appendChild(figure("Profit", money(book.profit), pct(book.return)));
+  grid.appendChild(figure("Trades", String(book.trades || 0),
+    `${money(book.fees)} in fees`));
+  panel.appendChild(grid);
+
+  const waiting = book.waiting_to_buy;
+  const held = book.position;
+
+  if (held) {
+    const mark = held.marks[0] || {};
+    const state = el("div", "call");
+    state.appendChild(el("h4", null, `Holding ${mark.symbol}`));
+    state.appendChild(el("p", null,
+      `Bought ${money(mark.price)} on ${mark.session}, now ${money(mark.last)} `
+      + `(${pct(mark.move)}). Worth ${money(held.worth)}.`));
+    state.appendChild(el("p", "verdict",
+      held.sessions_left > 0
+        ? `Sells on ${held.review_on} — ${held.sessions_left} session(s) away. `
+          + `Held ${held.held_sessions} so far, and nothing is traded in between.`
+        : `The review session has arrived: it sells at the next open.`));
+    if (held.trusted === false) {
+      state.appendChild(el("p", "note",
+        "Recorded while the gate was shut, so this is a record of what it would "
+        + "have done, not a recommendation."));
+    }
+    panel.appendChild(state);
+  } else if (waiting) {
+    const buys = (waiting.buy || []).map((b) =>
+      `${b.symbol} (${pct(b.probability_up)} up)`).join(", ");
+    const state = el("div", "call");
+    state.appendChild(el("h4", null, `Wants to buy ${buys}`));
+    state.appendChild(el("p", null,
+      `Decided from the close of ${waiting.as_of}. It fills at the next open — `
+      + `the price does not exist yet, which is what makes this a forward record.`));
+    panel.appendChild(state);
+  } else {
+    panel.appendChild(el("p", "empty",
+      "In cash. It plans a buy after the next run produces signals."));
+  }
+
+  const closed = book.closed || [];
+  if (closed.length) {
+    panel.appendChild(el("h4", null, "What it has done"));
+    const table = el("table", "table");
+    const head = el("tr");
+    ["Bought", "Sold", "Name", "In", "Out", "Move", "Profit"]
+      .forEach((h) => head.appendChild(el("th", null, h)));
+    table.appendChild(head);
+    closed.slice().reverse().forEach((trade) => {
+      (trade.sold || []).forEach((sale) => {
+        const row = el("tr");
+        row.appendChild(el("td", null, trade.opened));
+        row.appendChild(el("td", null, trade.session));
+        row.appendChild(el("td", null, sale.symbol));
+        row.appendChild(el("td", null, money(sale.bought_at)));
+        row.appendChild(el("td", null, money(sale.price)));
+        row.appendChild(el("td", sale.gross_return < 0 ? "is-down" : "is-up",
+          pct(sale.gross_return)));
+        row.appendChild(el("td", trade.profit < 0 ? "is-down" : "is-up",
+          money(trade.profit)));
+        table.appendChild(row);
+      });
+    });
+    panel.appendChild(table);
+  }
+  return panel;
+}
+
 function brokerPanel(account) {
   const brokers = account.brokers || [];
   if (!brokers.length) return null;
@@ -218,14 +301,18 @@ async function refresh() {
   const host = document.getElementById("pnl");
 
   try {
-    const response = await fetch("/api/pnl");
+    const [response, bookResponse] = await Promise.all([
+      fetch("/api/pnl"),
+      fetch("/api/book").catch(() => null),
+    ]);
     if (!response.ok) throw new Error(`server returned ${response.status}`);
     const body = await response.json();
     const account = body.account || {};
+    const book = bookResponse && bookResponse.ok ? await bookResponse.json() : null;
 
     host.replaceChildren();
 
-    if (!account.days && !account.pending) {
+    if (!account.days && !account.pending && !(book && (book.position || book.waiting_to_buy))) {
       host.appendChild(el("p", "empty",
         "Nothing recorded yet. Train a model and the ledger starts the same "
         + "evening — the first line settles at the next open."));
@@ -236,8 +323,8 @@ async function refresh() {
       `Filled at the open after each signal, closed at that session's close, `
       + `${pct(body.cost_per_side, 2)} charged each way.`));
 
-    [standingPanel(account), brokerPanel(account), divergencePanel(body),
-     curvePanel(account)]
+    [bookPanel(book), standingPanel(account), brokerPanel(account),
+     divergencePanel(body), curvePanel(account)]
       .filter(Boolean)
       .forEach((panel) => host.appendChild(panel));
 

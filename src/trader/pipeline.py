@@ -48,6 +48,7 @@ from . import features as features_mod
 from . import labels as labels_mod
 from . import model as model_mod
 from . import news as news_mod
+from . import holding as holding_mod
 from . import paper as paper_mod
 from . import prices as prices_mod
 from . import trainer as trainer_mod
@@ -477,6 +478,7 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
                             else "finished")
             if not submitted:
                 record_paper(run)
+                follow_book(run)
                 logger.info("Run %s finished locally: %s", run_id, run.verdict)
         elif submitted:
             run.status = "training"
@@ -539,6 +541,7 @@ def collect(run: Run, *, client: Client | None = None) -> Run:
         _process(run)
         run.status = "done"
         record_paper(run)
+        follow_book(run)
 
     except Exception as exc:                            # noqa: BLE001
         run.status = "failed"
@@ -766,6 +769,29 @@ def record_paper(run: Run, *, top_n: int | None = None) -> dict | None:
     except Exception as exc:                            # noqa: BLE001
         logger.warning("Could not record paper intent: %s", exc)
         return None
+
+
+def follow_book(run=None, watchlist: Sequence[str] | None = None) -> dict:
+    """Move the committed book forward one step: plan, fill, hold, or sell.
+
+    The search committed one position rebalanced every sixty sessions, which is
+    the only shape this account size can carry -- see holding.py. Called after a
+    run finishes (to plan from today's signals) and on every scheduler cycle (to
+    fill what was planned and to sell when the review session arrives).
+    """
+    try:
+        if run is not None and (run.signals or []):
+            holding_mod.plan_next(run)
+
+        symbols = set(holding_mod.symbols_to_price())
+        if not symbols:
+            return {"note": "nothing planned or held"}
+
+        frames = prices_mod.load_many(sorted(symbols), period="2y")
+        return holding_mod.advance(frames)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("Could not move the held book forward: %s", exc)
+        return {"error": str(exc)}
 
 
 def settle_paper(watchlist: Sequence[str] | None = None) -> dict:
