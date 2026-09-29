@@ -46,7 +46,9 @@ from starlette.requests import Request
 
 from .. import auto as auto_mod
 from .. import context as context_mod
+from .. import challenge as challenge_mod
 from .. import holding as holding_mod
+from .. import promote as promote_mod
 from .. import prices as prices_mod
 from .. import news as news_mod
 from .. import paper as paper_mod
@@ -246,14 +248,48 @@ def api_pnl_settle(background: BackgroundTasks):
 
 
 @app.get("/api/book")
-def api_book():
-    """The committed book: what it holds, and when it decides again."""
+def api_book(book_id: str | None = None):
+    """A book: what it holds, and when it decides again.
+
+    The funded one by default; `?book_id=` reads a challenger instead.
+    """
     try:
         symbols = sorted(holding_mod.symbols_to_price())
         frames = prices_mod.load_many(symbols, period="2y") if symbols else {}
-        return holding_mod.account(frames)
+        return holding_mod.account(frames,
+                                   book_id=book_id or holding_mod.funded())
     except Exception as exc:                            # noqa: BLE001
         logger.exception("Could not read the held book")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/books")
+def api_books():
+    """Every book in the contest, the funded one first."""
+    try:
+        symbols = sorted(holding_mod.symbols_to_price())
+        frames = prices_mod.load_many(symbols, period="2y") if symbols else {}
+        return holding_mod.accounts(frames)
+    except Exception as exc:                            # noqa: BLE001
+        logger.exception("Could not read the contest")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/contest")
+def api_contest():
+    """The books, what the promotion rule makes of them, and the guard."""
+    try:
+        symbols = sorted(holding_mod.symbols_to_price())
+        frames = prices_mod.load_many(symbols, period="2y") if symbols else {}
+        return {"books": holding_mod.accounts(frames),
+                "funded": holding_mod.funded(),
+                "promotion": promote_mod.decide(),
+                "guard": promote_mod.drift(),
+                "asked": challenge_mod.spent_this_week(),
+                "budget": challenge_mod.BUDGET_PER_WEEK,
+                "waiting": len(challenge_mod.candidates())}
+    except Exception as exc:                            # noqa: BLE001
+        logger.exception("Could not read the contest")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 

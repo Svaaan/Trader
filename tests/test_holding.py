@@ -12,6 +12,7 @@ fill happens at the next open, and the sale happens on the session the plan
 named -- not on the day the number looks good.
 """
 
+import json
 import os
 import sys
 
@@ -491,3 +492,123 @@ def test_the_log_explains_a_warning_without_claiming_it_acted(store, panel):
 
 def test_an_empty_record_logs_nothing(store):
     assert holding.log() == []
+
+
+# --- many books, one of them funded --------------------------------------------
+#
+# A challenger has to earn a forward record the same way the champion does:
+# same machinery, same costs, same forward-only discipline. The only difference
+# is that nobody would have traded it. So every line carries the name of the
+# book it belongs to, and the books keep separate accounts.
+
+def test_the_record_written_before_books_had_names_belongs_to_the_champion(
+        store, panel):
+    """The one thing here that cannot be recreated is the record already built."""
+    symbols = sorted(panel)
+    dates = sessions_of(panel)
+    # A line in the old shape: no book_id at all.
+    path = holding._path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(json.dumps({"plan": {
+            "at": "2026-09-25T00:00:00+00:00", "as_of": dates[-40].date().isoformat(),
+            "run_id": "old", "book": holding.BOOK, "trusted": False,
+            "buy": [{"symbol": symbols[0], "weight": 1.0,
+                     "probability_up": 0.9, "pattern": []}]}}) + "\n")
+
+    assert holding.state()["plan"]["run_id"] == "old"
+    assert holding.state(holding.CHAMPION)["plan"]["run_id"] == "old"
+
+
+def test_a_challenger_keeps_its_own_account(store, panel):
+    symbols = sorted(panel)
+    dates = sessions_of(panel)
+    holding.register("wide-5", rule={"top_n": 2, "rebalance_every": 20},
+                     why="does spreading it thinner survive the fees?")
+
+    run = FakeRun(dates[-40].date().isoformat(),
+                  [(symbols[0], 0.9), (symbols[1], 0.85)] + [(s, 0.3) for s in symbols[2:]])
+    holding.plan_all(run)
+    holding.advance_all(panel, today=dates[-39])
+
+    champion = holding.state(holding.CHAMPION)
+    challenger = holding.state("wide-5")
+
+    assert len(champion["holding"]["bought"]) == 1
+    assert len(challenger["holding"]["bought"]) == 2
+    # Separate accounts: both started with the same cash and spent their own.
+    assert champion["cash"] != challenger["cash"]
+    assert holding.account(panel, book_id="wide-5")["equity"] > 0
+
+
+def test_only_one_book_is_funded(store):
+    holding.register("challenger", rule={"top_n": 3}, why="testing")
+    assert holding.funded() == holding.CHAMPION
+    assert holding.books()["challenger"]["funded"] is False
+
+    holding.fund("challenger", why="it won the contest")
+    assert holding.funded() == "challenger"
+    assert holding.books()[holding.CHAMPION]["funded"] is False
+
+    with pytest.raises(ValueError, match="not in the contest"):
+        holding.fund("nobody", why="typo")
+
+
+def test_a_book_cannot_join_twice(store):
+    holding.register("twice", rule={"top_n": 2}, why="first")
+    with pytest.raises(ValueError, match="already in the contest"):
+        holding.register("twice", rule={"top_n": 3}, why="second")
+
+
+def test_prices_are_fetched_for_every_book(store, panel):
+    symbols = sorted(panel)
+    dates = sessions_of(panel)
+    holding.register("other", rule={"top_n": 1}, why="testing")
+
+    holding.plan_next(FakeRun(dates[-40].date().isoformat(), [(symbols[0], 0.9)]))
+    holding.plan_next(FakeRun(dates[-40].date().isoformat(), [(symbols[3], 0.95)]),
+                      book_id="other")
+
+    assert holding.symbols_to_price() == {symbols[0], symbols[3]}
+
+
+def test_each_book_follows_its_own_rule(store, panel):
+    symbols = sorted(panel)
+    dates = sessions_of(panel)
+    holding.register("quick", rule={"top_n": 1, "rebalance_every": 20},
+                     why="does reviewing sooner help?")
+
+    run = FakeRun(dates[-40].date().isoformat(), [(symbols[0], 0.9)])
+    holding.plan_all(run)
+    holding.advance_all(panel, today=dates[-39])
+
+    # The champion reviews every 60 sessions, the challenger every 20, so only
+    # one of them is due at the same moment.
+    stepped = holding.advance_all(panel, today=dates[-19],
+                                  run=FakeRun(dates[-19].date().isoformat(),
+                                              [(symbols[1], 0.99)]))
+    assert stepped[holding.CHAMPION]["exited"] is None
+    assert stepped["quick"]["exited"] is not None
+
+
+def test_the_contest_puts_the_funded_book_first(store, panel):
+    holding.register("shadow", rule={"top_n": 2}, why="testing")
+    listed = holding.accounts(panel)
+
+    assert [book["book_id"] for book in listed][0] == holding.CHAMPION
+    assert listed[0]["funded"] is True
+    assert {book["book_id"] for book in listed} == {holding.CHAMPION, "shadow"}
+    assert listed[1]["why"] == "testing"
+
+
+def test_a_log_belongs_to_its_own_book(store, panel):
+    symbols = sorted(panel)
+    dates = sessions_of(panel)
+    holding.register("other", rule={"top_n": 1}, why="testing")
+    holding.plan_next(FakeRun(dates[-40].date().isoformat(), [(symbols[0], 0.9)]))
+    holding.plan_next(FakeRun(dates[-40].date().isoformat(), [(symbols[3], 0.95)]),
+                      book_id="other")
+
+    assert symbols[0] in holding.log()[0]["text"]
+    assert symbols[3] in holding.log(book_id="other")[0]["text"]
+    assert len(holding.log()) == 1

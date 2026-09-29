@@ -1,1186 +1,292 @@
 # Trader
 
-Direction signals for US and European equities, trained two ways and scored
-honestly.
+Direction signals for 241 US and European equities, graded honestly enough to
+say when they are worthless — which, so far, is most of the time.
 
-It fetches daily prices, builds features from five sources, and trains on the
-training half — here in numpy, or on HelloWorldAi across a network, or both at
-once so the two can be compared. Either way the model is graded on the last
-stretch of history it was never given.
-
-**It produces an opinion about direction and nothing else.** No orders, no
-broker credentials, no keys to anything that can spend money. Adding execution
-later is a deliberate separate step, not a switch to flip.
+**It produces an opinion and a paper record. Nothing else.** No orders, no
+broker credentials, no keys to anything that can spend money.
 
 ```bash
 python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
+cp env/.env.example env/.env          # a submitter key, only for the remote trainer
 
-cp env/.env.example env/.env      # then put a submitter key in it
-
-python train.py                   # train here AND on HelloWorldAi, then compare
-python train.py --backend local   # here only: ~30s, no network, no key needed
-python search.py run --horizon 1,5   # try configurations; the test set stays sealed
-python auto.py                    # keep training on a schedule; Ctrl+C stops it
-python run.py                     # the UI, on http://127.0.0.1:8600
-python watch.py --news            # collect finished models, grow the news store
+python train.py --backend local       # train and grade, ~1 min, no network
+python run.py                         # the UI on http://127.0.0.1:8600
+python auto.py                        # the scheduler: collect, settle, review, archive
+python search.py board                # what has been tried, and the bar it must clear
 ```
 
-The first run fetches a few hundred price histories and takes some minutes.
-Everything after that is cached. Set `TRADER_UNIVERSE=core` to work with ten
-symbols while iterating on code.
+First run fetches a few hundred price histories; everything after that is
+cached. `TRADER_UNIVERSE=core` works with ten symbols while iterating.
 
 ---
 
-## What it actually found
+## What it found
 
-Something more interesting than "no edge", and worse.
+**The model is accurate and unprofitable.** On 464 sealed sessions it scores
+50.8% against a 50.0% baseline — a real edge, positive in six of six
+walk-forward windows — and it **loses money**, with an open-to-close
+t-statistic of −3.19.
 
-On 238 symbols with a relative target — 428,100 training rows, 107,165 test rows
-it never saw — a plain logistic regression is **reliably more accurate than the
-baseline and reliably loses money**:
+Both things are true because of *when* the move happens:
 
-| | |
-|---|---|
-| Accuracy, out of time | 51.11% |
-| Baseline (the training majority) | 50.03% |
-| Edge | **+1.08 points** |
-| Rows / effective rows | 107,165 / 25,520 |
-| Chance would produce | 0.63 points |
-| Seed-to-seed spread | 0.07 points |
-| Walk-forward windows positive | **6 of 6** (mean +1.47, sd 0.56) |
-| | |
-| Sharpe, after costs | **−0.68** |
-| Return t-statistic | **−0.93** |
-| Annualised | **−3.2%** |
-
-Every accuracy hurdle passes, and passes comfortably. The edge is seventeen
-times the seed spread, nearly twice what chance produces on the discounted
-sample, and positive in *every one* of six consecutive out-of-time windows.
-It is not noise.
-
-It is also worth −3.2% a year, because the model is right about small moves and
-wrong about large ones. That is a real and well-documented way to be accurate
-and broke, and it is exactly what `evaluate.py` was always warning about:
-*"Being right about nine small moves and wrong about one large one is a losing
-week that reads as 90% accurate."*
-
-**The gate opened on it.** Five hurdles were not enough, and I only found that
-out by running them on a wide panel and looking at the money column. There is
-now a sixth — the return's t-statistic has to clear 2 — and the page it would
-have printed "Buy now" on now reads *still collecting data*.
-
-That is the whole argument for building the harness before the strategy. The
-harness is what tells you that your most convincing result is a losing one.
-
-For contrast, the original absolute target on the same panel: the seed spread
-alone was 1.84 points, walk-forward was positive in 1 of 6 windows, and the mean
-edge across windows was −2.44%. Every "edge" ever measured on that setup was
-smaller than the gap between a model and itself.
-
----
-
-## The number that decides it: what an order could actually reach
-
-The features on day *t* are computed from day *t*'s close. Nobody knows that
-close until the session has ended, so nobody can be positioned **at** it on the
-strength of it. The earliest an order can go in is the next open.
-
-But the label runs close to close. So the thing the whole harness was grading is
-a trade that cannot be placed.
-
-Decomposing the gross P&L of the logistic control by holding window — same rows,
-same positions, same demeaning, only the window differs:
-
-| window | gross P&L per row | |
+| window | per row | annualised |
 |---|---|---|
-| close(t) → close(t+1) — **what the label means** | **+2.96 bp** | daily Sharpe **+1.67** |
-| ↳ the overnight gap alone | **+3.84 bp** | *more than all of it* |
-| ↳ open(t+1) → close(t+1) — **what an order reaches** | **−0.80 bp** | Sharpe **−0.40** |
+| close → close, what the label describes | +2.5 bp | +14.4% |
+| ├ overnight, close → next open | **+2.2 bp** | — |
+| └ open → close, what an order can reach | +0.3 bp | +5.4% |
 
-The entire gross edge is the overnight gap, and the gap belongs to whoever was
-already holding. By the open it has happened; what remains is negative **before
-costs**. Zero commission would not save this.
+**Roughly 90% of the gross edge is the overnight gap**, which a signal computed
+from the closing price cannot be positioned for. Every number here is reported
+over both windows for that reason, and the gate reads the second one.
 
-That reframes the earlier finding. "Accurate but unprofitable after costs" was
-true and too kind. The deeper problem is that the quantity being measured was
-never reachable — and the most encouraging number in the project, a daily Sharpe
-of +1.67, is the one that describes it.
+Trading the gap directly does not rescue it: the overnight drift is real
+(+4.5 bp a night, t +3.77, 71% of symbols positive) and **smaller than the
+spread you cross to capture it** — 10 bp there and back, before commission.
 
-So every evaluation now reports both windows, `labels.executable_return`
-computes the second, and **the gate reads the executable one**. The verdict says
-so in as many words when they disagree:
+## What a trade costs, and why that decides the design
 
-> +0.8% over the baseline, and close to close that is Sharpe +1.67 — but held
-> from the first open after the signal exists it is −0.40, t −1.4. The edge is in
-> the overnight gap, which is gone by the time anybody could trade on it.
+A retail Nordic broker charges a percentage **or a minimum, whichever is
+larger**. Read off their own price pages on 2026-09-28 (`broker.py` keeps each
+source and date):
 
-Both series are demeaned the same way for a relative target, so the comparison
-between them is a comparison of windows and not of conventions. Old runs without
-the field fall back to the graded number, which is the optimistic assumption
-this argument exists to stop anybody making silently.
-
----
-
-## The paper ledger: the one measurement that cannot be mined
-
-`/pnl` is a forward paper account — $500, filled at the first open after each
-signal, closed at that session's close, 5bp charged each way. No orders are
-placed and no broker is involved.
-
-Everything else in this project is a backtest, and a backtest can be mined. This
-cannot, because when each line is written **the outcome has not happened yet**.
-That one property is worth more than any amount of careful splitting.
-
-It is also fragile in exactly one way, so there is a rule:
-
-> **The model never reads the ledger.** It is a scorecard, never an input.
-
-A system that tunes itself on its own paper results turns the only un-mineable
-measurement in the project into another training set — and you would spend
-months of calendar time producing a number with the same flaw as the backtest,
-except now you would believe it more because it came from "live" trading.
-`dataset.py`, `features.py` and `labels.py` cannot import `paper.py`, and there
-is a test that fails if they ever do.
-
-What the system *may* do with its own results is **notice**: `divergence()`
-compares the live Sharpe against what the backtest predicted and says whether
-they have come apart, in standard errors. That is the honest version of "self
-improving" — it tells you the model has stopped working, which is the thing
-worth knowing, without letting it fit to the answer.
-
-### Why it does not back its best five ideas
-
-The obvious design — pick the most confident names and concentrate — was
-measured on this panel, and it is backwards:
-
-| top N | positions/day | close→close | | **open→close (real)** | |
-|---|---|---|---|---|---|
-| | | ann | Sharpe | **ann** | **Sharpe** |
-| 1 | 2 | **+40.9%** | 1.13 | **−7.2%** | −0.15 |
-| 5 | 10 | +26.0% | 1.38 | **−7.3%** | −0.48 |
-| 10 | 20 | +30.6% | 1.94 | −1.2% | −0.05 |
-| 119 | 238 | +17.0% | 2.98 | **+5.1%** | **1.14** |
-
-Backing the top 5 shows **+26% a year** close-to-close and **−7.3%** over the
-window an order can reach. The most confident calls are precisely the ones whose
-edge sits in the overnight gap, so concentrating on them concentrates on the
-part that is already gone by the open. Sharpe climbs monotonically with breadth
-in *both* columns.
-
-So `top_n` defaults to None — the whole book — and setting it is a decision the
-P&L page will then show you the consequences of.
-
-The ledger records even while the gate is shut, marked `shadow`. A forward
-record of a model with no edge is exactly how you learn it still has none.
-
-### The overnight drift: real, unconditional, and smaller than the spread
-
-If the edge sits in the gap, the obvious question is whether to trade the gap —
-buy at the close, sell at the open. The pattern is real and it is in this data.
-Ten years, 238 names, every session, standard errors clustered by session:
-
-| leg | per row | t | annualised |
+| | percentage | minimum per side | FX |
 |---|---|---|---|
-| overnight, close(t) → open(t+1) | **+4.5 bp** | **+3.77** | **+11.9%** |
-| intraday, open(t) → close(t) | +1.6 bp | +1.33 | +4.1% |
-| the whole day | +6.0 bp | +3.34 | +16.4% |
-
-About three quarters of what a holder earns arrives while the market is shut.
-It is uneven across names — 71% of symbols have a positive average night, and
-the extremes are wide: AVGO +30 bp a night (t +2.68), RTX +16 bp (t +3.40),
-against ADBE −17 bp and ACN −17 bp (t ≈ −2.3). `labels.overnight_return` and
-`labels.intraday_return` are in the codebase so this can be re-measured rather
-than believed.
-
-Three things stop it being a strategy here.
-
-**It is unconditional, so the model is not needed** — and worse, the model
-subtracts. Over the test period, holding every name every night earned +8.9% a
-year gross. The same nights filtered by the model's direction earned +3.6%
-(t 1.03), and its confident long calls earned **−34.8%** (t −0.47). Taking the
-position a session later, so nothing trades at a price the signal used, gives
-+6.0% for the full book; the confident long slice reads +105.8% a year on 1,185
-rows with a **t of 1.31**, which is the same small-slice mirage the search has
-now produced twice.
-
-**A night is a full round trip.** The drift is 4.5 bp. The bid-ask spread this
-project charges — 5 bp a side, 10 bp there and back — is more than twice it,
-before any commission. At Avanza Mini on Stockholm the commission alone is 50 bp
-a round trip, eleven times the gap.
-
-**Commission-free is not cost-free.** The Stockholm names are the one place a
-€500 account pays no commission (Avanza Start), and their gap is the same size
-as everyone else's: +4.6 bp a night, t +3.21, +12.3% a year gross. But Start
-allows 500 free trades in twelve months, which a 12-name book turning over
-nightly spends in **20 sessions**, and the spread is still there underneath.
-
-What would actually settle it is intraday data this project does not have. The
-pattern you see described — flat or down through the session, with the move
-arriving around the open — is about the first thirty to sixty minutes, and
-daily bars carry one open and one close. Minute bars for a handful of names
-would answer it; nothing in the current pipeline can.
-
-### What a trade actually costs at Nordnet or Avanza
-
-Five basis points a side is spread and slippage. It is not commission, and a
-retail Nordic broker does not charge in basis points — it charges a percentage
-**or a minimum, whichever is larger**, plus a currency markup on anything not
-priced in your own currency. On a book of this shape the minimum is the entire
-story.
-
-Read off the brokers' own price pages on 2026-09-28 (`broker.py` carries each
-source and date; classes and tiers change, and yours may differ):
-
-| | percentage | minimum per side | currency markup |
-|---|---|---|---|
-| Avanza Start, Stockholm main list | 0% | 0 kr | — |
-| Avanza Mini, Stockholm | 0.25% | 1 kr | — |
-| Avanza Start **and** Mini, US | 0.25% | 1 USD | 0.25% each way |
-| Avanza Small, US | 0.15% | 6 USD | 0.25% each way |
-| Nordnet Mini, Nordic | 0.25% | 1 kr | — |
+| Avanza Start, Stockholm | 0% | 0 kr | — |
+| Avanza Mini, US | 0.25% | $1 | 0.25% each way |
 | Nordnet Mini, outside the Nordics | 0.25% | 9 kr | 0.25% each way |
-| Nordnet Liten, outside the Nordics | 0.15% | 49 kr | 0.25% each way |
 
-Avanza's currency figure is their own: the automatic exchange spread is 0.5%
-round trip, "alltså 0,25% åt vardera håll". Nordnet were running free Nordic
-trading for new customers until 2027-06-30, after which Mini applies.
+On a $500 account spread over 238 names, a position is **$2.10** and a round
+trip costs **$2.01 — 96% of the position**. The first day of that book costs
+$478 and there is no second day.
 
-**The paper account holds 238 names on $500, so a position is $2.10.** One
-round trip:
+So the shape is not a tuning problem, it is arithmetic: at this size the
+account can hold **one or two positions**, traded rarely.
 
-| | per side | round trip | as a share of the position |
-|---|---|---|---|
-| spread only (what the backtest charges) | $0.001 | $0.002 | **0.1%** |
-| Nordnet Mini (outside the Nordics) | $0.95 | $1.90 | **90.5%** |
-| Avanza Mini (US) | $1.005 | $2.01 | **95.7%** |
-| Avanza Small (US) | $6.005 | $12.01 | **572%** |
+## What it does now
 
-Priced over the one real settled day, the book pays **$476.50 in commission at
-Avanza Mini** and ends the day at $22.50. The ledger, charging spread only,
-recorded −$1.00. That is not a bad fill or a tuning problem: below **$400 a
-position** the minimum decides the bill, so halving the position doubles the
-cost as a share of it, and a 238-name book does not clear that until the
-account is about **$95,000**.
-
-So the honest reading is that the strategy's *shape* is unaffordable at this
-size, independently of whether the signal is any good. Three ways out, and
-their arithmetic:
-
-* **Hold fewer names.** Keeping the cost under 1% of a position needs ~$400 a
-  position, which at $500 is **one name**. The concentration measurements say
-  that is the worst version of this book, not the best.
-* **Trade the market you are billed in.** The Stockholm names in the universe
-  (12 of 241) cost **nothing** at Avanza Start and carry no currency markup —
-  the one shape a $500 account survives. But Start allows 500 free trades in
-  twelve months, and a 12-name book turning over daily spends that in **21
-  sessions**; after that it is Mini at 0.50% a round trip, which is **127% a
-  year in cost alone** at a one-day horizon.
-* **Hold longer.** The same 0.50% over a 20-session hold is 6.4% a year rather
-  than 127%. The search already tested longer horizons: the losses shrink
-  because the edge shrinks with them.
-
-The P&L page now prices the record against real schedules beside its own
-spread-only figure, and `broker.py` will do it for any position size.
-
-### What auditing the first real day found
-
-The first settled day was wrong, and three separate things were behind it.
-
-**It was settled against the wrong prices.** `settle_paper` loaded prices for
-whatever watchlist it was handed rather than for the symbols in the entry, so a
-238-name book was filled from ten of them; the other 228 were dropped as
-"missing" and the ten — **3.2% of the book, scaled up 31.5×** — became the only
-day on the page. The symbols now come from the ledger itself, and a book with
-less than `MIN_SETTLED_WEIGHT` (80%) of its weight priced is left pending
-instead of rescaled. Dropping one name that did not price is still right; making
-a day out of a thirtieth of a book is not.
-
-**A test had written six synthetic symbols into the real ledger**, where they
-sat unsettlable in `pending` for ever.
-
-**A name at an exact coin flip was carried as a position** with weight 0.0. It
-could not make or lose anything, but it counted in the hit rate — 117 of 238
-instead of 116 of 237.
-
-Corrections are appended, never edited: `paper.void(as_of, reason=..., kind=...)`
-writes a line that strikes out an intent or a settlement, and a voided
-settlement is filled again on the next pass. Both real corrections are in the
-ledger with their reasons. The rebuilt day was then **checked against the raw
-prices independently** — recomputed −0.00200294 against the stored −0.00200293,
-filled on 2026-09-14 (the session after the signal), 238 weights summing to
-1.000000, none above 0.0170 against the 0.25 cap, and every direction matching
-its probability. The page agrees: $499.00, −$1.00, one settled day, one pending.
-
----
-
-## Two trainers, and why that is the point
-
-Training happens in one of three places, and the useful one is both:
-
-| `--backend` | what it does |
-|---|---|
-| `local` | trains here in numpy — about 30 seconds, no network, no GPU, no key |
-| `helloworld` | upload, submit, poll, download — the original path |
-| `both` | the same rows to both, then compare them (**default**) |
-
-**Your GPU is not the bottleneck, and neither was the network.** The model is
-**7,233 parameters** — 46 → 64 → 64 → 1. Training it for the full step count is
-26 seconds of numpy on a CPU; a full train-and-score cycle is about 30. At batch
-size 64 an RTX 3070 is launching kernels for matrices too small to fill it. What
-was being shipped across a network and queued behind a node-placement bug was
-half a minute of arithmetic.
-
-So the HelloWorldAi path stays, because running a real workload through a
-distributed trainer is the point of having built one — but it is no longer the
-only way to get a model, and it now has something to be checked against.
-
-**Both backends produce the same artifact.** A locally trained network is packed
-into the same zip of `model.safetensors` plus a `config.json` manifest that
-HelloWorldAi returns, loaded by the same `model.load_bundle`, run through the
-same numpy forward pass, and scored by the same evaluator on the same held-out
-rows. Nothing downstream knows which one it got.
-
-That identity is what makes the comparison mean anything: same rows, same
-hyperparameters, same everything except where the gradient descent happened. Any
-gap is a fact about the **round trip** — placement, their trainer, the holdout
-it carves out, the weights that came back — rather than about the data.
-
-And the gap has a scale. Two models of this shape on these rows differ by the
-seed alone, and the noise floor already measures how much that is worth, so the
-page reports the gap in multiples of it:
-
-> The two agree to within the seed spread (1.62 points). The round trip is
-> returning what training here returns, which is what it should do.
-
-A gap several times the seed spread in HelloWorldAi's favour is treated as
-*suspicious* rather than good news — both saw the same training rows, so a real
-advantage has to have come from somewhere, and the usual somewhere is having
-seen more than it should.
-
-### The learning rate was killing the network
-
-Running the local backend on the wide panel produced a model with an edge of
-exactly **+0.0000** while a logistic regression on identical rows scored +1.08
-points. An MLP with hidden layers strictly contains a logistic regression's
-capacity, so that is not a fact about the data — it is a training failure.
-
-It was, precisely:
+The committed book — chosen by the search, recorded in the seal — is **long
+only, one position, reviewed every 60 sessions**. `/pnl` shows the decision in
+a sentence and a dated log it writes from its own ledger:
 
 ```
-up-rate 1.0000   accuracy 0.5003
-probability range: 0.516992 .. 0.516992   std 0.000000
-  layer 0: 64/64 units alive (0 dead)
-  layer 1:  0/64 units alive (64 dead)
+IT WANTS TO BUY
+INVE-B.ST
+INVE-B.ST (56.6% up) — decided from the close of 2026-09-25.
+It fills at the next open.
 ```
 
-Every unit of the second hidden layer was dead. A ReLU whose pre-activation is
-negative for every input outputs zero for every input *and has zero gradient*,
-so it never recovers — the network had collapsed to its output bias and was
-returning one constant probability for every row in the panel. Adam at
-`lr=0.01`, on every seed tried.
-
-`lr=0.01` was the default on **both** backends, and `pipeline` never overrode
-it, so every HelloWorldAi run this project ever made was trained at it too.
-
-| lr | accuracy | up-rate | dead in layer 2 |
-|---|---|---|---|
-| 0.01 | 0.4997 | 0.000 | **64 of 64** |
-| 0.003 | 0.5054 | 0.875 | 38 of 64 |
-| **0.001** | **0.5087** | **0.571** | **1 of 64** |
-| 0.0003 | 0.5079 | 0.474 | 0 of 64 |
-
-Now 0.001 — Adam's own default — everywhere. At full step count on the wide
-panel the same model goes from an edge of +0.0000 to **+0.0091**, up-rate 1.000
-to 0.556, probability std 0.000000 to 0.047.
-
-The worst part is what the gate said about it: *"The model answers the same way
-almost every day, so its accuracy is just the class balance. It has learned
-nothing."* That is a sentence about the market, and it was a sentence about the
-optimiser. So `train_local` now checks the network it produced and **refuses to
-return a collapsed one**, naming the learning rate and saying in as many words
-that nothing about the market can be concluded from it.
-
-A training failure that reports itself as a market finding is the most expensive
-kind of bug this project can have, because the conclusion it produces is exactly
-the conclusion the project expects.
-
-### And it stops itself now
-
-With the learning rate fixed, the obvious next question is whether training
-longer helps. It does not, and the curve is unambiguous:
-
-| steps | passes | train acc | **test acc** | edge |
-|---|---|---|---|---|
-| 5,000 | 0.7 | 0.5194 | **0.5118** | +0.0115 |
-| 20,000 | 3.0 | 0.5337 | 0.5108 | +0.0105 |
-| 80,268 | 12.0 | 0.5564 | 0.5066 | +0.0063 |
-| 200,000 | 29.9 | 0.5690 | **0.5029** | +0.0026 |
-
-Training accuracy climbs the whole way; out-of-sample accuracy falls the whole
-way. The model is not getting smarter, it is memorising — so looping training to
-"keep improving" makes it strictly worse, and would have done nothing whatsoever
-in the collapsed case, where the second layer had zero gradient from the start.
-
-But picking 5,000 off that table means picking a hyperparameter by reading the
-test set, which is how the one number that has to stay clean gets spent. So
-`fit_mlp` holds back the **last 15% of the training rows** — chronologically, so
-the slice is the most recent part of the training period — checks against it
-every 1,000 steps, keeps the best weights, and gives up after 8 checks without
-improvement.
-
-It lands on 5,000 steps. The same place, chosen without looking:
-
-| ceiling | stopped at | test acc | edge |
-|---|---|---|---|
-| 20,000 | 5,000 | 0.5077 | +0.0075 |
-| 80,268 | 5,000 | 0.5077 | +0.0075 |
-| 200,000 | 5,000 | 0.5077 | +0.0075 |
-
-`steps` is now a ceiling rather than an instruction, a local run takes 6 seconds
-instead of 69, and the step count stopped being a number anybody has to guess.
-
-One more trap worth recording, because it would never have raised: the bundle format
-ends in two class scores through a softmax and the local network ends in one
-logit through a sigmoid. `softmax([a0, a1])[1]` is `sigmoid(a1 − a0)`, so the
-"down" row must be **zero** and the "up" row the trained weights. Mirroring them
-as `[−w, +w]` is the obvious thing to write, doubles the logit, and silently
-sharpens every probability the model reports by up to 0.14. `train_local` loads
-its own output back through the real loader and refuses to return a bundle that
-disagrees with the network that produced it.
-
----
-
-## What was wrong before, and what it cost
-
-This is documented rather than quietly fixed, because each one produced numbers
-that looked completely reasonable.
-
-**A cached price history was never checked against the period requested.** A
-short fetch of AAPL got cached early; every run afterwards asked for ten years,
-got two, and never noticed. Apple had no rows before the cut date, so it was
-silently dropped — nine symbols trained where ten were reported, for every run
-in the project's history.
-
-**The train/test split was re-derived at scoring time instead of being carried.**
-It moved from 2024-11-06 to 2024-12-31, graded 4,187 rows while the run
-advertised 4,100, and added a symbol to the test set that had been absent from
-training. No rows leaked in that instance, but the direction of the drift was
-luck: a single failed price fetch at scoring time changes the pool, which moves
-the date, which can move it *earlier* and put trained rows into the score.
-
-**Costs were charged per row rather than per trade.** The model held long on 99%
-of days and changed position 113 times in 4,187 rows — and was charged 4,187
-round trips.
-
-```
-gross                            +25.56% annualised
-cost as coded (5bp every row)    +10.71%   <- what the UI reported
-cost on actual turnover          +24.71%
-```
-
-That is 14.9 points of annual drag against a true 0.85. It turned a strategy
-that essentially *was* buy-and-hold into one that appeared to destroy a sixth of
-the account every year — an error in the direction that flattered the "no edge"
-conclusion, which is still an error.
-
-**RSI returned 100 through its entire warm-up.** The guard meant to blank it
-tested `avg_gain.isna()`, which is true *during* the warm-up, so it kept the
-fill instead of removing it. Harmless only because the 50-day average dropped
-those rows anyway.
-
-**Confidence buckets printed accuracy on five rows.** One stored run reads
-"accuracy 1.0" on a bucket of five, with no warning. In a project whose whole
-purpose is refusing to overclaim, that was the most misleading line on the page.
-
-**Returns carried no uncertainty at all.** The gate computes a standard error
-for accuracy and refuses to speak without one. The return figures printed next
-to it — the numbers a person would actually act on — had none.
-
----
-
-## The target is the most important decision here
-
-Absolute direction — *will this close higher tomorrow* — is close to
-unanswerable. About 52% of daily moves in a large-cap panel are up, so a model
-that learns nothing and answers "up" every time scores 52%, and gradient descent
-finds that constant long before it finds anything subtle. Measured here
-repeatedly: up-rate 0.98, accuracy equal to the class balance, every feature
-influence under 0.01. The model was not failing to learn. It had learned the
-only thing reliably there, which is the drift.
-
-Relative direction — *will this finish in the top half of its peers* — removes
-the drift by construction. The classes are 50/50 on every date, so no constant
-can score above chance, and the market factor that dominates absolute returns
-cancels out of the target entirely.
-
-Both targets are kept, because the comparison between them is informative. The
-relative one produces a real and repeatable *accuracy* edge on a wide panel;
-neither has produced a profitable one.
-
-### How much evidence a panel is actually worth
-
-Ten symbols on one day are not ten independent verdicts on a model, so the gate
-discounts the row count by a design effect measured from the panel. All four
-numbers below come from the same 238 symbols and the same 107,165 test rows:
-
-| target | model | effective rows | design effect |
-|---|---|---|---|
-| absolute | always-up | 4,534 | **23.6** |
-| absolute | logistic | 8,534 | 12.6 |
-| relative | always-up | 107,165 | 1.0 |
-| relative | logistic | 25,520 | 4.2 |
-
-Two things fall out of that, and both matter more than they look.
-
-**On the absolute target a day is essentially one observation.** Everything rises
-and falls with the market, so being wrong about one name means being wrong about
-nearly all of them: 107,165 rows are worth 4,534. That is roughly the number of
-*trading days* in the test window. All the apparent power of a wide panel
-evaporates, and a gate computed on the raw row count would be asking for about
-a fifth of the evidence it thinks it is.
-
-**The discount depends on the model as well as the target.** A constant answer
-on a relative target has errors that are just the labels, which are balanced per
-date by construction, so nothing correlates. A model that actually varies makes
-*correlated mistakes* — when it misreads the market it misreads it in every name
-at once — and four fifths of its sample goes. So the design effect is recomputed
-for every model rather than assumed once for the panel.
-
-The practical consequence: the relative target buys about **5.6× more
-independent evidence** from the same rows. That is a bigger effect than anything
-the feature engineering achieved.
-
----
-
-## Five kinds of input
-
-46 features today, from four blocks, each optional so its contribution can be
-measured rather than assumed. A fifth -- the news store -- is wired in and
-deliberately switched off until it has history; see below.
-
-**The symbol's own prices** (18). The original nine were nearly the same feature
-— returns over three horizons, price against two moving averages, all momentum
-wearing different hats. A model given five correlated views of one thing has one
-input, not five. What was added is information of a different kind: where in the
-day's range it closed, how much of the move happened overnight, how far it sits
-below its year's high, 12-1 momentum, return skew, and Amihud illiquidity.
-
-**Where it sits among its peers** (9). Percentile ranks within the panel, plus
-breadth and dispersion. Relative momentum is the oldest factor in the
-literature; a rank is also how a name's own history gets normalised against a
-market that was calm in 2017 and is not now.
-
-**The state of the world** (16). This is the answer to "can we add economic
-news", and it is deliberately not news — see below.
-
-**Distance to the next announcement** (3). Post-earnings-announcement drift is
-one of the few equity anomalies that has survived fifty years of people trying
-to arbitrage it away, and it is visible at exactly this horizon. It costs two
-integers and no scraping.
-
-### Why macro is prices, not headlines
-
-Scraping CPI headlines gives about **twenty observations** across a two-year test
-set — twelve prints a year, identical across every symbol on the day they land.
-Nothing can be learned from twenty points and nothing can be graded on them
-either. A macro *event* feature is the smallest dataset in the project wearing
-the costume of the largest.
-
-The same information arrives continuously through prices: the curve steepens
-before the print and after it, the dollar moves every session, credit widens
-while the story is still forming. That is 2,500 observations rather than twenty,
-it is the mechanism by which macro actually reaches equity prices, and it costs
-one HTTP request per series.
-
-It also avoids the worst leak in the macro family. **GDP and employment are
-revised**, and FRED serves the current revision — so a model trained on "what GDP
-was in March 2024" is trained on a number that did not exist in March 2024.
-Getting that right needs vintage data (ALFRED, not FRED); getting it wrong is
-invisible. A yield close is a yield close forever.
-
-### Everything shared is lagged one session
-
-The panel holds US and European names. The S&P closes at 16:00 New York; Nestlé
-closes at 17:30 Zurich, which is 11:30 New York. Today's US macro close is five
-and a half hours *after* the European bar it would be attached to — and even
-within the US the VIX settles fifteen minutes after the equity close. The same
-applies to cross-sectional ranks: ranking Nestlé against Apple on the same
-calendar date compares closes taken hours apart.
-
-So the macro, cross-sectional and news blocks are all shifted by one session,
-uniformly. It costs a day of freshness and removes an entire class of leak that
-would otherwise be invisible and would flatter every European name in the panel.
-
----
-
-## What the model has to beat
-
-Nine models were once trained on a GPU across a network and compared only
-against the class balance. A logistic regression on the same rows takes four
-tenths of a second and scored the same. That does not mean the distributed
-training was broken — it means nobody could have told if it were.
-
-Three controls now run locally before every submission and their scores are
-stored with the run. They are trained with **exactly the hyperparameters being
-submitted** -- same width, depth, batch size and step count -- because a control
-trained for a different length than the model it is a control for is not
-answering the question. Counting gradient steps rather than epochs also means a
-240-symbol panel costs the same as a 10-symbol one, instead of twenty-four times
-as much; the epoch-counting version took minutes on a wide panel, which is long
-enough that somebody would turn the controls off.
-
-- **Majority** — answer the training majority every time. The floor.
-- **Logistic regression** — same rows, same split, same scaler. If the network
-  does not beat this, the round trip bought a linear model slowly.
-- **A local MLP of the same shape** — same width, depth and step count as the
-  job being submitted. If the remote model scores meaningfully *worse* than
-  this, the problem is in the round trip rather than in the data.
-
-And two things the controls make possible that a single trained model cannot:
-
-**Walk-forward.** Six consecutive out-of-time windows instead of one. One test
-period is one draw, and a single flattering window is the most common way a
-strategy that does not work comes to look as though it does. Six GPU round trips
-would take a day; this takes seconds, and it is asking about the *data* rather
-than about any particular trained network.
-
-**A noise floor.** The same configuration trained several times with different
-seeds. Whatever spread that produces is the smallest difference between two
-models that means anything.
-
----
-
-## The gate
-
-`/analysis` is the trading view: one call per symbol, with the argument for it.
-Three states — **Buy now**, **No buy**, **Still collecting data** — and one rule
-that decides between them.
-
-Every call is gated on the model having earned an opinion, and the bar is
-computed rather than chosen. There are six hurdles:
-
-1. **Enough distinct days.** A wide panel over three weeks is still three weeks.
-2. **Enough *effective* rows.** Ten symbols on one day are not ten verdicts. The
-   design effect is measured from the panel rather than assumed — about 1.7 on
-   the original absolute-target panel, so the honest bar was a third higher than
-   the one being used.
-3. **The model varies.** A model answering one way every day has an accuracy
-   that is just the class balance.
-4. **It beats the baseline by more than chance**, where the baseline is the class
-   that dominated *training* — the only one anybody had in advance. Using the
-   test period's own majority was measuring against a number knowable only
-   afterwards.
-5. **The edge exceeds the noise floor**, and holds up in most walk-forward
-   windows.
-6. **The money is distinguishable from luck.** After costs, the strategy's
-   return needs a t-statistic of 2. This is the hurdle the wide panel forced —
-   see above; accuracy alone opened the gate on a model losing 3.2% a year.
-
-Every hurdle is recorded whether it passed or not, and the page shows the whole
-list. A gate that says no without saying which question it failed teaches nobody
-anything.
-
-When the gate is shut — which is every model this project has trained — every
-symbol reads *still collecting data*, whatever the probability says.
-
-I checked the gate rather than trusting it: 2,000 Monte Carlo trials of
-skill-less models at up-rates from 0.50 to 0.995 opened it in 0.0–0.1% of cases.
-The conservatism comes from the majority-class baseline being genuinely hard to
-beat — a varying no-skill model loses to it by about 1.6 points on average.
-That check was run at a one-day horizon, and it did not cover longer ones —
-which is where the next section found a hole.
-
----
-
-## Training on a schedule, and why it is paced by sessions
-
-The **Auto-train** button on the runs page, and `python auto.py`, run the same
-loop: wake on a timer, and each time collect anything HelloWorldAi has finished,
-settle the paper positions whose session has now happened, and train — but only
-if a session has closed since the last time it trained. **Stop auto-training**
-stops it; the cycle in flight finishes, nothing new starts. The command line and
-the page can stop each other, through a marker file rather than a field, so a
-heartbeat cannot overwrite the request.
-
-The pacing is the whole design, and it is not a performance argument:
-
-* **It stops itself.** Early stopping halts around step 1,000 of a 36,000
-  budget. Training to the ceiling scored 51.1% against 53.7% — more training
-  made it worse.
-* **The same rows give the same model**, up to the seed, and the seed spread
-  (1.8 points) is wider than any edge measured here.
-* **Every run scores on the sealed test period.** A loop that retrains every ten
-  minutes looks at that period every ten minutes, which is exactly what the
-  trial ledger counts. Twenty identical runs are one piece of evidence and
-  nineteen extra chances to catch a lucky one.
-
-So the interval is how long it may sit after a session closes before it notices,
-not how often it trains. What genuinely does want a schedule is the other half:
-the paper ledger only grows forwards, and settling yesterday is the one thing
-here that improves purely by waiting. The scheduler cannot import the search
-module, so an overnight loop can never spend the trial budget — there is a test
-for that.
-
-Its first real cycle found a bug worth the whole exercise. `settle` writes
-outcomes as new lines beside the intents rather than editing history, and both
-writers then read the file as if every line were an intent: `record_intent`
-raised `KeyError('as_of')` on the first settlement line, and `settle` would have
-re-settled every day on every pass, appending a second outcome and counting the
-return twice. **The forward ledger had stopped growing the day it first paid
-out**, and the only sign was one warning line. Both are fixed and both have
-regression tests.
-
----
-
-## Is the gate too strict? What it turned down, measured
-
-The gate has never opened, so the fair question is whether it is refusing money.
-Working backwards over the 464 sealed sessions of run `20260928-165234`, which
-passed seven of the eight hurdles and failed only on money:
-
-| confidence | rows | accuracy | close→close | **open→close** |
-|---|---|---|---|---|
-| 0.00–0.10 | 97,184 | 50.5% | −0.09% | **−0.10%** |
-| 0.10–0.25 | 9,665 | 52.7% | +0.02% | **−0.06%** |
-| 0.25–0.50 | 280 | **71.8%** | **+1.30%** | **−0.04%** |
-| 0.50+ | 24 | **100%** | **+4.23%** | **−0.49%** |
-
-Per row, net of costs. The rows where the model was most sure were **71.8%
-right**, and the 24 it was surest about were **right every single time** — and
-both lose money held from the next open, because **98.5% of that gross move is
-the overnight gap**. The confidence table on the analysis page now carries both
-columns for that reason; it used to show only the first.
-
-Every book built from the calls it suppressed loses over the same period:
-
-| book | close→close | **open→close** | Sharpe | t |
-|---|---|---|---|---|
-| everything (what the run scored) | −18.9% | **−24.5%** | −6.87 | −9.32 |
-| confidence ≥ 0.25 | +66.6% | **−44.1%** | −0.98 | −0.56 |
-| up calls only (p ≥ 0.58) | −24.9% | **−72.1%** | −2.55 | −2.31 |
-| top 5 by confidence each session | +15.0% | **−19.6%** | −1.15 | −1.56 |
-| top 10 by confidence each session | +4.0% | **−22.0%** | −1.72 | −2.33 |
-
-Annualised, net, equal weight per session.
-
-One number in that audit did look like a lost opportunity, and it is worth
-saying why it is not. The 1,214 up calls (p ≥ 0.58, 57.1% right) earn **+0.18%
-per call** over the *reachable* window — unlike everything else here, most of
-their move is not overnight. But per call is not a book: those calls arrive 2 to
-a session at the median and 127 at the maximum, so weighting them equally levers
-up the busy days. Equal weight per session, the same calls return −0.29% a day.
-And clustered by session — the only honest standard error, since calls in one
-session share a market — the per-call edge has a **t of 1.01**. The naive t,
-which treats 1,214 correlated calls as independent, would have read 2.79. That
-is the difference between "worth testing" and "worth trading", and it is the
-same correction the accuracy hurdle needed.
-
-So: the gate is not too strict. It rejected the one thing that decides it, and
-every subset of what it rejected loses money over the window an order can reach.
-
-### The long-only slice, tested properly, does not survive
-
-That one slice was worth a pre-registered trial, so it got one — trials 21 to 26
-in the ledger, on the validation period, which the audit had never touched. The
-hypothesis was stated first, and so was the rule: commit the book with the
-highest executable t among those clearing both t ≥ 2 and the corrected accuracy
-bar; otherwise commit nothing.
-
-| book | rows | open→close Sharpe | t |
-|---|---|---|---|
-| long only, p ≥ 0.55 | 13,364 | −3.07 | −3.70 |
-| long only, p ≥ 0.58 | 4,360 | −1.55 | −1.86 |
-| long only, p ≥ 0.62 | 811 | −0.96 | −0.95 |
-| long and short, p ≥ 0.55 | 20,764 | −3.29 | −3.98 |
-| long and short, p ≥ 0.58 | 6,873 | −2.12 | −2.55 |
-| long and short, p ≥ 0.62 | 1,529 | −1.41 | −1.50 |
-
-**Nothing qualified, so nothing was committed and the seal stayed shut.** Being
-pickier loses less — Sharpe climbs from −3.07 to −0.96 as the threshold rises —
-and long-only beats long-and-short at every threshold, which is the audit's
-finding reappearing. Neither ever crosses zero. The +0.18% per call that started
-this was the per-call weighting, and a clustered t of 1.01 had already said so.
-
-Note what the seal could not do here. **The hypothesis came from the sealed
-rows**, so opening them for it would not have been a test; validation was the
-honest ground, and the only clean test left for an idea of this shape is forward
-paper trading.
-
-One trap this search exposed: a long-only book shows an edge of **exactly
-zero against a bar of exactly zero**, and clears the accuracy hurdle trivially.
-It only ever says up, and the baseline is always up, so accuracy minus baseline
-is identically zero on every row — not a zero edge, no comparison at all. Trials
-now record `edge_comparable`, the board prints `n/a` rather than a number, and
-only the money hurdle speaks for a one-sided book.
-
----
-
-## The committed book, and why it does not panic
-
-`/pnl` follows what the search committed: long only, one position, reviewed
-every sixty sessions, priced at the market each name is actually billed on.
-Three kinds of line, appended and never rewritten — `plan` (what it wants to
-buy, written before the price exists), `fill` (what it paid, at the first open
-after the plan) and `exit` (what it sold for, on the session the plan named).
-
-Between reviews it is **deaf on purpose**. New signals arrive every day and are
-ignored, because at this account size every change of mind is a round trip and
-twice-monthly second-guessing is about 15% a year in fees. At the review it
-either keeps the name — costing nothing, the clock restarting — switches, or
-goes to cash if nothing is called up. An early version sold at every review and
-rebought, paying a round trip to stand still; the strategy that was simulated
-never did that, because it only ever charged for a change.
+Three kinds of line, appended and never rewritten: `plan` (what it wants,
+written before the price exists), `fill` (what it paid, at the first open
+after), `exit` (what it sold for, on the session the plan named).
+
+**It is deaf between reviews on purpose.** New signals arrive daily and are
+ignored, because every change of mind is a round trip. At the review it keeps
+the name (costing nothing), switches, or goes to cash.
 
 ### It notices when its reasons stop being true, and holds anyway
 
-A buy is made on a pattern: the features that pushed the probability up. Those
-are recorded at entry, and every day the same name is re-read. The verdict is
-`intact`, `drifting`, or `broken` — broken meaning the model no longer calls it
-up at all, or most of the reasons it bought on have stopped arguing for it. It
-is written down only when it changes, and shown on the page in plain words.
-
-**It never trades on it**, and that is measured rather than assumed. Paired on
-the validation window — identical picks, identical entries, only the exit rule
+A buy is made on a pattern — the features that pushed the probability up. Those
+are recorded, and the same name is re-read daily: `intact`, `drifting`, or
+`broken`. It says so on the page and **never trades on it**, which is measured
+rather than assumed. Paired on identical picks and entries, only the exit rule
 differing:
 
 | rule | ends with | trades | fees |
 |---|---|---|---|
-| **hold to review (committed)** | **$1,028** | 14 | $56 |
-| exit when the model turns, then switch | $671 | 58 | $178 |
-| exit when the model turns, then cash | $401 | 52 | $131 |
-| exit when the pattern breaks, then switch | $495 | 122 | $326 |
-| exit when the pattern breaks, then cash | $669 | 86 | $278 |
+| **hold to review** | **$1,028** | 14 | $56 |
+| exit when the model turns | $671 | 58 | $178 |
+| exit when the pattern breaks | $495 | 122 | $326 |
 
-And episode by episode, which is the honest version of the question: the
-pattern broke in **seven of seven** episodes, and holding on from the break
-returned **+8.65% on average** (median +3.96%, t +3.31) — better in **every
-one**. The breaks were real and they were not warnings of further losses.
+The pattern broke in **seven of seven** episodes, and holding on from the break
+returned **+8.65% on average** (t +3.31), better in every one. A warning is
+free; acting on it spent two thirds of the account.
 
-Seven episodes is not a law, and the window was a rising market. But both the
-money and the pairing point the same way, and the fee arithmetic settles it:
-acting on the warning spends two thirds of the account on trades. So a break is
-worth knowing and is not worth trading, which is the whole reason the warning
-and the action are separate things here.
+## How a strategy earns the right to be believed
 
----
+**The scarce resource is the test set, not compute.** A model trains in
+seconds, so three hundred configurations is an afternoon — and the best of three
+hundred answers is mostly the luckiest. So:
 
-## The first thing that beat doing nothing
+- The panel is cut in three. The search sees train and validation; the sealed
+  period is truncated out before a model is fitted.
+- Every trial is appended to `data/search/trials.jsonl`. **32 so far**, which
+  puts the bar at **1.61×** what it would have been on the first look.
+- `open` refuses to score anything until a configuration is committed in
+  writing, with a reason. Deciding before looking is the difference between a
+  test and a search.
+- A concentrated book is judged by **permutation**: 2,000 random books with the
+  identical trade pattern, count and cost. Fiftieth percentile is no skill.
 
-Every strategy here died of turnover rather than of signal, so the obvious test
-was the one nobody had run: keep the same model and stop trading it so often.
-Scored in money at a 500 account with Avanza's real commission — `book.py`
-simulates the account forward, and a book that runs out of money stops.
+That machinery has now rejected more of my own ideas than it has passed:
 
-The benchmark is deliberately dumb. Buying names at random and holding to the
-end returns **+11.7% a year** for under 17 of fees, and every daily strategy
-loses to it: the model's top five rebalanced every session pays **504 of
-commission on a 500 account and ends at zero.**
+| tried | result |
+|---|---|
+| longer horizons (5, 10, 20 days) | losses shrink because the edge does |
+| absolute target | worse than always guessing "up" |
+| long-only, high threshold | negative at every threshold |
+| market rotation | markets mean-revert; loses to holding the US |
+| top-N concentration, daily | top 5 rebalanced daily **wipes the account out** |
+| exiting on a broken pattern | worse in seven of seven episodes |
+| **top 1, reviewed every 60 sessions** | **96.2% percentile, committed** |
 
-Because a book of five names rebalanced eight times is eight decisions, each
-trial is also run against 200 random books with the identical trade pattern,
-count and cost. That permutation percentile — not the Sharpe — is what judges a
-concentrated book. Trials 27 to 32, pre-registered, on validation:
+The committed book made +89.3% before costs over eight sealed rebalances, and
+**+71.8% with its single best holding removed**. It replicated on validation at
+the 99th percentile. Fourteen decisions is not a track record.
 
-| book | final | trades | fees | beat random | buy & hold | verdict |
-|---|---|---|---|---|---|---|
-| top 1, every 20 | $613 | 30 | $99 | 78% | $602 | no |
-| top 1, every 60 | **$919** | 12 | $51 | 94% | $602 | no — under the 95% bar |
-| top 3, every 20 | $661 | 90 | $143 | 98% | $634 | qualifies |
-| top 3, every 60 | $724 | 36 | $58 | 91% | $634 | no |
-| top 5, every 20 | $611 | 152 | $200 | **100%** | $654 | no — lost to doing nothing |
-| **top 5, every 60** | **$772** | 54 | $73 | **99%** | $654 | **committed** |
+## The contest: one champion, a few shadows, and a rule
 
-Two rows matter more than the winner. **Top 5 every 20 beat 100% of matched
-random books and still lost to doing nothing**, because rotating that often
-burns 200 of a 500 account in fees — picking well and trading too much is worse
-than not picking at all. And **top 1 every 60 made the most money and was
-rejected** at 94% against a 95% bar, which is the rule working rather than the
-biggest number being chosen afterwards.
+A champion that is never challenged never improves. A challenger loop with no
+brakes is worse than none at all — run enough candidates and one beats the
+champion by luck every night, while the ledger reports triumph. So the loop is
+deliberately narrow and deliberately slow.
 
-The committed book was checked for the obvious failure: on the sealed period it
-made +89.3% before costs over eight rebalances, and **removing its single best
-holding (AMD, +63.9%) still leaves +71.8%**, with seven of eight periods
-positive across mixed sectors and countries. It replicated on validation, which
-the model never trained on, at the 99th percentile.
+**Narrow.** Every axis it varies is a *decision rule* — how many names, how
+long between reviews, what probability to demand. Model capacity, data volume
+and freshness are excluded by name, because they are measured flat (see below)
+and varying them would raise the bar for everything else and find nothing.
 
-**The seal stays shut for it.** The low-turnover idea was found by looking at
-the sealed period, so opening it would be a search rather than a test. The next
-honest test is forward paper trading at 500 — where the ledger is already
-running and cannot be mined. Fourteen decisions is not a track record, the
-percentile holds cost and trade count constant but not risk, and the test
-period was a rising market.
+**Slow.** Five new questions a week, never one the ledger has already paid for,
+one per cycle. At 32 trials the bar is already 1.61× the first-look bar.
 
----
+**Clearing the bar wins nothing.** A challenger that beats 95% of matched
+random books and ends above buy-and-hold is *registered as a shadow book*: it
+starts its own forward record, with its own $500, the same commission by
+market, the same review rules. At most three run at once.
 
-## Searching without spending the test set
+**Only the forward record can promote it.** The rule was written before any
+contest ran, which is the only time such a rule can be written honestly:
 
-A model trains in seconds now, so trying three hundred configurations is an
-afternoon. What that afternoon spends is not compute, it is the test set: every
-configuration scored against it is another question asked of the same rows, and
-the best of three hundred answers is mostly the luckiest.
+- both books have **8 closed decisions** — about two years at a 60-session
+  review, which is the price of evidence that cannot be mined;
+- the challenger is ahead by **5 points of total return**;
+- its share of decisions won is **not worse** — one enormous holding carrying a
+  book that lost most of its decisions is not a better method;
+- and **no promotion in 180 days**.
 
-```bash
-python search.py run --macro on,off --horizon 1,5,20 --note "does macro help at longer holds"
-python search.py board                       # leaders on validation, and the bar they must clear
-python search.py commit 7 --why "best validation Sharpe; simplest of the top three"
-python search.py open                        # the sealed period, once
-```
+A backtest cannot promote anything: clearing one is what got the challenger a
+shadow in the first place, and promoting on the same evidence would be
+promoting on the thing that has fooled this project three times.
 
-The panel is cut in three. The last 20% is sealed; of what is left, the last
-20% is validation. `run` fits on the first part and scores on validation, with
-the sealed rows truncated out before any model sees them — the search cannot
-reach them by construction, and a test checks that. Every trial is appended to
-`data/search/trials.jsonl`, and only validation numbers are ever written there.
+**The guard can only stop.** Separately from promotion, the funded book is
+checked every cycle: past a **−20% drawdown** it stands down immediately, and
+after six closed decisions it stands down if it was funded on a backtest
+expecting to make money and has lost money instead. Standing down means nothing
+is funded — and every book keeps recording, because you want to know whether
+the one you stopped would have recovered. Nothing in that path can start
+trading something.
 
-`open` refuses until one configuration has been **committed in writing, with a
-reason**. Deciding before looking is the difference between a test and a
-search. A second opening is allowed — forbidding it would just mean deleting a
-file — but it needs `--again`, it is counted, and the reading says plainly that
-it is no longer a test.
+## Why the model itself is not what improves
 
-**The book is searchable too.** `--long-only`, `--min-probability` and
-`--top-n` change what is held rather than what is built, so they score the same
-fitted model and cost one fit for all of them — but each is its own trial and
-its own look, because choosing between them on the same rows is a search like
-any other. A committed configuration carries its book, so the sealed period
-scores what was actually chosen.
+Measured on the validation period, one seed spread being 0.47 points:
 
-**The trial count sets the bar.** Looking `n` times and keeping the best means
-at least one false pass with probability 1 − 0.95ⁿ: 19% at four trials, 99% by
-ninety. `board` and `open` both apply a Šidák correction and print what an edge
-has to clear given how many times you have looked, sized by the measured spread
-of the edge itself rather than by a row count.
+| question | answer |
+|---|---|
+| Does more data help? | No. 85k → 342k rows moves accuracy 0.2 pts. |
+| Does more capacity help? | No. **Logistic regression matches the network.** |
+| Does retraining help? | No. An 18-month-old model matches a refitted one. |
+| Do specialists beat the generalist? | No. Worse in six of seven markets. |
 
-**The neutral band thins training, never grading.** `--neutral-band 0.2` drops
-names whose forward return ranked near the middle of their date, so the model is
-not taught to reproduce noise. The ranking is of the *future* return, and until
-this was fixed the band removed test and validation rows too: a banded model was
-graded only on names already known to have moved a lot — 132 of one symbol's 230
-test rows on the synthetic panel, half of all validation rows — and a search
-would have preferred banded configurations for that alone. Now the band applies
-to training rows only; graded rows, their returns and the cut dates are the same
-with or without it, and the purge still removes exactly `horizon` sessions. No
-banded trial had been recorded in the ledger before the fix.
+The 46 features are the ceiling, and they are nearly all derived from price.
+Everything that improved this year was the **decision layer** — turnover, real
+commission, hold rules — not the model.
 
-### The first dry run, and the bug it found
+So the scheduler's job is no longer training. It is **accumulating the two
+things that cannot be bought later**: the forward paper record, and the news
+archive.
 
-Four configurations on the ten-symbol core panel, in a throwaway ledger. The
-winner — macro on, five-day horizon — scored **+2.5 points of edge, Sharpe
-+2.52, t +3.05** on validation, and the board said it had earned a commit. On
-the sealed period it scored **+0.13 points** and a negative Sharpe. Four tries
-had been enough to find noise dressed as a strategy.
+## The news archive
 
-That was the seal doing its job. But a validation t of 3 on a signal that
-vanished was worth explaining, and the explanation was not luck alone.
+The block is inert until it has a year of history, and `news.readiness`
+enforces that rather than handing the model zeros for a decade and real numbers
+for last week. **906 items across 85 symbols, 19 days of 365.**
 
-**Every statistic treated overlapping holding windows as independent days.** At
-a five-day horizon, consecutive rows share four days of the same move, and a
-real model's positions persist because the features behind them change slowly —
-so it is graded on nearly the same return again and again. Measured on pure
-noise with sticky positions, a model with no skill at all cleared t = 2 in
-**36% of runs at five days and 56% at twenty**, against the 5% the threshold
-promises. At one day it held at 5%, which is why nothing before had caught it.
-Sharpe was separately annualised as though a five-day return were a daily one,
-inflating it by √5. A search that varies the horizon would have climbed that
-slope and called it a finding.
+It stores whole items — title, summary, source, publication time, and when
+*this machine* saw it. That distinction is the point: **features can be
+recomputed from your own archive later; the archive cannot be backfilled.** An
+archive fetched next year has been re-ranked by what turned out to matter, and
+its timestamps are frequently ingestion times. The scheduler now asks for a
+rotating slice of 40 symbols every cycle.
 
-Now the rows carry their horizon (`Split.horizon`, set once from the spec), and
-`evaluate` uses it: Sharpe is annualised over 252 / h periods, the t-statistic
-and effective rows are corrected for overlap with Hansen–Hodrick long-run
-variance at lag h − 1, and drawdown compounds a book that actually rebalances
-every h sessions. The same noise test now gives **6.7% at five days and 6.3% at
-twenty**. At one day every number is identical to before.
+## The gate
 
-Rerun with the fix, the same winner reads Sharpe +1.13 and t +2.11, the
-accuracy bar rises from +2.07 to +2.88 points, and **the board rejects it
-before the test set is opened** — which is the order this is meant to happen in.
+`/analysis` gives one call per symbol, and every call is gated on the model
+having earned an opinion. Six hurdles: enough distinct days; enough *effective*
+rows (ten symbols on one day are not ten verdicts); the model varies; it beats
+the training-period majority by more than chance; the edge exceeds the seed
+spread and holds across walk-forward windows; and **the money is
+distinguishable from luck over the window an order can reach**.
 
----
+The last one exists because the others were not enough — the logistic control
+clears every accuracy test and loses 3.2% a year.
 
-## Adding news, honestly
+Every hurdle is recorded whether it passed or not. The gate has never opened.
 
-`news.py` is a point-in-time store, and the reason it looks so unlike a scraper
-is that the scraping is the easy half and the timestamps are the hard one.
+## Statistics that had to be fixed to be honest
 
-**A backfilled archive cannot be trusted.** Ask any provider today for news about
-a symbol and you get what it has now, ranked by what it thinks matters now.
-Stories that turned out to be important were promoted, stories that turned out
-to be noise were dropped, and `published_at` is very often ingestion time rather
-than when the item crossed the wire. A model trained on that has been shown
-which stories mattered — which is precisely what it was supposed to work out —
-and none of it is visible in the output.
-
-The available source returns ten recent items per symbol. That is not a
-limitation to work around; it is the shape of the honest problem. **There is no
-archive to backfill from, so the store is built forwards.**
-
-So the store records `captured_utc`, written by this machine at the moment the
-item is appended and revisable by nobody. The provider's `published_utc` is kept
-beside it and never used as a feature. The file is append-only, because its
-entire value is that its earlier lines could not have been adjusted afterwards.
-
-And news features stay **inert until the store has a year of history**.
-`readiness` reports how much exists; the pipeline refuses the block until it
-clears the threshold and says so. Turning it on over an empty store would feed
-the model zeros for every historical row and a real number for today, which is
-not a feature — it is a date stamp.
-
-Start `python watch.py --news` now and the block becomes usable in about a year.
-That is the real cost of doing this honestly, and it is worth knowing before
-building rather than after.
-
----
-
-## Asking it questions
-
-`context.py` is the reading panel, and it is built so it cannot become the
-trading half.
-
-**It never touches the model or the score.** Nothing there feeds a feature, a
-label or an evaluation — it reads the store and the finished run and writes
-prose. That is the same seam already drawn around order execution, for the same
-reason.
-
-**It is gated by the same trust object as everything else.** A fluent paragraph
-next to a probability is more dangerous than no paragraph, because fluency reads
-as conviction. The page currently says *"still collecting data — this model has
-not shown an edge yet"*, which is the most valuable sentence in the project, and
-a confident-sounding narrative beside it would quietly undo that. When the gate
-is shut the panel still renders, headed **Background — not evidence**.
-
-**It retrieves and cites; it does not conclude.** Every claim traces to a stored
-item with a capture timestamp. It is asked for what would make the reading wrong
-as well as what supports it — the more useful half, and the less dangerous one.
-It will not make a recommendation, because the only opinion in this project
-comes from the gate, which is computed rather than written.
-
-**Headlines are untrusted input.** They are scraped text written by strangers,
-and anything in them that looks like an instruction is data. They go into the
-request fenced and labelled, and the system prompt says so.
-
-Optional: without `ANTHROPIC_API_KEY` and the `anthropic` package, the panel
-shows its sources without prose and everything else works unchanged.
-
----
+- **Overlapping windows.** At a five-day horizon consecutive rows share four
+  days of the same move. Skill-free models cleared t = 2 in **39% of runs at
+  h=5 and 53% at h=20**; with a Hansen-Hodrick correction, 3% and 8%.
+- **The edge's standard error.** The baseline is measured on the same rows, and
+  on an absolute target it is shared by every name on a date. Skill-free models
+  passed the accuracy hurdle **19% of the time**; clustered by date, 2.7%.
+- **The percentile itself.** Measured on 200 draws it rejected a book at 94%
+  that is 96.2% on 2,000 — a real decision lost to Monte Carlo noise. Now 2,000.
+- **Look-ahead in the neutral band.** It ranked names by their *realised*
+  future return and dropped the middle ones from the test rows too. The band now
+  thins training only.
 
 ## How the pieces fit
 
 ```
 universe.py   which symbols, and why width is the point
-prices.py     daily OHLCV, split-adjusted, cached -- checked against the period
-   |          asked for, and not re-asked of a provider that just answered
-broker.py     what Nordnet and Avanza charge: percentage or minimum, plus
-   |          currency -- and what that does to a book of small positions
-book.py       a book walked forward in money, and the percentile against the
-   |          same trade pattern picked at random
-holding.py    the committed book as a forward record: plan, fill, hold, review
-   |          -- and the watch that says when its reasons stopped being true
-auto.py       the scheduler: collect, settle, and train when a session closes
+prices.py     daily OHLCV, cached, checked against the period asked for, and
+   |          not re-asked of a provider that just answered
 features.py   18 per-symbol indicators, every one computable at that close
-cross.py      9 -- where this name sits among its peers, lagged one session
-macro.py      up to 16 -- the state of the world, from unrevised market data, lagged
-events.py     3 -- distance to the next announcement, clipped to what was known
-news.py       a point-in-time store; inert as a feature until it has history
-labels.py     the only forward-looking lines, kept separate; two targets
+cross.py      9 -- where a name sits among its peers, lagged one session
+macro.py      up to 16 -- the state of the world, from unrevised market data
+events.py     3 -- distance to the next announcement
+news.py       a point-in-time archive; inert until it has a year
+labels.py     the only forward-looking lines; both windows of a day
 dataset.py    one cut date, carried not re-derived; purge; scaler on train only
    |
-baseline.py   majority, logistic, local MLP, walk-forward, noise floor
-trainer.py    two backends producing the same artifact, and what their
-   |          disagreement means, in units of the seed spread
-helloworld.py upload -> submit -> poll -> download
-   |
-model.py      numpy forward pass; no torch, no GPU, no black box
-evaluate.py   accuracy vs a training-period baseline, turnover-based costs,
-   |          Sharpe, t, drawdown, effective sample size -- all horizon-aware
+baseline.py   majority, logistic, MLP, walk-forward, noise floor
+trainer.py    two backends producing the same artifact
+evaluate.py   accuracy against a training-period baseline, turnover costs, and
+   |          every statistic corrected for overlap and clustering
 explain.py    the six-hurdle gate, and per-day attribution underneath it
+broker.py     what Nordnet and Avanza charge, minimum and all
+book.py       a book walked forward in money, and the permutation percentile
 search.py     train / validation / sealed test, a trial ledger, commit-then-open
-context.py    prose and citations, downstream of everything, gated
-web/          the UI; watch.py does the collecting unattended
+holding.py    the books: each a forward record, one of them funded
+challenge.py  the challenger loop -- budgeted, deduped, decision rules only
+promote.py    when a challenger takes over, and when the funded one stands down
+paper.py      the day-trade ledger that came before it
+auto.py       the scheduler: collect, settle, review, archive
+web/          the UI; the decision first, the working folded away
 ```
-
----
 
 ## Limitations worth knowing
 
-**The universe is survivor-biased.** The symbol lists are liquid large caps with
-long histories, not index constituents as of any particular date. A name that
-left an index or was acquired is not there. Fixing it properly needs a
-point-in-time constituent history, which is a paid dataset.
+**The universe is survivor-biased.** Liquid large caps with long histories, not
+index constituents as of any date. Fixing it needs a paid dataset.
 
-**Earnings coverage is uneven.** US names come back with a decade of quarterly
-dates; some European names come back with three. Symbols below the threshold get
-neutral values and are named in the coverage report rather than silently filled.
+**Fourteen decisions is not a track record.** The committed book's evidence is
+eight sealed rebalances and six on validation, in a rising market.
 
-**The one-session lag is blunt.** Grouping the panel by trading session and
-ranking within each would recover a day of freshness. It is worth doing once the
-universe is wide enough for the groups to be large.
+**The seal is spent for the current idea.** Low turnover was found by looking at
+the sealed period, so the only honest test left for it is forward paper trading.
 
-**The accuracy edge is real and does not pay.** On the wide relative panel it
-survives every statistical test in the project and still loses money after
-costs. Nothing here is tradeable; that is the finding, not a caveat.
+**Runs stored before the standard-error fix keep the old bar**, and on an
+absolute target that bar is too low.
 
-**Runs stored before the accuracy hurdle was fixed keep the old bar.** That
-hurdle used to size its standard error as a single proportion over the effective
-rows. But the edge is accuracy *minus* a baseline measured on the same rows, and
-on an absolute target that baseline is shared by every name on a date, because
-the market moves them together. On skill-less models the one-sided two-standard-
-error check — nominally 2.3% — passed 10% of the time with independent names and
-19% when they shared a market factor. The relative target was already right
-(0.7%): every date is half up by construction, so the baseline carries no
-date-level noise.
+**Costs past one session are approximate** — turnover is charged day to day on
+overlapping positions.
 
-The standard error is now measured on the difference itself, clustered by date,
-with the same overlap correction as everything past one session, and the same
-models pass 2.7%, 2.7% and 0.7%. The obvious repair — doubling the row variance
-and keeping the old design effect — was measured too and rejected: it only
-halved the shared-market case and made the relative target 30% too strict. The
-search bar uses the same number. Evaluations and ledger trials recorded before
-the fix have no measured standard error, so they fall back to the old formula
-and say so; on a relative target that makes little difference, on an absolute
-one their bar is too low. The other hurdles always stood behind it, which is
-why it never opened the gate.
-
-**A macro series stopped updating for two months, and the block handled it.**
-Between 2026-07-17 and 2026-09-25 the provider served no new ^VIX3M while ^VIX
-ran on; it has since resumed, and the column is back without anyone touching the
-code — the price cache rechecked, the series was no longer behind the others,
-and the block went back to 16 columns. What follows is what happens while a
-series is frozen, which is now tested rather than hypothetical. The macro
-block used to forward-fill every series onto one calendar without limit, so for
-39 sessions `vix_term_slope` divided a July close by a current one — on the end
-of the sealed test period and on every live signal. `pct_change` was doing the
-same thing one step later: its default pads, so a stopped series would have
-reported a return of exactly zero every day.
-
-The fill is now bounded at five sessions — the longest gap in any of these
-series over ten years is two, STOXX over Christmas — and every `pct_change`
-passes `fill_method=None`. A series more than five sessions behind the others
-has *ended*: it is dropped with the features built from it, named with its last
-date in the run's macro report, and warned about once. Leaving it blank instead
-looks more conservative and is not: a blank column deletes that date for every
-symbol, which on the wide panel would have removed 7,777 of the most recent
-complete rows, today's included. Dropping the column keeps all 536,221 and the
-cut date where it was. A gap inside a series that resumes is filled for five
-sessions, left blank past that and reported; none has happened.
-
-What it costs while a series is out: that column is gone, so models trained
-with it produce no signal (the page already refuses a row missing a trained
-feature), and a run waiting to be scored refuses by name rather than failing on
-a shape mismatch. The 20 trials in the search ledger were scored during the
-frozen window, with `vix_term_slope` carrying a July close; trials from here on
-are not strictly comparable with those.
-
-**Costs past one session are approximate.** Turnover is still charged day to
-day on overlapping positions, where a book that rebalances every h sessions
-would trade less often and by more each time.
-
-**Only the local controls have been run at width.** The numbers above come from
-the logistic and MLP controls on 238 symbols. No HelloWorldAi model has yet been
-trained on a panel that size — the step count that panel earns is about twenty
-times the old default, which is a real request of somebody else's GPU.
-
----
+**A macro series can stop.** ^VIX3M went unpublished for two months; a series
+more than five sessions behind the others is now dropped with its features
+rather than carried forward, and picked up again when it resumes.
 
 ## Tests
 
@@ -1188,22 +294,13 @@ times the old default, which is a real request of somebody else's GPU.
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-304 tests. The look-ahead ones test the property rather than the implementation
-— features computed on a truncated history must match the full one — and there
-is a test that deliberately introduces a centred rolling window to confirm the
-property test can still fail. The macro, cross-sectional and event blocks each
-have their own leak test. The model-loading ones build a bundle with
-HelloWorldAi's own packing code rather than a fixture, so a format change fails
-here instead of in production.
+339 tests. The look-ahead ones test the property rather than the implementation
+— features computed on a truncated history must match the full one — and one
+deliberately introduces a centred window to prove the property test can fail.
 
-Several are regression tests for the bugs listed above: the pinned cut date, the
-RSI warm-up, per-trade costs, the withheld small-bucket accuracy, the
-training-period baseline, the append-only news store, the noise floor, and the
-sigmoid-to-softmax conversion that would have sharpened every probability by up
-to 0.14 without raising anything, the executable return that turns an
-untradeable backtest into the number the gate reads, and the overlap correction
-— which checks both that a skill-less model at five days used to clear t = 2
-more than a quarter of the time, and that it no longer does. The accuracy
-hurdle has the same pair: skill-less models graded through `evaluate` and the
-gate must clear it at about the nominal rate and with an edge-to-error spread
-near one, and the old formula, on the same simulated models, must not.
+Most of the rest are regression tests for measured mistakes: the pinned cut
+date, the RSI warm-up, per-trade costs, the training-period baseline, the
+sigmoid-to-softmax conversion, the executable return, the overlap correction,
+the clustered standard error, the neutral-band leak, the paper ledger that
+stopped growing the day it first paid out, and the settlement that filled a
+238-name book from ten of them.

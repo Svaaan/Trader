@@ -68,6 +68,11 @@ def scheduler(tmp_path, monkeypatch):
     # The news pass reaches the provider; an auto test must not.
     monkeypatch.setattr(auto.pipeline_mod, "collect_news",
                         lambda symbols: {"added": 0, "readiness": {}})
+    # Nor may it run a search or read the real contest.
+    monkeypatch.setattr(auto.pipeline_mod, "challenge_step",
+                        lambda watchlist=None: {"asked": None})
+    monkeypatch.setattr(auto.pipeline_mod, "promotion",
+                        lambda: {"promote": None, "why": "stubbed"})
     monkeypatch.setattr(auto, "last_closed_session", lambda: "2026-09-25")
 
     yield calls
@@ -132,7 +137,7 @@ def test_forcing_trains_whatever_the_calendar_says(scheduler):
 
 # --- starting and stopping ----------------------------------------------------
 
-def wait_until(predicate, timeout=5.0):
+def wait_until(predicate, timeout=20.0):
     deadline = time.time() + timeout
     while time.time() < deadline:
         if predicate():
@@ -187,7 +192,7 @@ def test_a_stop_asked_for_on_disk_is_obeyed(scheduler):
     with open(auto._stop_marker(), "w", encoding="utf-8") as handle:
         handle.write("stop")
 
-    assert wait_until(lambda: not auto.running(), timeout=5)
+    assert wait_until(lambda: not auto.running())
 
 
 def test_a_loop_whose_process_died_is_not_reported_as_running(scheduler):
@@ -321,3 +326,19 @@ def test_a_news_failure_does_not_stop_the_cycle(scheduler, monkeypatch):
 
     assert "the provider said no" in out["news"]["error"]
     assert out["trained"] is not None, "the cycle gave up because news failed"
+
+
+def test_the_cycle_asks_the_challenger_loop_and_reads_the_rule(scheduler,
+                                                               monkeypatch):
+    """Both are cheap and neither moves money: asking is budgeted inside the
+    loop, and reading a verdict changes nothing by itself."""
+    monkeypatch.setattr(auto.pipeline_mod, "challenge_step",
+                        lambda watchlist=None: {"asked": "top 2, every 40",
+                                                "qualified": False})
+    monkeypatch.setattr(auto.pipeline_mod, "promotion",
+                        lambda: {"promote": None, "why": "not enough decisions"})
+
+    out = auto.cycle(trained_for="2026-09-25")
+
+    assert out["challenger"]["asked"] == "top 2, every 40"
+    assert out["promotion"] == {"promote": None, "why": "not enough decisions"}

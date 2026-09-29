@@ -48,7 +48,9 @@ from . import features as features_mod
 from . import labels as labels_mod
 from . import model as model_mod
 from . import news as news_mod
+from . import challenge as challenge_mod
 from . import holding as holding_mod
+from . import promote as promote_mod
 from . import paper as paper_mod
 from . import prices as prices_mod
 from . import trainer as trainer_mod
@@ -781,23 +783,68 @@ def follow_book(run=None, watchlist: Sequence[str] | None = None) -> dict:
     """
     try:
         if run is not None and (run.signals or []):
-            holding_mod.plan_next(run)
+            holding_mod.plan_all(run)
 
         symbols = set(holding_mod.symbols_to_price())
         if not symbols:
             return {"note": "nothing planned or held"}
 
         frames = prices_mod.load_many(sorted(symbols), period="2y")
-        step = holding_mod.advance(frames, run=run)
+        stepped = holding_mod.advance_all(frames, run=run)
 
-        # A review that sold leaves the book in cash with today's opinion still
+        # A review that sold leaves a book in cash with today's opinion still
         # in hand, so it can choose again in the same pass.
-        if step.get("exited") and run is not None:
-            holding_mod.plan_next(run)
-        return step
+        if run is not None and any(s.get("exited") for s in stepped.values()):
+            holding_mod.plan_all(run)
+
+        funded = holding_mod.funded()
+        return {**stepped.get(funded, {}), "books": {
+            book_id: {k: v for k, v in step.items() if k != "holding"}
+            for book_id, step in stepped.items()}}
     except Exception as exc:                            # noqa: BLE001
         logger.warning("Could not move the held book forward: %s", exc)
         return {"error": str(exc)}
+
+
+def challenge_step(watchlist: Sequence[str] | None = None) -> dict:
+    """Ask one new question of the search, if this week has budget left.
+
+    Narrow and slow on purpose: see challenge.py. A qualifying challenger does
+    not take over, it starts a forward record of its own.
+    """
+    try:
+        symbols = universe_mod.resolve(watchlist) if watchlist else default_watchlist()
+        waiting = challenge_mod.candidates()
+        if not waiting or challenge_mod.spent_this_week() >= challenge_mod.BUDGET_PER_WEEK:
+            return {"asked": None}
+
+        frames = prices_mod.load_many(symbols, period="10y")
+        return challenge_mod.step(frames)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("Challenger pass failed: %s", exc)
+        return {"asked": None, "error": str(exc)}
+
+
+def promotion() -> dict:
+    """What the promotion rule says today. Reading it changes nothing."""
+    try:
+        return promote_mod.decide()
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("Could not read the promotion rule: %s", exc)
+        return {"promote": None, "why": str(exc)}
+
+
+def guard_book() -> dict:
+    """Stop following the funded book if it has stopped doing its job.
+
+    Acts rather than reports, because a kill switch nobody pulls is a comment.
+    It can only ever stop: nothing in the loop starts trading something.
+    """
+    try:
+        return promote_mod.guard()
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("Could not read the drift guard: %s", exc)
+        return {"stand_down": False, "why": str(exc)}
 
 
 def settle_paper(watchlist: Sequence[str] | None = None) -> dict:

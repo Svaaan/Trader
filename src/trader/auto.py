@@ -237,8 +237,16 @@ def cycle(*, backend: str = "local", watchlist=None, trained_for: str | None = N
     out["settled"] = settled.get("settled", 0)
     out["pending"] = settled.get("pending", 0)
 
-    # The committed book: fill what was planned, sell when the review session
-    # arrives. Most days this does nothing, which is the strategy.
+    # One new question a week, and what the promotion rule makes of the
+    # records so far. Neither moves any money by itself.
+    out["guard"] = pipeline_mod.guard_book()
+    out["challenger"] = pipeline_mod.challenge_step(watchlist)
+    verdict = pipeline_mod.promotion()
+    out["promotion"] = {"promote": verdict.get("promote"),
+                        "why": verdict.get("why")}
+
+    # The books: fill what was planned, sell when a review session arrives.
+    # Most days this does nothing, which is the strategy.
     step = pipeline_mod.follow_book()
     out["book"] = {k: v for k, v in step.items() if k != "holding"}
     if step.get("holding"):

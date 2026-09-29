@@ -42,6 +42,10 @@ STORE_FILE = "holdings.jsonl"
 
 STARTING_CASH = 500.0
 
+# The book that is actually followed. Every line written before books had names
+# belongs to it, so the record it has already built survives being joined.
+CHAMPION = "champion"
+
 # What the search committed. Kept here as the default rather than read from the
 # search ledger, because a forward record should say what it was following even
 # if somebody commits something else tomorrow.
@@ -78,6 +82,99 @@ def schedule_for(symbol: str) -> str:
     return SCHEDULES.get(suffix, SCHEDULE)
 
 
+def _lines(book_id: str = CHAMPION) -> list:
+    """The lines belonging to one book, in order.
+
+    A line written before any of this existed carries no name and belongs to
+    the champion -- the record it has built is the one thing here that cannot
+    be recreated, so it is joined rather than restarted.
+    """
+    return [entry for entry in _read()
+            if entry.get("book_id", CHAMPION) == book_id]
+
+
+def books() -> dict:
+    """Every book in the contest: its rule, whether it is funded, and why.
+
+    Registration is a line like any other, because a challenger joining is an
+    event and the order of events is the whole value of this file.
+    """
+    known = {CHAMPION: {"id": CHAMPION, "rule": dict(BOOK), "funded": True,
+                        "why": "the book the search committed", "since": None}}
+    for entry in _read():
+        if "register" in entry:
+            item = entry["register"]
+            known[item["id"]] = {
+                "id": item["id"], "rule": {**BOOK, **(item.get("rule") or {})},
+                "funded": bool(item.get("funded")), "why": item.get("why", ""),
+                "since": item.get("at"), "expected": item.get("expected"),
+            }
+        elif "fund" in entry:
+            # A fund line naming nothing stands everything down.
+            for book in known.values():
+                book["funded"] = book["id"] == entry["fund"].get("id")
+    return known
+
+
+def register(book_id: str, *, rule: dict, why: str, funded: bool = False,
+             expected: float | None = None) -> dict:
+    """Enter a book into the contest. Shadows are recorded, never funded.
+
+    A challenger earns its record the same way the champion does -- same
+    machinery, same costs, same forward-only discipline -- and the only
+    difference is that nobody would have traded it.
+    """
+    if book_id in books() and book_id != CHAMPION:
+        raise ValueError(f"{book_id} is already in the contest")
+
+    entry = {"register": {"id": book_id, "rule": {**BOOK, **(rule or {})},
+                          "why": why, "funded": bool(funded), "at": _now(),
+                          # What its backtest expected per decision. The guard
+                          # compares the forward record against this rather
+                          # than against a number chosen after the fact.
+                          "expected": expected}}
+    logger.info("Registered %s: %s", book_id, why)
+    return _append(entry, book_id=book_id)["register"]
+
+
+def fund(book_id: str, *, why: str) -> dict:
+    """Make this the book that would actually be traded. Exactly one at a time."""
+    if book_id not in books():
+        raise ValueError(f"{book_id} is not in the contest")
+
+    entry = {"fund": {"id": book_id, "why": why, "at": _now()}}
+    logger.warning("Funded book is now %s: %s", book_id, why)
+    return _append(entry, book_id=book_id)["fund"]
+
+
+def funded() -> str | None:
+    """The book that would actually be traded, or None if trading has stopped.
+
+    None is a real answer, not a missing one: `stand_down` records that nothing
+    is being followed, and every book keeps its record either way -- you want to
+    know whether the one you stopped would have recovered.
+    """
+    for book_id, book in books().items():
+        if book["funded"]:
+            return book_id
+    return None
+
+
+def stand_down(*, why: str) -> dict:
+    """Stop funding anything. The records continue; the money does not.
+
+    Only ever called by the guard in promote.py, and it only ever stops --
+    nothing here can start trading something on its own.
+    """
+    entry = {"fund": {"id": None, "why": why, "at": _now()}}
+    logger.warning("Standing down: %s", why)
+    return _append(entry, book_id=CHAMPION)["fund"]
+
+
+def rule_for(book_id: str = CHAMPION) -> dict:
+    return books().get(book_id, {}).get("rule", dict(BOOK))
+
+
 def _path() -> str:
     return os.path.join(os.path.abspath(STORE_DIR), STORE_FILE)
 
@@ -90,11 +187,12 @@ def _read() -> list:
         return []
 
 
-def _append(entry: dict) -> dict:
+def _append(entry: dict, *, book_id: str = CHAMPION) -> dict:
     path = _path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        handle.write(json.dumps({**entry, "book_id": book_id},
+                                ensure_ascii=False) + "\n")
     return entry
 
 
@@ -102,15 +200,16 @@ def _now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
-def state() -> dict:
-    """Where the account stands, read from the lines in order.
+def state(book_id: str = CHAMPION) -> dict:
+    """Where one book stands, read from its own lines in order.
 
     Returns the plan waiting to be filled (if any), the position being held (if
-    any), everything already closed, and the cash.
+    any), everything already closed, and the cash. Each book keeps its own
+    account, so their records are comparable without unpicking a shared one.
     """
     cash, plan, holding, closed, watched = STARTING_CASH, None, None, [], None
 
-    for entry in _read():
+    for entry in _lines(book_id):
         if "plan" in entry:
             plan = entry["plan"]
         elif "fill" in entry:
@@ -212,28 +311,30 @@ def _compare(pattern: list, signal: dict, bought_at: float) -> dict:
 
 
 def symbols_to_price() -> set:
-    """Whatever the record needs prices for: the plan waiting, or the holding.
+    """Whatever the record needs prices for, across every book in the contest.
 
     The same rule the other ledger learned the hard way -- what to fetch is
     named by the record, not by whichever universe the caller happens to have.
     """
-    current = state()
     names = set()
-    if current["plan"]:
-        names.update(p["symbol"] for p in current["plan"]["buy"])
-    if current["holding"]:
-        names.update(p["symbol"] for p in current["holding"]["bought"])
+    for book_id in books():
+        current = state(book_id)
+        if current["plan"]:
+            names.update(p["symbol"] for p in current["plan"]["buy"])
+        if current["holding"]:
+            names.update(p["symbol"] for p in current["holding"]["bought"])
     return names
 
 
-def plan_next(run, *, book: dict | None = None) -> dict | None:
+def plan_next(run, *, book: dict | None = None,
+              book_id: str = CHAMPION) -> dict | None:
     """Write down what to buy, before the price it will be bought at exists.
 
-    Refuses if something is already held or already planned: this book holds one
+    Refuses if something is already held or already planned: a book holds one
     thing at a time, and the point of the interval is that it is left alone.
     """
-    book = {**BOOK, **(book or {})}
-    current = state()
+    book = {**rule_for(book_id), **(book or {})}
+    current = state(book_id)
     if current["holding"] or current["plan"]:
         return None
 
@@ -270,9 +371,9 @@ def plan_next(run, *, book: dict | None = None) -> dict | None:
                  # whether the reason is still there.
                  "pattern": _pattern_of(s)} for s in chosen],
     }}
-    logger.info("Plan: buy %s at the next open (from %s)",
+    logger.info("Plan (%s): buy %s at the next open (from %s)", book_id,
                 ", ".join(s["symbol"] for s in chosen), as_of)
-    return _append(entry)["plan"]
+    return _append(entry, book_id=book_id)["plan"]
 
 
 def _candidate(run, book: dict) -> dict | None:
@@ -288,7 +389,7 @@ def _candidate(run, book: dict) -> dict | None:
 
 
 def advance(frames: dict, *, book: dict | None = None, today=None,
-            run=None) -> dict:
+            run=None, book_id: str = CHAMPION) -> dict:
     """Fill a waiting plan, or review a position whose date has arrived.
 
     Called on a schedule. Does nothing most days, which is the entire point of
@@ -301,16 +402,16 @@ def advance(frames: dict, *, book: dict | None = None, today=None,
     pay a round trip to stand still -- and the strategy that was tested never
     did that, because it only ever charged for a change.
     """
-    book = {**BOOK, **(book or {})}
-    current = state()
-    out = {"filled": None, "exited": None, "holding": None, "note": None,
-           "renewed": None, "watch": None}
+    book = {**rule_for(book_id), **(book or {})}
+    current = state(book_id)
+    out = {"book_id": book_id, "filled": None, "exited": None, "holding": None,
+           "note": None, "renewed": None, "watch": None}
 
     if current["plan"] and not current["holding"]:
-        filled = _fill(current["plan"], current["cash"], frames)
+        filled = _fill(current["plan"], current["cash"], frames, book_id)
         if filled:
             out["filled"] = filled
-            current = state()
+            current = state(book_id)
         else:
             out["note"] = "the session after the plan has not closed yet"
 
@@ -318,7 +419,8 @@ def advance(frames: dict, *, book: dict | None = None, today=None,
     if holding:
         if run is not None:
             out["watch"] = watch(holding, run,
-                                 (current.get("watch") or {}).get("status"))
+                                 (current.get("watch") or {}).get("status"),
+                                 book_id=book_id)
         due = _sessions_left(holding, frames, today=today)
         out["holding"] = {**holding, "sessions_left": due["left"],
                           "review_on": due["review_on"],
@@ -328,7 +430,7 @@ def advance(frames: dict, *, book: dict | None = None, today=None,
             candidate = _candidate(run, book) if run is not None else None
 
             if candidate and candidate["symbol"] in held_names and len(held_names) == 1:
-                renewed = _renew(holding, candidate, due)
+                renewed = _renew(holding, candidate, due, book_id)
                 out["renewed"] = renewed
                 out["holding"] = {**holding, "session": renewed["from_session"],
                                   "sessions_left": int(book["rebalance_every"]),
@@ -338,7 +440,7 @@ def advance(frames: dict, *, book: dict | None = None, today=None,
                     f"calls it up ({float(candidate['probability_up']):.3f}), so "
                     f"nothing was traded and nothing was paid")
             else:
-                exited = _exit(holding, current["cash"], frames)
+                exited = _exit(holding, current["cash"], frames, book_id)
                 if exited:
                     out["exited"] = exited
                     out["holding"] = None
@@ -353,7 +455,23 @@ def advance(frames: dict, *, book: dict | None = None, today=None,
     return out
 
 
-def _fill(plan: dict, cash: float, frames: dict) -> dict | None:
+def advance_all(frames: dict, *, run=None, today=None) -> dict:
+    """Step every book in the contest, each by its own rule.
+
+    The champion and the challengers see exactly the same prices and the same
+    model on the same day; what differs is only what each does about it.
+    """
+    return {book_id: advance(frames, today=today, run=run, book_id=book_id)
+            for book_id in books()}
+
+
+def plan_all(run, *, today=None) -> dict:
+    """Let any book that is in cash choose, from the same signals."""
+    return {book_id: plan_next(run, book_id=book_id) for book_id in books()}
+
+
+def _fill(plan: dict, cash: float, frames: dict,
+          book_id: str = CHAMPION) -> dict | None:
     """Buy at the first open after the plan was written."""
     bought, spent = [], 0.0
     for position in plan["buy"]:
@@ -385,9 +503,9 @@ def _fill(plan: dict, cash: float, frames: dict) -> dict | None:
         "cash_after": round(cash - spent, 4),
         "fees": round(spent, 4),
     }}
-    logger.info("Filled: %s at %s", ", ".join(
+    logger.info("Filled (%s): %s at %s", book_id, ", ".join(
         f"{b['symbol']} {b['price']}" for b in bought), bought[0]["session"])
-    return _append(entry)["fill"]
+    return _append(entry, book_id=book_id)["fill"]
 
 
 def _sessions_left(holding: dict, frames: dict, today=None) -> dict:
@@ -411,7 +529,8 @@ def _sessions_left(holding: dict, frames: dict, today=None) -> dict:
             "held": held}
 
 
-def watch(holding: dict, run, last_status: str | None) -> dict | None:
+def watch(holding: dict, run, last_status: str | None,
+          *, book_id: str = CHAMPION) -> dict | None:
     """Re-read the case for what is held, and say so when it changes.
 
     Deliberately writes nothing unless the verdict changes: a record of events
@@ -443,13 +562,14 @@ def watch(holding: dict, run, last_status: str | None) -> dict | None:
     _append({"watch": {
         "at": _now(), "symbol": bought.get("symbol"),
         "session": signal.get("as_of"), **verdict,
-    }})
+    }}, book_id=book_id)
     logger.info("Watching %s: %s -- %s", bought.get("symbol"),
                 verdict["status"], verdict["note"])
     return verdict
 
 
-def _renew(holding: dict, candidate: dict, due: dict) -> dict:
+def _renew(holding: dict, candidate: dict, due: dict,
+           book_id: str = CHAMPION) -> dict:
     """Record a review that confirmed the position. No trade, no fee."""
     entry = {"renew": {
         "at": _now(),
@@ -459,12 +579,13 @@ def _renew(holding: dict, candidate: dict, due: dict) -> dict:
         # The clock restarts from the session the review fell on.
         "from_session": due["review_on"] or holding["session"],
     }}
-    logger.info("Reviewed and kept %s (%.3f): nothing traded",
-                candidate["symbol"], float(candidate["probability_up"]))
-    return _append(entry)["renew"]
+    logger.info("Reviewed and kept %s (%.3f) for %s: nothing traded",
+                candidate["symbol"], float(candidate["probability_up"]), book_id)
+    return _append(entry, book_id=book_id)["renew"]
 
 
-def _exit(holding: dict, cash: float, frames: dict) -> dict | None:
+def _exit(holding: dict, cash: float, frames: dict,
+          book_id: str = CHAMPION) -> dict | None:
     """Sell at the open of the session the plan named."""
     sold, proceeds = [], 0.0
     for position in holding["bought"]:
@@ -498,12 +619,12 @@ def _exit(holding: dict, cash: float, frames: dict) -> dict | None:
         "fees": round(sum(s["fee"] for s in sold), 4),
         "profit": round(sum(s["net"] for s in sold), 4),
     }}
-    logger.info("Sold: %s at %s, profit %.2f", ", ".join(
+    logger.info("Sold (%s): %s at %s, profit %.2f", book_id, ", ".join(
         s["symbol"] for s in sold), sold[0]["session"], entry["exit"]["profit"])
-    return _append(entry)["exit"]
+    return _append(entry, book_id=book_id)["exit"]
 
 
-def log(limit: int = 40) -> list:
+def log(limit: int = 40, book_id: str = CHAMPION) -> list:
     """The record as sentences, newest first.
 
     Every line in the ledger is already an event with a date on it, so the log
@@ -513,7 +634,7 @@ def log(limit: int = 40) -> list:
     statistics, and it cannot drift from the truth because it is the truth.
     """
     lines = []
-    for entry in _read():
+    for entry in _lines(book_id):
         if "plan" in entry:
             plan = entry["plan"]
             names = ", ".join(
@@ -567,9 +688,10 @@ def log(limit: int = 40) -> list:
     return list(reversed(lines))[:limit]
 
 
-def account(frames: dict | None = None, *, today=None) -> dict:
+def account(frames: dict | None = None, *, today=None,
+            book_id: str = CHAMPION) -> dict:
     """What the page shows: the pick, the plan to sell, and what it has done."""
-    current = state()
+    current = state(book_id)
     holding, plan, closed = current["holding"], current["plan"], current["closed"]
 
     position = None
@@ -609,14 +731,28 @@ def account(frames: dict | None = None, *, today=None) -> dict:
         "fees": round(sum(e.get("fees", 0.0) for e in closed)
                       + (holding.get("fees", 0.0) if holding else 0.0), 2),
         "trades": 2 * len(closed) + (len(holding["bought"]) if holding else 0),
-        "book": BOOK,
+        "book": rule_for(book_id),
         "waiting_to_buy": plan,
         "position": position,
         "closed": closed[-10:],
-        "log": log(),
+        "log": log(book_id=book_id),
+        "book_id": book_id,
+        "funded": books().get(book_id, {}).get("funded", book_id == CHAMPION),
+        "why": books().get(book_id, {}).get("why", ""),
+        "rule": rule_for(book_id),
         "schedule": ", ".join(sorted({
             broker_mod.resolve(schedule_for(p["symbol"])).name
             for p in ((holding or {}).get("bought")
                       or (plan or {}).get("buy") or [])
         })) or broker_mod.resolve(SCHEDULE).name,
     }
+
+
+def accounts(frames: dict | None = None, *, today=None) -> list:
+    """Every book side by side, the funded one first.
+
+    This is the contest: the same machinery, the same costs and the same days,
+    with nothing shared between them except the market.
+    """
+    out = [account(frames, today=today, book_id=book_id) for book_id in books()]
+    return sorted(out, key=lambda book: (not book["funded"], book["book_id"]))

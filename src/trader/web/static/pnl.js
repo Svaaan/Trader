@@ -100,6 +100,54 @@ function logPanel(entries) {
   return panel;
 }
 
+// --- the contest ---------------------------------------------------------------
+
+function contestPanel(contest) {
+  if (!contest || contest.error) return null;
+  const books = contest.books || [];
+
+  const panel = el("section", "panel");
+  panel.appendChild(el("h3", null, "The contest"));
+
+  if (contest.guard && contest.guard.stand_down) {
+    panel.appendChild(el("p", "decision-warn",
+      `Trading is stopped — ${contest.guard.why}. The records keep running, so `
+      + `you can see whether it would have recovered.`));
+  }
+
+  const table = el("table", "table");
+  const head = el("tr");
+  ["Book", "Rule", "Decisions", "Return", "Status"]
+    .forEach((h) => head.appendChild(el("th", null, h)));
+  table.appendChild(head);
+
+  books.forEach((book) => {
+    const rule = book.rule || {};
+    const closed = (book.closed || []).length;
+    const row = el("tr");
+    row.appendChild(el("td", null, book.book_id));
+    row.appendChild(el("td", null,
+      `top ${rule.top_n}, every ${rule.rebalance_every}`));
+    row.appendChild(el("td", null, String(closed)));
+    row.appendChild(el("td", book.profit < 0 ? "down" : "up", pct(book.return)));
+    row.appendChild(el("td", null, book.funded ? "funded" : "shadow"));
+    table.appendChild(row);
+  });
+  panel.appendChild(table);
+
+  const promotion = contest.promotion || {};
+  panel.appendChild(el("p", "note",
+    `Promotion: ${promotion.why || "nothing to say"}.`));
+  const spare = Math.max(contest.budget - contest.asked, 0);
+  panel.appendChild(el("p", "note",
+    `Challengers: ${contest.asked} question${contest.asked === 1 ? "" : "s"} asked `
+    + `this week against a budget of ${contest.budget}, so `
+    + `${spare ? `${spare} left` : "none left until the week turns"}. `
+    + `${contest.waiting} rules still untried. A challenger that clears the bar `
+    + `starts a record of its own — only that record can promote it.`));
+  return panel;
+}
+
 // --- everything that is measurement rather than decision ----------------------
 
 function numbers(book, account, body) {
@@ -168,14 +216,17 @@ async function refresh() {
   const host = document.getElementById("pnl");
 
   try {
-    const [pnlResponse, bookResponse] = await Promise.all([
+    const [pnlResponse, bookResponse, contestResponse] = await Promise.all([
       fetch("/api/pnl").catch(() => null),
       fetch("/api/book").catch(() => null),
+      fetch("/api/contest").catch(() => null),
     ]);
 
     const body = pnlResponse && pnlResponse.ok ? await pnlResponse.json() : {};
     const account = body.account || {};
     const book = bookResponse && bookResponse.ok ? await bookResponse.json() : null;
+    const contest = contestResponse && contestResponse.ok
+      ? await contestResponse.json() : null;
 
     host.replaceChildren();
 
@@ -188,6 +239,12 @@ async function refresh() {
     host.appendChild(decision(book));
     const log = logPanel(book.log);
     if (log) host.appendChild(log);
+    // Only worth a panel once something is actually competing.
+    if (contest && (contest.books || []).length > 1) {
+      host.appendChild(contestPanel(contest));
+    } else if (contest && contest.guard && contest.guard.stand_down) {
+      host.appendChild(contestPanel(contest));
+    }
     host.appendChild(numbers(book, account, body));
 
   } catch (error) {
