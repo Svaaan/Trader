@@ -53,6 +53,7 @@ from .. import prices as prices_mod
 from .. import news as news_mod
 from .. import paper as paper_mod
 from .. import pipeline
+from .. import search as search_mod
 
 logger = logging.getLogger(__name__)
 
@@ -143,14 +144,33 @@ def analysis(request: Request):
                                       {"request": request, "v": _static_version()})
 
 
+# Every signal carries its 46 raw feature values and the model's contribution
+# from all 46, which is 1.4 MB of JSON for 238 symbols -- re-sent on every poll
+# to draw three sentences per name. `detail` decides how much of that travels:
+# "none" for a page that only wants the score, "brief" (the default) for the
+# three reasons that are actually rendered, "full" for the raw row.
+def _signals(run, detail: str) -> list:
+    if detail == "none":
+        return []
+    if detail == "full":
+        return run.signals
+
+    return [{k: v for k, v in signal.items()
+             if k not in ("features", "all_contributions")}
+            for signal in (run.signals or [])]
+
+
 @app.get("/api/analysis")
-def api_analysis():
+def api_analysis(detail: str = "brief"):
     """The newest finished run, with its reasoning.
 
     Only finished runs: a model still training has no opinion, and showing the
     previous run's calls beside a "training" badge would invite reading stale
     numbers as current ones.
     """
+    if detail not in ("none", "brief", "full"):
+        return JSONResponse(
+            {"error": "detail must be none, brief or full"}, status_code=400)
     run = _newest_done()
     if run is None:
         return JSONResponse({"run": None,
@@ -170,7 +190,7 @@ def api_analysis():
             "walk_forward": run.walk_forward,
             "verdict": run.verdict,
             "learnt": run.learnt,
-            "signals": run.signals,
+            "signals": _signals(run, detail),
             "dataset": {
                 "test": (run.dataset or {}).get("test", {}),
                 "train": (run.dataset or {}).get("train", {}),
@@ -185,6 +205,100 @@ def api_analysis():
         "news": news_mod.readiness(run.watchlist or []),
         "context_available": context_mod.available(),
     })
+
+
+@app.get("/api/decision")
+def api_decision():
+    """Everything the front page needs, and nothing it does not.
+
+    The front page polls. Handing it the whole analysis payload meant 1.4 MB
+    every fifteen seconds to render one verdict and one decision, so this
+    assembles exactly that: the gate, the headline numbers, what the funded
+    book intends, and the reasons for the names actually involved.
+    """
+    run = _newest_done()
+    book = None
+    try:
+        symbols = sorted(holding_mod.symbols_to_price())
+        frames = prices_mod.load_many(symbols, period="2y") if symbols else {}
+        book = holding_mod.account(frames)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("Could not read the book: %s", exc)
+
+    if run is None:
+        return {"run": None, "book": book,
+                "why": "No finished model yet. Train one first."}
+
+    # The names the decision is about -- the ones being bought, or held.
+    involved = set()
+    for entry in ((book or {}).get("waiting_to_buy") or {}).get("buy", []):
+        involved.add(entry.get("symbol"))
+    for entry in ((book or {}).get("position") or {}).get("bought", []):
+        involved.add(entry.get("symbol"))
+
+    reasons = {
+        signal["symbol"]: {
+            "probability_up": signal.get("probability_up"),
+            "confidence": signal.get("confidence"),
+            "leaning": signal.get("leaning"),
+            "as_of": signal.get("as_of"),
+            "close": signal.get("close"),
+            "stale_days": signal.get("stale_days"),
+            "reasons": signal.get("reasons") or [],
+        }
+        for signal in (run.signals or []) if signal.get("symbol") in involved
+    }
+
+    evaluation = run.evaluation or {}
+    return {
+        "run": {
+            "run_id": run.run_id,
+            "created": run.created,
+            "horizon": run.horizon,
+            "trust": run.trust,
+            "verdict": run.verdict,
+            "symbols": evaluation.get("symbols"),
+            "headline": {
+                "accuracy": evaluation.get("accuracy"),
+                "baseline_accuracy": evaluation.get("baseline_accuracy"),
+                "edge": evaluation.get("edge"),
+                "edge_standard_error": evaluation.get("edge_standard_error"),
+                "days": evaluation.get("days"),
+                "effective_rows": evaluation.get("effective_rows"),
+                "executable_tstat": evaluation.get("executable_tstat"),
+                "executable_sharpe": evaluation.get("executable_sharpe"),
+                "executable_annualised": evaluation.get("executable_annualised"),
+                "strategy_sharpe": evaluation.get("strategy_sharpe"),
+                "execution_gap": evaluation.get("execution_gap"),
+                "test_from": (run.dataset or {}).get("test", {}).get("from"),
+                "test_to": (run.dataset or {}).get("test", {}).get("to"),
+            },
+        },
+        "book": book,
+        "signals": reasons,
+        "briefing": briefing_mod.read(limit=1),
+    }
+
+
+@app.get("/api/trials")
+def api_trials(limit: int = 40):
+    """The search ledger: every configuration asked about, in the order asked.
+
+    Append-only and pre-registered, which is the only reason the number of
+    trials can be used to correct the bar the next one has to clear. Served in
+    full rather than ranked, because the ones that failed are what make the
+    ones that passed mean anything.
+    """
+    try:
+        trials = search_mod.read_trials()
+        return {
+            "trials": trials[-limit:][::-1],
+            "total": len(trials),
+            "seal": search_mod.seal_state(),
+        }
+    except Exception as exc:                            # noqa: BLE001
+        logger.exception("Could not read the trial ledger")
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.get("/pnl", response_class=HTMLResponse)

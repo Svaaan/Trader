@@ -120,6 +120,16 @@ class Evaluation:
     executable_max_drawdown: float
     execution_gap: float            # graded Sharpe minus executable Sharpe
 
+    # The three series behind every ratio above, as equity from 1.0.
+    #
+    # Only the means used to survive this function, and a mean is the one thing
+    # that cannot show what is actually wrong here: the graded curve and the
+    # executable curve start together and end a long way apart, and no pair of
+    # Sharpe ratios makes that as plain as the two lines do. Kept as the
+    # compounded curve rather than the returns so a reader cannot accidentally
+    # annualise it a second time.
+    equity: dict
+
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
 
@@ -495,6 +505,20 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
 
     effective, design, rho = _effective_rows(correct, dates, symbols, horizon)
 
+    def curve(series: pd.Series) -> list:
+        """Compounded equity from 1.0, one point per holding period.
+
+        Stepped by `horizon` for the same reason `_drawdown` is: past one
+        session the rows overlap, and compounding every one of them charges
+        the same move h times.
+        """
+        stepped = series.iloc[::horizon]
+        if stepped.empty:
+            return []
+        return [round(float(v), 5) for v in (1.0 + stepped).cumprod()]
+
+    stepped_dates = [str(d)[:10] for d in net.iloc[::horizon].index]
+
     graded_sharpe = _sharpe(net, horizon)
     reachable_sharpe = _sharpe(executable_net, horizon)
 
@@ -532,6 +556,10 @@ def evaluate(probabilities, actual, forward_returns, dates, symbols, *,
         executable_tstat=round(_tstat(executable_net, horizon), 3),
         executable_max_drawdown=round(_drawdown(executable_net, horizon), 4),
         execution_gap=round(graded_sharpe - reachable_sharpe, 3),
+        equity={"dates": stepped_dates,
+                "graded": curve(net),
+                "executable": curve(executable_net),
+                "hold": curve(hold)},
     )
 
 

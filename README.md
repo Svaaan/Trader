@@ -248,6 +248,31 @@ clears every accuracy test and loses 3.2% a year.
 
 Every hurdle is recorded whether it passed or not. The gate has never opened.
 
+## The three pages
+
+```bash
+python run.py                         # http://127.0.0.1:8600
+```
+
+**Today** leads with the gate, because the gate has never been open and that is
+the thing a reader is least likely to go looking for. Underneath it: all eight
+hurdles with the number behind each, then what the paper book intends and the
+three features that moved the answer, in sentences.
+
+**Evidence** is the case against trusting it, in four charts. The first is the
+one the project earns: the same positions held close-to-close and held from the
+next open, drawn from the run's own stored series. They start together at 1.0
+and end 9 points apart. The others put the edge beside its own noise floor,
+show accuracy climbing with confidence while the tradeable return does not, and
+give every walk-forward window both ways.
+
+**Record** is what cannot be re-run: the forward book, the contest, and all 32
+trials in the order they were asked, with the committed one marked.
+
+The charts are hand-drawn SVG. Four charts do not pay for a charting
+dependency, and each of these is making a specific argument that a generic
+chart would soften.
+
 ## Statistics that had to be fixed to be honest
 
 - **Overlapping windows.** At a five-day horizon consecutive rows share four
@@ -291,7 +316,7 @@ briefing.py   what it noticed today, from the stores, written forward
 paper.py      the day-trade ledger that came before holding.py -- read only:
    |          nothing writes to it, because 238 names on 500 pays 96% a trip
 auto.py       the scheduler: news, books, contest, briefing
-web/          the UI; the decision first, the working folded away
+web/          three pages: the verdict, the case against it, the record
 ```
 
 ## Limitations worth knowing
@@ -321,7 +346,7 @@ rather than carried forward, and picked up again when it resumes.
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-306 tests. The look-ahead ones test the property rather than the implementation
+317 tests. The look-ahead ones test the property rather than the implementation
 — features computed on a truncated history must match the full one — and one
 deliberately introduces a centred window to prove the property test can fail.
 
@@ -330,5 +355,6 @@ date, the RSI warm-up, per-trade costs, the training-period baseline, the
 sigmoid-to-softmax conversion, the executable return, the overlap correction,
 the clustered standard error, the neutral-band leak, the paper ledger that
 stopped growing the day it first paid out, the settlement that filled a
-238-name book from ten of them, and the endpoint that went on reading a field
-after the field was deleted.
+238-name book from ten of them, the endpoint that went on reading a field after
+the field was deleted, and the fill that debited its commission but not the
+money it spent — which marked a $500 book at $991 the next session.

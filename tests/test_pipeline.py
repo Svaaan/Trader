@@ -439,3 +439,84 @@ def test_the_pages_serve_a_real_run(runs_dir, panel_prices, offline_spec,
     analysis = client.get("/api/analysis")
     assert analysis.status_code == 200
     assert analysis.json()["run"]["run_id"] == run.run_id
+
+
+def test_the_polling_page_is_not_handed_the_whole_run(runs_dir, panel_prices,
+                                                      offline_spec):
+    """The front page polls. It used to poll the full analysis payload.
+
+    Every signal carries its raw feature row and the model's contribution from
+    all 46 features, which on the real 238-name panel is 1.4 MB of JSON -- re-
+    fetched every fifteen seconds to render one verdict and three sentences.
+    `detail` decides how much of that travels, and /api/decision carries only
+    the names the decision is actually about.
+    """
+    from starlette.testclient import TestClient
+
+    from trader.web import app as web_app
+
+    run = pipeline.start(list(panel_prices), spec=offline_spec,
+                         run_controls=False)
+    assert run.signals, "this test needs a run that produced signals"
+
+    client = TestClient(web_app.app)
+
+    full = client.get("/api/analysis?detail=full").json()["run"]["signals"]
+    brief = client.get("/api/analysis?detail=brief").json()["run"]["signals"]
+    none = client.get("/api/analysis?detail=none").json()["run"]["signals"]
+
+    assert len(full) == len(brief) and none == []
+    assert "features" in full[0] and "all_contributions" in full[0]
+    # The three reasons survive -- they are what the page renders.
+    assert "features" not in brief[0] and "all_contributions" not in brief[0]
+    assert "reasons" in brief[0] and "probability_up" in brief[0]
+
+    assert client.get("/api/analysis?detail=sideways").status_code == 400
+
+
+def test_the_decision_endpoint_answers_for_the_names_it_names(
+        runs_dir, panel_prices, offline_spec):
+    """It carries reasons for the symbols the book is acting on, and no others.
+
+    A page that names a symbol and then quotes another one's numbers is the bug
+    this endpoint's shape exists to make impossible: the reasons are keyed by
+    the symbol they belong to rather than handed over as a list to index into.
+    """
+    from starlette.testclient import TestClient
+
+    from trader.web import app as web_app
+
+    pipeline.start(list(panel_prices), spec=offline_spec, run_controls=False)
+    body = TestClient(web_app.app).get("/api/decision").json()
+
+    assert body["run"]["trust"] is not None
+    assert "accuracy" in body["run"]["headline"]
+
+    book = body.get("book") or {}
+    wanted = {entry["symbol"]
+              for entry in (book.get("waiting_to_buy") or {}).get("buy", [])}
+    wanted |= {entry["symbol"]
+               for entry in (book.get("position") or {}).get("bought", [])}
+    assert set(body["signals"]) <= wanted
+
+
+def test_the_trial_ledger_is_served_in_the_order_it_was_written(monkeypatch,
+                                                                tmp_path):
+    """Newest first, with the total, because the total is what raises the bar."""
+    import json as json_mod
+    from starlette.testclient import TestClient
+
+    from trader import search as search_mod
+    from trader.web import app as web_app
+
+    directory = tmp_path / "search"
+    directory.mkdir()
+    monkeypatch.setattr(search_mod, "SEARCH_DIR", str(directory))
+    with open(directory / search_mod.TRIALS_FILE, "w", encoding="utf-8") as handle:
+        for n in (1, 2, 3):
+            handle.write(json_mod.dumps({"trial": n, "spec": {}, "book": {},
+                                         "validation": {"edge": 0.01 * n}}) + "\n")
+
+    body = TestClient(web_app.app).get("/api/trials").json()
+    assert body["total"] == 3
+    assert [t["trial"] for t in body["trials"]] == [3, 2, 1]

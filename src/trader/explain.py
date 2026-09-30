@@ -157,10 +157,10 @@ def assess(evaluation: dict, *, controls: dict | None = None,
 
     enough_rows = effective >= MIN_EFFECTIVE_ROWS
     record("enough_effective_rows", enough_rows,
-           f"{rows} rows are worth {effective} independent ones after "
+           f"{rows:,} rows are worth {effective:,} independent ones after "
            f"discounting for how much the panel moves together.")
     if not enough_rows:
-        return refuse(f"{rows} rows, but only about {effective} of them are "
+        return refuse(f"{rows:,} rows, but only about {effective:,} of them are "
                       f"independent once the panel's shared movement is taken "
                       f"out. Not enough to measure anything.")
 

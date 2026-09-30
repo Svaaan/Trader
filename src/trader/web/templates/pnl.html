@@ -4,41 +4,36 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Trader — P&amp;L</title>
+    <title>Trader — Record</title>
     <link rel="stylesheet" href="/static/trader.css?v={{ v }}">
 </head>
 
 <body>
     <header class="top">
-        <div class="brand">Trader</div>
+        <div class="brand">Trader <span>record</span></div>
         <nav class="nav">
-            <a href="/">Runs</a>
-            <a href="/pnl" class="is-here">P&amp;L</a>
-            <a href="/analysis">Analysis</a>
+            <a href="/">Today</a>
+            <a href="/analysis">Evidence</a>
+            <a href="/pnl" class="is-here">Record</a>
         </nav>
-        <div class="top-right">
-            <button type="button" class="btn" id="settle">Check for a decision</button>
+        <div class="top-actions">
+            <button type="button" class="btn" id="advance">Check for a decision</button>
         </div>
     </header>
 
     <main>
-        <section class="intro">
-            <h1>The decision</h1>
-            <p>
-                A $500 paper account following the book the search committed. No
-                orders are placed and no broker is involved — this is a record,
-                and it is the only measurement here that <strong>cannot be
-                mined</strong>, because when each line is written the outcome has
-                not happened yet. The model never reads it back.
-            </p>
-        </section>
-
-        <div id="pnl">
+        {# Drawn by record.js from the book store, the contest and the search
+           ledger. Nothing on this page is re-computed from the model: it is
+           read back from files that are only ever appended to. #}
+        <div id="record">
             <p class="empty">Loading…</p>
         </div>
     </main>
 
-    <script src="/static/pnl.js?v={{ v }}"></script>
+    <script type="importmap">
+    {"imports": {"ui": "/static/ui.js?v={{ v }}"}}
+    </script>
+    <script type="module" src="/static/record.js?v={{ v }}"></script>
 </body>
 
 </html>

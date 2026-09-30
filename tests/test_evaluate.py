@@ -519,3 +519,65 @@ def test_the_confidence_buckets_carry_both_windows():
     assert top["mean_net_return"] > 0.01
     assert top["mean_executable_return"] == pytest.approx(0.0, abs=1e-9)
     assert all("mean_executable_return" in b for b in result.by_confidence)
+
+
+# --- the curves behind the ratios ----------------------------------------------
+
+def test_the_equity_curves_compound_the_real_series():
+    """Two Sharpe ratios do not show what two lines do.
+
+    The graded curve and the executable curve start at the same 1.0 and end a
+    long way apart on this panel, which is the finding. So the curves are part
+    of the evaluation rather than something the page re-derives from a mean --
+    a mean raised to the 252nd power is not this account's history.
+    """
+    rng = np.random.default_rng(5)
+    days, names = 90, 4
+    calendar = pd.bdate_range("2024-01-01", periods=days)
+    dates = np.repeat(calendar, names)
+    symbols = np.tile([f"S{i}" for i in range(names)], days)
+
+    probs = rng.random(days * names)
+    graded = np.where(probs > 0.5, 0.01, -0.01)
+    reachable = -graded
+    labels = (graded > 0).astype(int)
+
+    result = evaluate.evaluate(probs, labels, graded, dates, symbols,
+                               executable_returns=reachable,
+                               train_up_share=0.5, cost=0.0)
+
+    curves = result.equity
+    assert len(curves["dates"]) == days
+    for name in ("graded", "executable", "hold"):
+        assert len(curves[name]) == days, name
+
+    # The graded book is right every row here and the reachable one is wrong
+    # every row, so the curves must part rather than merely differ in ratio.
+    assert curves["graded"][-1] > 1.0
+    assert curves["executable"][-1] < 1.0
+    # And the compounded end matches the annualised figure it is quoted beside.
+    years = days / evaluate.TRADING_DAYS
+    assert curves["graded"][-1] ** (1 / years) - 1 == pytest.approx(
+        result.strategy_annualised, rel=0.01)
+
+
+def test_the_curve_steps_by_the_horizon():
+    """At h sessions a row is held h days, so compounding every row would
+    charge the same move h times and draw a curve the account never had."""
+    days, names = 60, 3
+    calendar = pd.bdate_range("2024-01-01", periods=days)
+    dates = np.repeat(calendar, names)
+    symbols = np.tile([f"S{i}" for i in range(names)], days)
+    probs = np.full(days * names, 0.9)
+    returns = np.full(days * names, 0.01)
+    labels = np.ones(days * names, dtype=int)
+
+    at_one = evaluate.evaluate(probs, labels, returns, dates, symbols,
+                               train_up_share=0.5, cost=0.0, horizon=1)
+    at_five = evaluate.evaluate(probs, labels, returns, dates, symbols,
+                                train_up_share=0.5, cost=0.0, horizon=5)
+
+    assert len(at_one.equity["graded"]) == days
+    assert len(at_five.equity["graded"]) == len(range(0, days, 5))
+    # Same per-row move, so a curve that stepped wrongly would compound higher.
+    assert at_five.equity["graded"][-1] < at_one.equity["graded"][-1]

@@ -4,56 +4,58 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Trader</title>
+    <title>Trader — Today</title>
     <link rel="stylesheet" href="/static/trader.css?v={{ v }}">
 </head>
 
 <body>
     <header class="top">
-        <div class="brand">Trader</div>
+        <div class="brand">Trader <span>{{ watchlist | length }} names</span></div>
         <nav class="nav">
-            <a href="/" class="is-here">Runs</a>
-            <a href="/pnl">P&amp;L</a>
-            <a href="/analysis">Analysis</a>
+            <a href="/" class="is-here">Today</a>
+            <a href="/analysis">Evidence</a>
+            <a href="/pnl">Record</a>
         </nav>
-        <div class="top-right">
+        <div class="top-actions">
             <button type="button" class="btn" id="startRun">Train a new model</button>
-            <button type="button" class="btn" id="autoTrain" data-running="no">Auto-train</button>
+            <button type="button" class="btn" id="autoTrain" data-running="no">Start the scheduler</button>
         </div>
     </header>
 
-    <p class="auto-state" id="autoState">Auto-training off</p>
+    <p class="auto-state" id="autoState">Reading the scheduler…</p>
 
     <main>
-        <section class="intro">
-            <h1>Direction signals, with the working shown</h1>
-            <p>
-                Each run is graded on the last stretch of history it was never
-                given, and says plainly whether it earned an opinion. It places
-                no orders and holds no broker credentials.
-            </p>
-            <p class="watchlist">
-                {# A few hundred names is the point -- a macro feature needs a
-                   cross-section to mean anything, and a rank needs peers. But
-                   printing all of them turns the sentence into a wall, so the
-                   count leads and the list is available underneath it. #}
-                Watching <strong>{{ watchlist | length }}</strong> symbols
-                across US and European exchanges.
-            </p>
-            <details class="watchlist-all">
-                <summary>Show the universe</summary>
-                <p class="watchlist">
-                    {% for symbol in watchlist %}<code>{{ symbol }}</code>{% endfor %}
-                </p>
-            </details>
-        </section>
-
-        <div id="runs" class="runs">
+        {# Everything on this page is drawn by today.js from /api/decision, so
+           that the verdict and the decision come from the same read of the
+           record and cannot disagree with each other. #}
+        <div id="today">
             <p class="empty">Loading…</p>
         </div>
+
+        <section>
+            <div class="section-head">
+                <div class="eyebrow">the universe</div>
+                <h2>Watching {{ watchlist | length }} names across US and European exchanges</h2>
+                <p>
+                    Width is not about having more rows. A macro feature is
+                    identical across every symbol on the day it lands, so on ten
+                    names a CPI print is one observation; on hundreds it is
+                    hundreds of observations of which companies react and how.
+                </p>
+            </div>
+            <details class="fold">
+                <summary>Show every symbol</summary>
+                <div class="universe">
+                    {% for symbol in watchlist %}<code>{{ symbol }}</code>{% endfor %}
+                </div>
+            </details>
+        </section>
     </main>
 
-    <script src="/static/trader.js?v={{ v }}"></script>
+    <script type="importmap">
+    {"imports": {"ui": "/static/ui.js?v={{ v }}"}}
+    </script>
+    <script type="module" src="/static/today.js?v={{ v }}"></script>
 </body>
 
 </html>

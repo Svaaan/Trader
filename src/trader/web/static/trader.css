@@ -1,810 +1,583 @@
-/* Dark, quiet, and built so the numbers are the loudest thing on the page.
-
-   Colour carries meaning and nothing else: green and red mean a direction or a
-   verdict, the accent means something you can press. Nothing decorative is
-   tinted, because on a page whose whole job is to be read carefully, a colour
-   that means nothing costs the colours that do. */
+/* An instrument, not a dashboard.
+ *
+ * The result this project reached is that the model is accurate and loses
+ * money. A page built like a trading app -- green numbers, a big equity curve,
+ * a buy button -- would fight that result on every screen. So the design has
+ * three rules:
+ *
+ * **The verdict is the largest thing on the page.** Not the accuracy and not
+ * the return: whether the gate is open. It has never been open, and a reader
+ * should know that before they know anything else.
+ *
+ * **Colour means exactly one thing.** Teal is a hurdle cleared, coral is one
+ * failed, amber is a forward record that cannot be re-run, blue is something
+ * you can press. Nothing decorative is tinted, because on a page whose job is
+ * careful reading, a colour that means nothing costs the colours that do.
+ *
+ * **Numbers are monospaced and aligned.** Tabular figures throughout, so a
+ * column of returns can be scanned instead of read.
+ */
 
 :root {
-  --bg: #0b0e13;
-  --surface: #141922;
-  --surface-2: #1a2029;
-  --border: rgba(255, 255, 255, 0.08);
-  --border-strong: rgba(255, 255, 255, 0.15);
+  --bg: #08090c;
+  --bg-lift: #0d0f14;
+  --panel: #101319;
+  --panel-2: #151922;
 
-  --text: #e7ebf2;
-  --text-muted: #98a3b6;
-  --text-faint: #6b7688;
+  --line: rgba(255, 255, 255, 0.07);
+  --line-mid: rgba(255, 255, 255, 0.12);
+  --line-strong: rgba(255, 255, 255, 0.22);
 
-  --accent: #22d3ee;
-  --up: #34d399;
-  --down: #f87171;
-  --warn: #fbbf24;
+  --text: #e9ecf2;
+  --muted: #98a2b3;
+  --faint: #667085;
 
-  --mono: "JetBrains Mono", Consolas, Monaco, monospace;
+  --pass: #3ddc97;
+  --fail: #ff6b6b;
+  --forward: #f5b942;
+  --cool: #56c2f5;
 
+  --pass-dim: rgba(61, 220, 151, 0.14);
+  --fail-dim: rgba(255, 107, 107, 0.13);
+  --forward-dim: rgba(245, 185, 66, 0.13);
+  --cool-dim: rgba(86, 194, 245, 0.10);
+
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --mono: "JetBrains Mono", "SF Mono", Consolas, Monaco, monospace;
+
+  --r: 10px;
   --r-sm: 6px;
-  --r-md: 10px;
+  --gut: clamp(1rem, 4vw, 2.5rem);
 }
 
 * { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
 
 body {
   margin: 0;
   background: var(--bg);
   color: var(--text);
-  font: 15px/1.6 "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font: 15px/1.65 var(--sans);
+  -webkit-font-smoothing: antialiased;
 }
 
-/* --- chrome --- */
+/* Every number here is meant to be compared with the one above it. */
+.num, .stat-value, .mono, td, .pip-count, .verdict-stat b, .reason-weight,
+.ledger-when, .decision-name {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+a { color: var(--cool); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+:focus-visible {
+  outline: 2px solid var(--cool);
+  outline-offset: 2px;
+  border-radius: 3px;
+}
+
+/* --- chrome ---------------------------------------------------------------- */
 
 .top {
+  position: sticky;
+  top: 0;
+  z-index: 20;
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  padding: 1rem 1.5rem;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
+  gap: 1.25rem;
+  padding: 0.85rem var(--gut);
+  background: rgba(8, 9, 12, 0.9);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--line);
 }
 
-.brand { font-weight: 600; letter-spacing: -0.01em; }
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
 
-.top-right { display: flex; align-items: center; gap: 0.75rem; }
+.brand span {
+  font: 11px/1 var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.nav { display: flex; gap: 0.25rem; margin-left: auto; }
+
+.nav a {
+  padding: 0.35rem 0.7rem;
+  border-radius: var(--r-sm);
+  color: var(--muted);
+  font-size: 13.5px;
+  font-weight: 500;
+}
+
+.nav a:hover { background: var(--panel); color: var(--text); text-decoration: none; }
+.nav a.is-here { background: var(--panel-2); color: var(--text); }
+
+.top-actions { display: flex; align-items: center; gap: 0.5rem; }
+
+.btn {
+  padding: 0.4rem 0.8rem;
+  border: 1px solid var(--line-mid);
+  border-radius: var(--r-sm);
+  background: var(--panel);
+  color: var(--text);
+  font: 500 13px/1.4 var(--sans);
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.btn:hover:not(:disabled) { background: var(--panel-2); border-color: var(--line-strong); }
+.btn:disabled { opacity: 0.45; cursor: default; }
+.btn[data-running="yes"] { border-color: var(--pass); color: var(--pass); }
 
 main {
-  max-width: 60rem;
+  max-width: 68rem;
   margin: 0 auto;
-  padding: 2rem 1.5rem 4rem;
+  padding: 2.5rem var(--gut) 6rem;
 }
 
-/* --- the standing caveat ---
-   Not a dismissible banner. What it says stays true on every visit, and a
-   warning you can close is one that is closed. */
+/* --- the verdict: the largest thing on the page --------------------------- */
 
-.intro h1 {
-  margin: 0 0 0.5rem;
-  font-size: 1.5rem;
+.verdict {
+  position: relative;
+  overflow: hidden;
+  padding: 2rem 2rem 1.75rem;
+  border: 1px solid var(--line-mid);
+  border-radius: var(--r);
+  background:
+    radial-gradient(120% 140% at 0% 0%, rgba(255, 107, 107, 0.07), transparent 60%),
+    var(--panel);
+}
+
+.verdict.is-open {
+  background:
+    radial-gradient(120% 140% at 0% 0%, rgba(61, 220, 151, 0.08), transparent 60%),
+    var(--panel);
+}
+
+.verdict-kicker {
+  font: 500 11px/1 var(--mono);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.verdict-word {
+  margin: 0.8rem 0 0;
+  font-size: clamp(2.1rem, 6vw, 3.1rem);
+  line-height: 1.02;
+  font-weight: 680;
+  letter-spacing: -0.035em;
+}
+
+.verdict.is-shut .verdict-word { color: var(--fail); }
+.verdict.is-open .verdict-word { color: var(--pass); }
+
+.verdict-why {
+  max-width: 56ch;
+  margin: 0.9rem 0 0;
+  color: var(--muted);
+  font-size: 15.5px;
+}
+
+.verdict-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1.75rem;
+  margin-top: 1.5rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid var(--line);
+}
+
+.verdict-stat { font-size: 12.5px; color: var(--faint); }
+
+.verdict-stat b {
+  display: block;
+  margin-bottom: 0.1rem;
+  font-size: 19px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.verdict-stat b.is-bad { color: var(--fail); }
+.verdict-stat b.is-good { color: var(--pass); }
+
+/* --- the gate as eight hurdles -------------------------------------------- */
+
+.pips { display: flex; align-items: center; gap: 0.4rem; }
+
+.pip {
+  flex: 1;
+  min-width: 8px;
+  height: 5px;
+  border-radius: 99px;
+  background: var(--pass);
+}
+
+.pip.is-fail { background: var(--fail); }
+.pip.is-unknown { background: var(--line-strong); }
+
+.pip-count {
+  flex: none;
+  margin-left: 0.4rem;
+  font-size: 12px;
+  color: var(--faint);
+  white-space: nowrap;
+}
+
+.gate-rail {
+  display: grid;
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+
+.hurdle {
+  display: grid;
+  grid-template-columns: 1.4rem 1fr;
+  gap: 0.9rem;
+  padding: 0.85rem 1rem;
+  background: var(--panel);
+}
+
+.hurdle.is-fail { background: linear-gradient(90deg, var(--fail-dim), var(--panel) 45%); }
+
+.hurdle-mark {
+  margin-top: 0.1rem;
+  font: 600 13px/1.5 var(--mono);
+  color: var(--pass);
+}
+
+.hurdle.is-fail .hurdle-mark { color: var(--fail); }
+
+.hurdle-name {
+  font-weight: 550;
+  font-size: 14px;
+  letter-spacing: -0.005em;
+}
+
+.hurdle.is-fail .hurdle-name { color: var(--fail); }
+.hurdle-detail { margin: 0.2rem 0 0; color: var(--muted); font-size: 13.5px; }
+
+/* --- sections ------------------------------------------------------------- */
+
+section { margin-top: 3.5rem; }
+
+/* The first thing on the page already has the main padding above it; the
+   section rhythm is for the space *between* sections. */
+main > section:first-child,
+main > div > section:first-child { margin-top: 0; }
+
+.section-head { margin-bottom: 1.25rem; }
+
+.section-head h2 {
+  margin: 0.35rem 0 0;
+  font-size: 19px;
+  font-weight: 620;
   letter-spacing: -0.02em;
 }
 
-.intro p { margin: 0 0 0.75rem; color: var(--text-muted); }
-
-.caveat {
-  padding: 0.75rem 0 0.75rem 0.9rem;
-  border-left: 2px solid var(--warn);
-  color: var(--text-muted) !important;
+.section-head p {
+  max-width: 70ch;
+  margin: 0.45rem 0 0;
+  color: var(--muted);
+  font-size: 14px;
 }
 
-.watchlist code {
-  display: inline-block;
-  margin: 0 0.3rem 0.3rem 0;
-  padding: 0.1rem 0.4rem;
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
-  font-family: var(--mono);
-  font-size: 0.75rem;
-  color: var(--text-muted);
+.eyebrow {
+  font: 500 11px/1 var(--mono);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--faint);
 }
 
-/* --- runs --- */
+.panel {
+  padding: 1.35rem 1.5rem;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--panel);
+}
 
-.runs { margin-top: 2rem; display: flex; flex-direction: column; gap: 1.25rem; }
+.panel + .panel { margin-top: 1rem; }
+.panel h3 { margin: 0 0 0.9rem; font-size: 15px; font-weight: 600; }
 
-.run {
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface);
+.note { margin: 0.9rem 0 0; color: var(--muted); font-size: 13.5px; }
+.note:first-child { margin-top: 0; }
+.note strong { color: var(--text); font-weight: 600; }
+
+.grid-2 {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(auto-fit, minmax(19rem, 1fr));
+}
+
+/* --- statistics ----------------------------------------------------------- */
+
+.stats {
+  display: grid;
+  gap: 1px;
+  grid-template-columns: repeat(auto-fit, minmax(10.5rem, 1fr));
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
   overflow: hidden;
 }
 
-.run-head {
+.stat { padding: 1rem 1.1rem; background: var(--panel); }
+
+.stat-label {
+  font: 500 10.5px/1.3 var(--mono);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--faint);
+}
+
+.stat-value {
+  margin-top: 0.45rem;
+  font-size: 22px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.stat-value.is-bad { color: var(--fail); }
+.stat-value.is-good { color: var(--pass); }
+.stat-hint { margin-top: 0.3rem; color: var(--faint); font-size: 12.5px; line-height: 1.45; }
+
+/* --- charts --------------------------------------------------------------- */
+
+.chart { width: 100%; height: auto; display: block; overflow: visible; }
+.chart text { font-family: var(--mono); fill: var(--faint); }
+.chart .axis-line { stroke: var(--line-mid); }
+.chart .grid-line { stroke: var(--line); }
+/* Solid, because the buy-and-hold series is the dashed one and on this panel
+   it sits within half a point of 1.0 -- two dashed grey lines on top of each
+   other read as one line that means nothing. */
+.chart .zero-line { stroke: var(--line-strong); }
+
+.legend {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  padding: 1rem 1.25rem;
-  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+  gap: 1.1rem;
+  margin-top: 1rem;
+  font-size: 13px;
+  color: var(--muted);
 }
 
-.run-head h2 { margin: 0; font-size: 1rem; font-family: var(--mono); }
-.run-sub { margin-top: 0.2rem; font-size: 0.8125rem; color: var(--text-faint); }
+.legend-key { display: flex; align-items: center; gap: 0.45rem; }
+.legend-swatch { width: 14px; height: 3px; border-radius: 99px; flex: none; }
 
-.panel { padding: 1.25rem; border-top: 1px solid var(--border); }
-.panel:first-of-type { border-top: none; }
+/* --- tables --------------------------------------------------------------- */
 
-.panel h3 {
-  margin: 0 0 1rem;
-  font-size: 0.8125rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+
+th {
+  padding: 0.5rem 0.7rem;
+  border-bottom: 1px solid var(--line-mid);
+  font: 500 10.5px/1.3 var(--mono);
+  letter-spacing: 0.09em;
   text-transform: uppercase;
-  color: var(--text-faint);
+  color: var(--faint);
+  text-align: right;
+  white-space: nowrap;
 }
 
-.panel h4 {
-  margin: 1.5rem 0 0.6rem;
-  font-size: 0.8125rem;
-  color: var(--text-muted);
+td {
+  padding: 0.55rem 0.7rem;
+  border-bottom: 1px solid var(--line);
+  text-align: right;
+  white-space: nowrap;
 }
 
-/* --- figures --- */
+th:first-child, td:first-child { text-align: left; }
+td:first-child { font-family: var(--sans); }
+tr:last-child td { border-bottom: none; }
+tbody tr:hover td { background: var(--panel-2); }
 
-.figures {
+.is-subject td { background: var(--cool-dim); font-weight: 600; }
+.up { color: var(--pass); }
+.down { color: var(--fail); }
+.flat { color: var(--muted); }
+
+.table-scroll { overflow-x: auto; margin: 0 -0.7rem; padding: 0 0.7rem; }
+
+/* --- the forward record --------------------------------------------------- */
+
+.ledger { list-style: none; margin: 0; padding: 0; }
+
+.ledger li {
+  position: relative;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  gap: 0.75rem;
+  grid-template-columns: 6.5rem 1fr;
+  gap: 1rem;
+  padding: 0.7rem 0 0.7rem 1.25rem;
+  border-bottom: 1px solid var(--line);
 }
 
-.figure {
-  padding: 0.85rem;
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
-}
-
-.figure-label {
-  font-size: 0.6875rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.figure-value {
-  margin-top: 0.35rem;
-  font-size: 1.25rem;
-  font-weight: 600;
-  font-variant-numeric: tabular-nums;
-}
-
-.figure-hint { margin-top: 0.2rem; font-size: 0.75rem; color: var(--text-faint); }
-
-/* --- prose inside a panel --- */
-
-.note {
-  margin: 1rem 0 0;
-  font-size: 0.8125rem;
-  line-height: 1.55;
-  color: var(--text-faint);
-}
-
-.note.is-bad { color: var(--down); }
-
-/* The one sentence that says whether any of it amounts to anything. */
-.verdict {
-  margin: 1rem 0 0;
-  padding: 0.75rem 0.9rem;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
-  font-size: 0.9375rem;
-}
-
-.error {
-  margin: 1rem 1.25rem;
-  padding: 0.75rem 0.9rem;
-  border: 1px solid rgba(248, 113, 113, 0.3);
-  border-radius: var(--r-sm);
-  color: var(--down);
-  font-size: 0.875rem;
-}
-
-.empty { color: var(--text-faint); text-align: center; padding: 3rem 0; }
-
-/* --- tables --- */
-
-.table {
-  width: 100%;
-  margin-top: 0.5rem;
-  border-collapse: collapse;
-  font-size: 0.875rem;
-}
-
-.table th {
-  padding: 0.5rem 0.6rem;
-  border-bottom: 1px solid var(--border);
-  text-align: left;
-  font-size: 0.6875rem;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-  font-weight: 500;
-}
-
-.table td {
-  padding: 0.55rem 0.6rem;
-  border-bottom: 1px solid var(--border);
-  font-variant-numeric: tabular-nums;
-}
-
-.table tr:last-child td { border-bottom: none; }
-
-.mono { font-family: var(--mono); font-size: 0.8125rem; }
-.up { color: var(--up); }
-.down { color: var(--down); }
-
-/* --- confidence bar ---
-   Deliberately a distance from a coin flip rather than a strength meter: a
-   full bar means "very sure", and most days it should be nearly empty. */
-
-.bar {
-  display: inline-block;
-  width: 90px;
+.ledger li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 1.15rem;
+  width: 6px;
   height: 6px;
-  border-radius: 999px;
-  background: var(--surface-2);
-  overflow: hidden;
-  vertical-align: middle;
+  border-radius: 99px;
+  background: var(--line-strong);
 }
 
-.bar-fill { height: 100%; background: var(--accent); }
-.bar-label { margin-left: 0.5rem; font-size: 0.75rem; color: var(--text-faint); }
-
-/* --- controls --- */
-
-.auto-state {
-    margin: 0 2rem 0.75rem;
-    font-size: 0.85rem;
-    color: var(--text-muted);
-}
-
-.auto-state.is-running {
-    color: var(--up);
-}
-
-.btn.is-running {
-    border-color: var(--up);
-}
-
-.btn {
-  padding: 0.55rem 0.95rem;
-  border: none;
-  border-radius: var(--r-sm);
-  background: var(--accent);
-  color: #04222a;
-  font: inherit;
-  font-size: 0.875rem;
-  font-weight: 500;
-  cursor: pointer;
-}
-
-.btn:hover:not(:disabled) { background: #67e8f9; }
-.btn:disabled { opacity: 0.5; cursor: default; }
-
-.pill {
-  padding: 0.2rem 0.55rem;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-sm);
-  font-size: 0.75rem;
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-
-.pill.is-ok { color: var(--up); border-color: rgba(52, 211, 153, 0.3); }
-.pill.is-bad { color: var(--down); border-color: rgba(248, 113, 113, 0.3); }
-.pill.is-working { color: var(--accent); border-color: rgba(34, 211, 238, 0.3); }
-
-@media (max-width: 640px) {
-  .top { flex-direction: column; align-items: stretch; }
-  main { padding: 1.5rem 1rem 3rem; }
-}
-
-/* --- the analysis page ----------------------------------------------------
-   Colour means a call: green buys, red does not, grey is the honest most of
-   the time. Nothing else on this page is tinted, because a page that argues
-   for a decision has to keep its emphasis for the decision. */
-
-.nav { display: flex; gap: 1rem; }
-
-.nav a {
-  color: var(--text-muted);
-  text-decoration: none;
-  font-size: 0.875rem;
-  padding: 0.3rem 0;
-  border-bottom: 2px solid transparent;
-}
-
-.nav a:hover { color: var(--text); }
-.nav a.is-here { color: var(--text); border-bottom-color: var(--accent); }
-
-.a-panel {
-  margin-top: 1.25rem;
-  padding: 1.25rem;
-  border: 1px solid var(--border);
-  border-radius: var(--r-md);
-  background: var(--surface);
-}
-
-.a-panel h2 {
-  margin: 0 0 1rem;
-  font-size: 0.8125rem;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-}
-
-.analysis-meta { margin: 1.5rem 0 0; font-size: 0.8125rem; color: var(--text-faint); }
-
-/* --- the gate ---
-   Its border carries the state, because it decides everything below it. */
-
-.a-panel.trust { border-left: 3px solid var(--text-faint); }
-.trust.is-ok { border-left-color: var(--up); }
-.trust.is-bad { border-left-color: var(--warn); }
-
-.trust-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
-  margin-bottom: 0.5rem;
-}
-
-.trust-head h2 {
-  margin: 0;
-  font-size: 1rem;
-  text-transform: none;
-  letter-spacing: -0.01em;
-  color: var(--text);
-}
-
-.trust-reason { margin: 0 0 1rem; font-size: 0.9375rem; color: var(--text-muted); }
-
-/* --- what it attends to --- */
-
-.influence { display: flex; flex-direction: column; gap: 0.5rem; }
-
-.influence-row {
-  display: grid;
-  grid-template-columns: 11rem 1fr 5rem;
-  align-items: center;
-  gap: 0.75rem;
-}
-
-.influence-name { font-size: 0.8125rem; color: var(--text-muted); }
-
-.influence-value {
-  font-size: 0.75rem;
-  text-align: right;
-  color: var(--text-faint);
-  font-variant-numeric: tabular-nums;
-}
-
-.influence .bar { width: 100%; height: 8px; }
-.bar-fill.is-down { background: var(--down); }
-
-/* --- the calls --- */
-
-.calls {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 0.75rem;
-}
-
-.call {
-  padding: 0.9rem;
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
-}
-
-.call-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 0.75rem;
-}
-
-.call-symbol { font-family: var(--mono); font-weight: 600; }
-.call-asof { font-size: 0.75rem; color: var(--text-faint); }
-
-.call-verdict {
-  padding: 0.15rem 0.5rem;
-  border: 1px solid var(--border-strong);
-  border-radius: var(--r-sm);
-  font-size: 0.6875rem;
-  font-weight: 600;
-  letter-spacing: 0.03em;
-  text-transform: uppercase;
-  white-space: nowrap;
-  color: var(--text-faint);
-}
-
-.call-verdict.is-buy { color: var(--up); border-color: rgba(52, 211, 153, 0.35); }
-.call-verdict.is-nobuy { color: var(--down); border-color: rgba(248, 113, 113, 0.35); }
-
-.call-numbers {
-  display: flex;
-  gap: 1rem;
-  margin-top: 0.5rem;
-  font-size: 0.75rem;
-  color: var(--text-faint);
-  font-variant-numeric: tabular-nums;
-}
-
-.call-because {
-  margin: 0.65rem 0 0;
-  font-size: 0.8125rem;
-  line-height: 1.5;
-  color: var(--text-muted);
-}
-
-.call-reasons {
-  margin: 0.6rem 0 0;
-  padding-left: 1.1rem;
-  font-size: 0.75rem;
-  line-height: 1.55;
-  color: var(--text-faint);
-}
-
-.call-reasons li { margin-bottom: 0.2rem; }
-
-/* --- the gate's working ---------------------------------------------------
-
-   Every hurdle the model was put through, passed or failed. A gate that says
-   no without saying which question it failed teaches nobody anything, so the
-   list is always rendered and never collapsed. */
-
-.checks {
-  list-style: none;
-  margin: 18px 0 0;
-  padding: 0;
-  border-top: 1px solid var(--border);
-}
-
-.checks li {
-  display: grid;
-  grid-template-columns: 20px 200px 1fr;
-  gap: 10px;
-  align-items: baseline;
-  padding: 9px 0;
-  border-bottom: 1px solid var(--border);
-  font-size: 13px;
-}
-
-.check-mark { font-weight: 700; }
-.checks li.is-ok .check-mark { color: var(--up); }
-.checks li.is-bad .check-mark { color: var(--down); }
-.check-name { color: var(--text); }
-.check-detail { color: var(--text-muted); }
-
-@media (max-width: 700px) {
-  .checks li { grid-template-columns: 20px 1fr; }
-  .check-detail { grid-column: 2; }
-}
-
-/* --- comparison tables ----------------------------------------------------
-
-   Used for the controls and the walk-forward. The trained model is the last
-   row of the controls table on purpose: it is read after the things it had to
-   beat, not above them. */
-
-.compare {
-  width: 100%;
-  border-collapse: collapse;
-  margin-top: 14px;
-  font-size: 13px;
-}
-
-.compare th {
-  text-align: right;
-  padding: 8px 10px;
-  color: var(--text-faint);
-  font-weight: 500;
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  border-bottom: 1px solid var(--border-strong);
-}
-
-.compare th:first-child,
-.compare td:first-child { text-align: left; }
-
-.compare td {
-  text-align: right;
-  padding: 9px 10px;
-  border-bottom: 1px solid var(--border);
-  font-family: var(--mono);
-  font-variant-numeric: tabular-nums;
-}
-
-.compare td:first-child { font-family: inherit; color: var(--text-muted); }
-
-.compare tr.is-subject td {
-  background: var(--surface-2);
-  color: var(--text);
-  font-weight: 600;
-}
-
-.compare tr.is-subject td:first-child { color: var(--text); }
-.compare tr.is-ok td:first-child { color: var(--up); }
-.compare tr.is-bad td:first-child { color: var(--down); }
-
-/* --- which blocks went in -------------------------------------------------- */
-
-.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
-
-.chip {
-  padding: 4px 10px;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--border-strong);
-  font-size: 12px;
-  font-family: var(--mono);
-  color: var(--text-muted);
-}
-
-.chip.is-ok { border-color: rgba(52, 211, 153, 0.4); color: var(--up); }
-.chip.is-off { opacity: 0.5; }
-
-.excluded {
-  margin: 8px 0 0;
-  padding-left: 18px;
-  font-size: 13px;
-  color: var(--text-muted);
-}
-
-.excluded li { margin: 4px 0; }
-
-.warn {
-  margin-top: 14px;
-  padding: 10px 12px;
-  border-left: 3px solid var(--warn);
-  background: rgba(251, 191, 36, 0.08);
-  font-size: 13px;
-  color: var(--text-muted);
-}
-
-/* --- the reading panel -----------------------------------------------------
-
-   Deliberately quieter than the verdict above it. Prose reads as conviction,
-   and this is background rather than evidence -- when the gate is shut it is
-   dimmed and labelled as such, so it cannot be mistaken for the call. */
-
-.context-button {
-  margin-top: 12px;
-  padding: 5px 12px;
-  border-radius: var(--r-sm);
-  border: 1px solid var(--border-strong);
-  background: transparent;
-  color: var(--text-muted);
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.context-button:hover:not(:disabled) {
-  border-color: var(--accent);
-  color: var(--accent);
-}
-
-.context-button:disabled { opacity: 0.5; cursor: default; }
-
-.context {
-  margin-top: 12px;
-  padding: 12px;
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-}
-
-.context.is-gated { opacity: 0.85; border-left: 3px solid var(--warn); }
-
-.context-head {
-  font-size: 11px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--text-faint);
-  margin-bottom: 8px;
-}
-
-.context.is-gated .context-head { color: var(--warn); }
-
-.context-text { margin: 0 0 10px; font-size: 13px; color: var(--text); }
-
-.sources {
-  margin: 0;
-  padding-left: 18px;
-  font-size: 12px;
-  color: var(--text-muted);
-}
-
-.sources li { margin: 5px 0; }
-.sources a { color: var(--accent); text-decoration: none; }
-.sources a:hover { text-decoration: underline; }
-
-.source-meta { color: var(--text-faint); font-size: 11px; }
-
-/* --- the universe ---------------------------------------------------------
-
-   A few hundred names is deliberate: a macro feature needs a cross-section to
-   mean anything and a rank needs peers. Printing all of them at once turns the
-   opening paragraph into a wall, so the count leads and the list folds away. */
-
-.watchlist-all {
-  margin: -4px 0 8px;
-  font-size: 13px;
-}
-
-.watchlist-all summary {
-  cursor: pointer;
-  color: var(--text-muted);
-  padding: 4px 0;
-}
-
-.watchlist-all summary:hover { color: var(--accent); }
-
-.watchlist-all[open] summary { margin-bottom: 8px; }
-
-.watchlist-all .watchlist {
-  max-height: 220px;
-  overflow-y: auto;
-  padding: 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--r-sm);
-  background: var(--surface);
-}
-
-/* A stale signal is the one failure a daily tool cannot afford to state
-   quietly, so the date stops being a label and becomes a warning. */
-.call-asof.is-stale { color: var(--warn); font-weight: 600; }
-
-/* --- the paper record ------------------------------------------------------
-
-   Drawn deliberately plainly. This page spends most of its words telling you
-   not to read too much into a short record, and a page that looked like a
-   trading terminal would undo that before anybody got to the text. */
-
-.verdict.is-thin {
-  color: var(--text-muted);
-  border-left: 3px solid var(--warn);
-  padding-left: 12px;
-}
-
-.sparkline {
-  display: flex;
-  align-items: flex-end;
-  gap: 2px;
-  height: 120px;
-  margin: 18px 0 6px;
-  padding: 10px;
-  border-radius: var(--r-sm);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-}
-
-.spark {
-  flex: 1 1 auto;
-  min-width: 2px;
-  background: var(--up);
-  border-radius: 1px 1px 0 0;
-  opacity: 0.8;
-}
-
-.spark.is-down { background: var(--down); }
-.spark:hover { opacity: 1; }
-
-.table tr.is-ok td:first-child { color: var(--up); }
-.table tr.is-bad td:first-child { color: var(--down); }
-
-
-/* --- the decision, which is the point of the page ---------------------- */
+.ledger li.is-decided::before { background: var(--cool); }
+.ledger li.is-filled::before, .ledger li.is-bought::before { background: var(--forward); }
+.ledger li.is-sold::before, .ledger li.is-exited::before { background: var(--pass); }
+.ledger li.is-broken::before { background: var(--fail); }
+.ledger li:last-child { border-bottom: none; }
+
+.ledger-when { font-size: 12.5px; color: var(--faint); }
+.ledger-text { font-size: 14px; }
+
+/* --- the decision --------------------------------------------------------- */
 
 .decision {
-    padding: 1.75rem 1.5rem;
-    border: 1px solid var(--border-strong);
-    border-radius: 10px;
-    background: var(--surface);
+  padding: 1.5rem;
+  border: 1px solid var(--line-mid);
+  border-left: 3px solid var(--forward);
+  border-radius: var(--r);
+  background: linear-gradient(90deg, var(--forward-dim), var(--panel) 40%);
 }
+
+.decision.is-cash { border-left-color: var(--line-strong); background: var(--panel); }
 
 .decision-label {
-    margin: 0;
-    font-size: 0.75rem;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    color: var(--text-faint);
+  margin: 0;
+  font: 500 11px/1 var(--mono);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--forward);
 }
 
-.decision-headline {
-    margin: 0.35rem 0 0.6rem;
-    font-size: 1.9rem;
-    font-family: var(--mono);
-    letter-spacing: -0.02em;
+.decision.is-cash .decision-label { color: var(--faint); }
+
+.decision-name {
+  margin: 0.6rem 0 0;
+  font-size: clamp(1.5rem, 4vw, 2rem);
+  font-weight: 600;
+  letter-spacing: -0.02em;
 }
 
-.decision-line { margin: 0 0 0.35rem; color: var(--text); }
-.decision-next { margin: 0 0 0.35rem; color: var(--accent); }
-.decision-soft { margin: 0.5rem 0 0; color: var(--warn); font-size: 0.875rem; }
+.decision-line { margin: 0.5rem 0 0; color: var(--muted); font-size: 14px; }
+.decision-line strong { color: var(--text); }
 
-.decision-warn {
-    margin: 0.75rem 0 0;
-    padding: 0.6rem 0.75rem;
-    border-left: 2px solid var(--warn);
-    color: var(--warn);
-    font-size: 0.875rem;
+.reasons { list-style: none; margin: 1.25rem 0 0; padding: 0; display: grid; gap: 0.6rem; }
+
+.reason {
+  display: grid;
+  grid-template-columns: 4.5rem 1fr;
+  gap: 0.9rem;
+  align-items: baseline;
+  font-size: 13.5px;
 }
 
-.decision-rule {
-    margin: 1rem 0 0;
-    padding-top: 0.85rem;
-    border-top: 1px solid var(--border);
-    font-size: 0.8125rem;
-    color: var(--text-faint);
+.reason-weight { font-size: 12.5px; text-align: right; color: var(--cool); }
+.reason-text { color: var(--muted); }
+
+.warn-line {
+  margin: 1rem 0 0;
+  padding: 0.7rem 0.9rem;
+  border-radius: var(--r-sm);
+  background: var(--fail-dim);
+  color: var(--text);
+  font-size: 13.5px;
 }
 
-/* --- the log ----------------------------------------------------------- */
-
-.log { margin: 0; padding: 0; list-style: none; }
-
-.log-line {
-    display: flex;
-    gap: 1rem;
-    padding: 0.6rem 0;
-    border-bottom: 1px solid var(--border);
-    font-size: 0.875rem;
-}
-
-.log-line:last-child { border-bottom: none; }
-
-.log-when {
-    flex: 0 0 6.5rem;
-    font-family: var(--mono);
-    font-size: 0.8125rem;
-    color: var(--text-faint);
-}
-
-.log-text { color: var(--text-muted); }
-.log-line.is-bought .log-text, .log-line.is-sold .log-text { color: var(--text); }
-.log-line.is-broken .log-text { color: var(--warn); }
-.log-line.is-decided .log-text { color: var(--accent); }
-
-/* --- everything that is measurement rather than decision --------------- */
+/* --- folds, tags, states -------------------------------------------------- */
 
 .fold {
-    margin-top: 1.5rem;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    background: var(--surface);
-    padding: 0 1.25rem;
+  margin-top: 1rem;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--panel);
 }
 
-.fold summary {
-    padding: 0.9rem 0;
-    cursor: pointer;
-    color: var(--text-muted);
-    font-size: 0.875rem;
+.fold > summary {
+  padding: 0.85rem 1.25rem;
+  cursor: pointer;
+  font-size: 13.5px;
+  font-weight: 550;
+  color: var(--muted);
+  list-style: none;
 }
 
-.fold[open] summary { border-bottom: 1px solid var(--border); margin-bottom: 1rem; }
-.fold > *:last-child { margin-bottom: 1.25rem; }
+.fold > summary::-webkit-details-marker { display: none; }
+.fold > summary::before { content: "\25B8  "; color: var(--faint); }
+.fold[open] > summary::before { content: "\25BE  "; }
+.fold > summary:hover { color: var(--text); }
+.fold > :not(summary) { padding: 0 1.25rem 1.25rem; }
+.fold[open] > summary { border-bottom: 1px solid var(--line); margin-bottom: 1.25rem; }
 
-
-/* --- a run, led by its conclusion -------------------------------------- */
-
-.run-verdict {
-    margin: 0.9rem 1.25rem 0;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 0.4rem;
-    font-size: 0.95rem;
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 99px;
+  font: 500 11px/1.5 var(--mono);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
 }
 
-.run-numbers {
-    margin-left: auto;
-    font-family: var(--mono);
-    font-size: 0.75rem;
-    color: var(--text-faint);
+.tag.is-pass { background: var(--pass-dim); color: var(--pass); }
+.tag.is-fail { background: var(--fail-dim); color: var(--fail); }
+.tag.is-forward { background: var(--forward-dim); color: var(--forward); }
+.tag.is-quiet { background: var(--panel-2); color: var(--muted); }
+
+.empty, .error {
+  padding: 2.5rem 1.5rem;
+  border: 1px dashed var(--line-mid);
+  border-radius: var(--r);
+  color: var(--muted);
+  text-align: center;
+  font-size: 14px;
 }
 
-.run-reading {
-    margin: 0.35rem 1.25rem 0;
-    font-size: 0.875rem;
-    color: var(--text-muted);
+.error { border-color: var(--fail); color: var(--fail); }
+
+.auto-state {
+  margin: 0;
+  padding: 0.5rem var(--gut);
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-lift);
+  font: 12.5px/1.5 var(--mono);
+  color: var(--faint);
 }
 
-.run .fold {
-    margin: 1rem 1.25rem 1.25rem;
-    background: var(--surface-2);
+code {
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  background: var(--panel-2);
+  font-family: var(--mono);
+  font-size: 0.88em;
+}
+
+.universe { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.75rem; }
+.universe code { color: var(--muted); font-size: 11.5px; }
+
+@media (max-width: 40rem) {
+  .top { flex-wrap: wrap; gap: 0.6rem; }
+  .nav { order: 3; width: 100%; margin-left: 0; overflow-x: auto; }
+  .verdict { padding: 1.5rem 1.25rem; }
+  .ledger li, .reason { grid-template-columns: 1fr; gap: 0.2rem; }
+  .reason-weight { text-align: left; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
 }

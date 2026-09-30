@@ -176,7 +176,36 @@ def test_the_round_trip_is_charged_at_both_ends(store, panel):
     expected = broker.per_side(500.0, holding.SCHEDULE) + 500.0 * holding.SPREAD
     assert filled["fees"] == pytest.approx(expected, rel=1e-6)
     assert exited["fees"] > 0
-    assert filled["cash_after"] == pytest.approx(500.0 - filled["fees"])
+
+    # The whole allocation leaves the account: the fee is paid out of it and
+    # the rest buys shares. This line used to read `500 - fees`, which left the
+    # money that bought the shares sitting in cash as well -- a $500 book with
+    # one position marked itself at $991 the next session.
+    bought = filled["bought"][0]
+    assert filled["cash_after"] == pytest.approx(500.0 - bought["value"])
+    assert bought["shares"] * bought["price"] == pytest.approx(
+        bought["value"] - bought["fee"], rel=1e-6)
+
+
+def test_a_filled_book_is_worth_what_it_paid_before_the_price_moves(store, panel):
+    """Cash plus shares at the entry price is the account, not twice it.
+
+    The arithmetic that caught this: 1.21 shares of a 412.00 name is 498.50,
+    and the book had 498.50 recorded as cash as well. Every mark after a fill
+    was therefore about double, which on the one record here that cannot be
+    re-run is the worst place for a number to be wrong.
+    """
+    symbols = sorted(panel)
+    dates = sessions_of(panel)
+    holding.plan_next(FakeRun(dates[-40].date().isoformat(), [(symbols[0], 0.9)]))
+    filled = holding.advance(panel, today=dates[-39])["filled"]
+
+    at_cost = sum(b["shares"] * b["price"] for b in filled["bought"])
+    assert filled["cash_after"] + at_cost + filled["fees"] == pytest.approx(
+        holding.STARTING_CASH, abs=0.01)
+
+    marked = holding.mark(panel, today=dates[-39])
+    assert marked["equity"] <= holding.STARTING_CASH * 1.05
 
 
 def test_the_account_shows_the_pick_and_the_sell_date(store, panel):
@@ -536,8 +565,19 @@ def test_a_challenger_keeps_its_own_account(store, panel):
 
     assert len(champion["holding"]["bought"]) == 1
     assert len(challenger["holding"]["bought"]) == 2
-    # Separate accounts: both started with the same cash and spent their own.
-    assert champion["cash"] != challenger["cash"]
+
+    # Separate accounts: each spent its own $500 on its own names. This used to
+    # be checked by comparing leftover cash, which only differed because the
+    # fill was failing to debit what it spent -- with that fixed both books are
+    # fully invested, so the thing to check is that they hold different things
+    # and are marked apart.
+    assert champion["holding"]["bought"][0]["symbol"] != tuple(
+        b["symbol"] for b in challenger["holding"]["bought"])
+    assert {b["symbol"] for b in challenger["holding"]["bought"]} != {
+        b["symbol"] for b in champion["holding"]["bought"]}
+    for book in (champion, challenger):
+        spent = sum(b["value"] for b in book["holding"]["bought"])
+        assert book["cash"] == pytest.approx(holding.STARTING_CASH - spent, abs=0.01)
     assert holding.account(panel, book_id="wide-5")["equity"] > 0
 
 
@@ -612,3 +652,90 @@ def test_a_log_belongs_to_its_own_book(store, panel):
     assert symbols[0] in holding.log()[0]["text"]
     assert symbols[3] in holding.log(book_id="other")[0]["text"]
     assert len(holding.log()) == 1
+
+
+# --- correcting a record that must not be edited ------------------------------
+
+def test_a_void_strikes_a_line_and_everything_after_it(store, panel):
+    """The file is append-only, so a correction is a line in it.
+
+    This exists because a real fill was written with the wrong cash, and the
+    mark that followed it inherited the error. Editing the file would have made
+    the record unfalsifiable; striking forward from the bad line leaves both
+    the mistake and the correction readable.
+    """
+    symbols = sorted(panel)
+    dates = sessions_of(panel)
+    holding.plan_next(FakeRun(dates[-40].date().isoformat(), [(symbols[0], 0.9)]))
+    filled = holding.advance(panel, today=dates[-39])["filled"]
+    holding.mark(panel, today=dates[-39])
+
+    assert holding.state()["holding"] is not None
+    assert holding.marks()
+
+    holding.void(filled["at"], kind="fill",
+                 reason="filled against the wrong cash")
+
+    # The book is back to the plan it had before the fill, and can act again.
+    after = holding.state()
+    assert after["holding"] is None
+    assert after["plan"] is not None
+    assert holding.marks() == []
+
+
+def test_a_void_needs_a_reason(store):
+    with pytest.raises(ValueError, match="reason"):
+        holding.void("2026-01-01T00:00:00+00:00", kind="fill", reason="")
+
+
+def test_the_struck_lines_are_still_in_the_file(store, panel):
+    """Struck, not deleted -- otherwise the correction is just an edit."""
+    symbols = sorted(panel)
+    dates = sessions_of(panel)
+    holding.plan_next(FakeRun(dates[-40].date().isoformat(), [(symbols[0], 0.9)]))
+    filled = holding.advance(panel, today=dates[-39])["filled"]
+    holding.void(filled["at"], kind="fill", reason="testing")
+
+    raw = open(holding._path(), encoding="utf-8").read()
+    assert "fill" in raw and "void" in raw and "testing" in raw
+
+
+def test_a_void_does_not_strike_what_happens_next(store, panel):
+    """A void is a line, not a mode. What the book does afterwards stands.
+
+    The first implementation filtered the void lines out and then truncated,
+    which loses where the void sat in the file -- so the corrected fill written
+    straight after it was dropped too, and the book looked like it had silently
+    refused to act.
+    """
+    symbols = sorted(panel)
+    dates = sessions_of(panel)
+    holding.plan_next(FakeRun(dates[-40].date().isoformat(), [(symbols[0], 0.9)]))
+    bad = holding.advance(panel, today=dates[-39])["filled"]
+    holding.void(bad["at"], kind="fill", reason="wrong cash")
+
+    again = holding.advance(panel, today=dates[-39])["filled"]
+    assert again is not None
+    assert holding.state()["holding"] is not None
+    assert holding.state()["holding"]["at"] == again["at"]
+
+
+def test_a_position_with_no_recorded_case_gets_no_warning(store, panel):
+    """"0 of 0 reasons still hold" is a verdict computed from nothing.
+
+    A plan written before the pattern was carried leaves the position with an
+    empty case, and the comparison then reports a break against no evidence.
+    The warning is only worth anything because it is read off the record, so
+    with no record it says nothing.
+    """
+    symbols = sorted(panel)
+    dates = sessions_of(panel)
+    holding.plan_next(FakeRun(dates[-40].date().isoformat(), [(symbols[0], 0.9)]))
+    holding.advance(panel, today=dates[-39])
+
+    held = holding.state()["holding"]
+    held["bought"][0]["pattern"] = []
+
+    run = FakeRun(dates[-38].date().isoformat(), [(symbols[0], 0.40)])
+    assert holding.watch(held, run, None) is None
+    assert not [e for e in holding._lines() if "watch" in e]

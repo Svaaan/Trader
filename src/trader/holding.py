@@ -89,8 +89,62 @@ def _lines(book_id: str = CHAMPION) -> list:
     the champion -- the record it has built is the one thing here that cannot
     be recreated, so it is joined rather than restarted.
     """
-    return [entry for entry in _read()
-            if entry.get("book_id", CHAMPION) == book_id]
+    return _apply_voids([entry for entry in _read()
+                         if entry.get("book_id", CHAMPION) == book_id])
+
+
+def void(anchor: str, *, kind: str, reason: str,
+         book_id: str = CHAMPION) -> dict:
+    """Strike a line and everything after it, by appending rather than editing.
+
+    `kind` and `anchor` name the entry to strike from -- its key ("fill",
+    "exit", "plan") and its `at` stamp. Both are needed because stamps are
+    written to the second, and a plan filled in the same second as it was
+    written would otherwise be struck along with the fill.
+
+    Everything the book wrote from there on is dropped when the record is read
+    back, so it returns to the state it was in beforehand and can act again.
+
+    The reason is required and kept. A record that can be silently corrected is
+    not a forward record, so the correction is a line in it -- and a reader can
+    see both that something was wrong and what was said about it.
+    """
+    if not reason:
+        raise ValueError("a void needs a reason; that is the point of it")
+    entry = {"void": {"from": anchor, "kind": kind, "reason": reason,
+                      "at": _now()}}
+    logger.warning("Voided (%s) from the %s at %s: %s",
+                   book_id, kind, anchor, reason)
+    return _append(entry, book_id=book_id)["void"]
+
+
+def _apply_voids(entries: list) -> list:
+    """Drop what the void lines strike, in file order.
+
+    A mark carries no stamp of its own, so "everything after" is positional:
+    the anchor names one entry and the strike runs from it to the end of what
+    had been written when the void was appended.
+    """
+    if not any("void" in entry for entry in entries):
+        return entries
+
+    # Walked in file order, because a void strikes what had already been
+    # written when it was appended and nothing else. Filtering the voids out
+    # first and truncating afterwards loses that boundary, and silently drops
+    # whatever the book does next -- which is the whole point of voiding.
+    kept: list = []
+    for entry in entries:
+        if "void" not in entry:
+            kept.append(entry)
+            continue
+        mark = entry["void"]
+        kind, anchor = mark.get("kind"), mark.get("from")
+        cut = next((i for i, seen in enumerate(kept)
+                    if isinstance(seen.get(kind), dict)
+                    and seen[kind].get("at") == anchor), None)
+        if cut is not None:
+            kept = kept[:cut]
+    return kept
 
 
 def books() -> dict:
@@ -557,8 +611,14 @@ def plan_all(run, *, today=None) -> dict:
 
 def _fill(plan: dict, cash: float, frames: dict,
           book_id: str = CHAMPION) -> dict | None:
-    """Buy at the first open after the plan was written."""
-    bought, spent = [], 0.0
+    """Buy at the first open after the plan was written.
+
+    `value` is the whole allocation, and all of it leaves the account: the fee
+    is paid out of it and the rest buys shares. Accumulating only the fee left
+    the allocation sitting in cash while the shares it bought were also counted,
+    so a $500 book that bought one position marked itself at $991 the next day.
+    """
+    bought, spent, charged = [], 0.0, 0.0
     for position in plan["buy"]:
         symbol = position["symbol"]
         session = _next_session(frames, symbol, plan["as_of"])
@@ -577,7 +637,8 @@ def _fill(plan: dict, cash: float, frames: dict,
             "probability_up": position.get("probability_up"),
             "pattern": position.get("pattern") or [],
         })
-        spent += fee
+        spent += value
+        charged += fee
 
     entry = {"fill": {
         "at": _now(), "as_of": plan["as_of"], "run_id": plan.get("run_id"),
@@ -586,7 +647,7 @@ def _fill(plan: dict, cash: float, frames: dict,
         "session": bought[0]["session"],
         "cash_before": round(cash, 4),
         "cash_after": round(cash - spent, 4),
-        "fees": round(spent, 4),
+        "fees": round(charged, 4),
     }}
     logger.info("Filled (%s): %s at %s", book_id, ", ".join(
         f"{b['symbol']} {b['price']}" for b in bought), bought[0]["session"])
@@ -639,7 +700,15 @@ def watch(holding: dict, run, last_status: str | None,
     if signal is None:
         return None
 
-    verdict = _compare(bought.get("pattern") or [], signal,
+    # A position bought before the pattern was recorded has nothing to compare
+    # today's reasons against, and `_compare` says so as "0 of 0 reasons still
+    # hold" -- a verdict computed from nothing, phrased as a measurement. The
+    # whole argument for this warning is that it is read off the record, so
+    # when there is no record of the case, there is no warning.
+    if not (bought.get("pattern") or []):
+        return None
+
+    verdict = _compare(bought["pattern"], signal,
                        float(bought.get("probability_up") or 0.0))
     if verdict["status"] == last_status:
         return verdict
