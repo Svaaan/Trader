@@ -17,10 +17,6 @@
             <a href="/analysis">Analysis</a>
         </nav>
         <div class="top-right">
-            <span class="pill {% if coordinator_ok %}is-ok{% else %}is-bad{% endif %}"
-                  id="coordinatorPill">
-                {{ coordinator_detail }}
-            </span>
             <button type="button" class="btn" id="startRun">Train a new model</button>
             <button type="button" class="btn" id="autoTrain" data-running="no">Auto-train</button>
         </div>

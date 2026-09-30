@@ -19,14 +19,14 @@ model, and this project has the measurements to say so:
 So the loop wakes on a timer but trains on data. A session closes once a day;
 until one does, there is nothing to learn that was not there an hour ago, and
 the cycle says so rather than burning a look at the test set to find out. What
-it does do every time is the work that genuinely is time-sensitive: collect any
-model that finished on HelloWorldAi, and settle the paper positions whose
-session has now happened -- the forward record that cannot be mined, and the one
-thing here that gets better purely by waiting.
+it does do every time is the work that genuinely is time-sensitive: collect
+today's news, advance the books whose session has now happened, step the
+challenger contest and write the briefing -- the forward record that cannot be
+mined, and the one thing here that gets better purely by waiting.
 
-Stopping takes effect between cycles. A local fit is about a minute on the wide
-panel and is not interrupted halfway; `stop` is not a kill switch, it is a
-promise that nothing new starts.
+Stopping takes effect between cycles. A fit is about a minute on the wide panel
+and is not interrupted halfway; `stop` is not a kill switch, it is a promise
+that nothing new starts.
 """
 
 from __future__ import annotations
@@ -109,7 +109,7 @@ def _blank() -> dict:
     return {"running": False, "stop_requested": False, "cycles": 0,
             "trained_for": None, "history": [], "started_at": None,
             "heartbeat": None, "interval_minutes": DEFAULT_INTERVAL_MINUTES,
-            "backend": None, "pid": None}
+            "pid": None}
 
 
 def _read() -> dict:
@@ -214,7 +214,7 @@ def collect_news(watchlist=None) -> dict:
         return {"asked": 0, "error": str(exc)}
 
 
-def cycle(*, backend: str = "local", watchlist=None, trained_for: str | None = None,
+def cycle(*, watchlist=None, trained_for: str | None = None,
           force: bool = False) -> dict:
     """Collect, settle, and train if a session has closed since the last one.
 
@@ -233,13 +233,14 @@ def cycle(*, backend: str = "local", watchlist=None, trained_for: str | None = N
 
     out["news"] = collect_news(watchlist)
 
-    settled = pipeline_mod.settle_paper(watchlist)
-    out["settled"] = settled.get("settled", 0)
-    out["pending"] = settled.get("pending", 0)
+    # The day-trade ledger is history, not a live book: nothing writes to it
+    # and the cycle no longer loads the universe to settle it.
 
     # One new question a week, and what the promotion rule makes of the
     # records so far. Neither moves any money by itself.
     out["guard"] = pipeline_mod.guard_book()
+    note = pipeline_mod.write_briefing(watchlist)
+    out["briefing"] = len(note["lines"]) if note else 0
     out["challenger"] = pipeline_mod.challenge_step(watchlist)
     verdict = pipeline_mod.promotion()
     out["promotion"] = {"promote": verdict.get("promote"),
@@ -266,7 +267,7 @@ def cycle(*, backend: str = "local", watchlist=None, trained_for: str | None = N
         return out
 
     try:
-        run = pipeline_mod.start(watchlist, backend=backend)
+        run = pipeline_mod.start(watchlist)
     except Exception as exc:                            # noqa: BLE001
         logger.exception("Training failed this cycle")
         out["error"] = f"train: {exc}"
@@ -307,9 +308,9 @@ def _wait(seconds: float) -> bool:
     return True
 
 
-def _loop(*, interval_minutes: float, backend: str, watchlist) -> None:
+def _loop(*, interval_minutes: float, watchlist) -> None:
     while not _asked_to_stop():
-        done = cycle(backend=backend, watchlist=watchlist,
+        done = cycle(watchlist=watchlist,
                      trained_for=_read().get("trained_for"))
 
         with _state_lock:
@@ -353,7 +354,7 @@ def _clear_stop() -> None:
 
 
 def start(*, interval_minutes: float = DEFAULT_INTERVAL_MINUTES,
-          backend: str = "local", watchlist=None) -> dict:
+          watchlist=None) -> dict:
     """Begin the loop in a background thread. Idempotent within a process."""
     global _thread
 
@@ -369,17 +370,17 @@ def start(*, interval_minutes: float = DEFAULT_INTERVAL_MINUTES,
         _clear_stop()
         _update(running=True, stop_requested=False, started_at=_now(),
                 heartbeat=_now(), cycles=0, interval_minutes=interval_minutes,
-                backend=backend, pid=os.getpid(), stopped_at=None,
+                pid=os.getpid(), stopped_at=None,
                 stopped_because=None)
 
         _thread = threading.Thread(
             target=_loop, name="auto-train", daemon=True,
-            kwargs={"interval_minutes": interval_minutes, "backend": backend,
+            kwargs={"interval_minutes": interval_minutes,
                     "watchlist": watchlist})
         _thread.start()
 
-    logger.info("Auto-training started: %s backend, checking every %g minute(s)",
-                backend, interval_minutes)
+    logger.info("Auto-training started, checking every %g minute(s)",
+                interval_minutes)
     return state()
 
 

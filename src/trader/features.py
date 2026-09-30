@@ -42,7 +42,7 @@ import pandas as pd
 
 # Ordered, because a model trained on columns in one order and asked to predict
 # with them in another produces confident nonsense. The manifest that goes to
-# HelloWorldAi carries these names so the pairing survives the round trip.
+# The bundle carries these names so the pairing survives the round trip.
 FEATURE_NAMES = [
     # --- momentum, over horizons that are actually different ---
     "return_1d",

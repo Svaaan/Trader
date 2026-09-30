@@ -1,7 +1,7 @@
 // Drawing a run so that every number can be argued with.
 //
 // Built with createElement throughout. Symbol names and error strings arrive
-// from yfinance and from the coordinator, and a page that puts those through
+// from yfinance and from the news providers, and a page that puts those through
 // innerHTML is a page that will one day render whatever a data provider decided
 // to put in a field.
 
@@ -102,31 +102,6 @@ function datasetPanel(run) {
         ? `Split at ${data.cut_date || test.from}: everything the model trained on happened before everything it was graded on.`
         : "The training and test windows overlap. Any score below is worthless."));
   }
-  return panel;
-}
-
-function verificationPanel(run) {
-  const verification = run.verification || {};
-  const measured = verification.measured || {};
-  if (!verification.verdict) return null;
-
-  const panel = el("section", "panel");
-  panel.appendChild(el("h3", null, "What HelloWorldAi checked"));
-
-  const grid = el("div", "figures");
-  grid.appendChild(figure("Verdict", verification.verdict,
-    verification.strength || ""));
-  grid.appendChild(figure("Holdout accuracy", percent(measured.holdout_accuracy),
-    "on a random slice"));
-  grid.appendChild(figure("Untrained model", percent(measured.untrained_accuracy),
-    "the floor it had to beat"));
-  panel.appendChild(grid);
-
-  panel.appendChild(el("p", "note",
-    "The coordinator rebuilt the model from the returned weights and scored it "
-    + "itself, so a node cannot report a result it did not get. Its slice is "
-    + "random, though, which for a price series is easier than predicting "
-    + "forwards — read it as proof that training happened, not as skill."));
   return panel;
 }
 
@@ -340,19 +315,11 @@ function runCard(run) {
   const progress = progressLine(run);
   if (progress) card.appendChild(progress);
 
-  // A `both` run whose remote half could not be reached still has a local
-  // model and is worth reading; the reason the other half is missing belongs
-  // on the card rather than only in a log nobody opens.
-  if (run.remote_error) {
-    card.appendChild(el("p", "warn",
-      `Trained here only — HelloWorldAi was not reachable: ${run.remote_error}`));
-  }
-
   const verdict = verdictLine(run);
   if (verdict) card.appendChild(verdict);
   if (run.verdict) card.appendChild(el("p", "run-reading", run.verdict));
 
-  const panels = [datasetPanel(run), verificationPanel(run), evaluationPanel(run),
+  const panels = [datasetPanel(run), evaluationPanel(run),
                   signalsPanel(run)].filter(Boolean);
   if (panels.length) {
     const fold = el("details", "fold");
@@ -449,9 +416,8 @@ async function refreshStatus() {
     const response = await fetch("/api/status");
     if (!response.ok) return;
     const status = await response.json();
-    const pill = document.getElementById("coordinatorPill");
-    pill.textContent = status.coordinator_detail;
-    pill.className = `pill ${status.coordinator_ok ? "is-ok" : "is-bad"}`;
+    const universe = document.getElementById("universeCount");
+    if (universe) universe.textContent = `${status.universe} symbols`;
   } catch {
     /* the runs panel already reports a dead server */
   }

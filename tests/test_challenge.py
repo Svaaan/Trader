@@ -136,74 +136,115 @@ def settled(book_id, profits, opened="2026-01-05"):
         }}, book_id=book_id)
 
 
+def sessions(count):
+    import pandas as pd
+    return [d.date().isoformat()
+            for d in pd.bdate_range("2026-01-01", periods=count)]
+
+
+def marked(book_id, daily, days=None):
+    """Give a book a forward equity curve, one mark per session."""
+    equity = holding.STARTING_CASH
+    for session, move in zip(days or sessions(len(daily)), daily):
+        equity *= 1.0 + move
+        holding._append({"mark": {"session": session, "equity": round(equity, 6),
+                                  "holding": []}}, book_id=book_id)
+
+
 def test_it_refuses_while_nothing_is_challenging(contest):
     assert promote.decide()["promote"] is None
     assert "nothing is challenging" in promote.decide()["why"]
 
 
-def test_it_refuses_until_both_have_enough_decisions(contest):
+def test_it_refuses_until_there_is_enough_shared_record(contest):
+    import numpy as np
+
     holding.register("rival", rule={"top_n": 2}, why="testing")
-    settled(holding.CHAMPION, [5.0] * 3)
-    settled("rival", [50.0] * 9)
+    days = sessions(30)
+    moves = np.random.default_rng(0).normal(0.0, 0.01, 30)
+    marked(holding.CHAMPION, moves, days)
+    marked("rival", moves + 0.002, days)
 
     verdict = promote.decide()
     assert verdict["promote"] is None
-    assert f"3 closed decisions of the {promote.MIN_DECISIONS}" in verdict["why"]
+    assert f"of the {promote.MIN_SESSIONS} needed" in verdict["why"]
 
 
 def test_a_backtest_cannot_promote_anything(contest):
-    """The challenger got its shadow by clearing a backtest. Doing it again is
-    not new evidence."""
+    """The challenger got its shadow by clearing a backtest. Doing that again
+    is not new evidence -- only a forward record can move the money."""
     holding.register("rival", rule={"top_n": 2},
                      why="beat 99% of matched random books")
-    settled(holding.CHAMPION, [1.0] * promote.MIN_DECISIONS)
 
     verdict = promote.decide()
     assert verdict["promote"] is None
-    assert "closed decisions" in verdict["why"]
+    assert "forward record" in verdict["why"]
 
 
 def test_winning_by_a_nose_is_not_enough(contest):
+    import numpy as np
+
     holding.register("rival", rule={"top_n": 2}, why="testing")
-    settled(holding.CHAMPION, [10.0] * promote.MIN_DECISIONS)
-    settled("rival", [11.0] * promote.MIN_DECISIONS)
+    days = sessions(140)
+    moves = np.random.default_rng(1).normal(0.0002, 0.01, 140)
+    marked(holding.CHAMPION, moves, days)
+    marked("rival", moves + 0.0001, days)      # about 1.4% ahead over the run
 
     verdict = promote.decide()
     assert verdict["promote"] is None
     assert "it needs" in verdict["why"]
 
 
-def test_more_money_but_fewer_decisions_won_is_not_enough(contest):
-    """One lucky holding is not a better method."""
+def test_one_lucky_day_does_not_promote_anything(contest):
+    """Ahead on the total, and nowhere on the difference: exactly what the
+    paired test is for."""
+    import numpy as np
+
     holding.register("rival", rule={"top_n": 2}, why="testing")
-    settled(holding.CHAMPION, [5.0] * promote.MIN_DECISIONS)
-    settled("rival", [300.0] + [-5.0] * (promote.MIN_DECISIONS - 1))
+    days = sessions(140)
+    moves = np.random.default_rng(2).normal(0.0, 0.01, 140)
+    jump = np.zeros(140)
+    jump[40] = 0.12
+    marked(holding.CHAMPION, moves, days)
+    marked("rival", moves + jump, days)
 
     verdict = promote.decide()
     assert verdict["promote"] is None
+    closest = verdict["challengers"][0]["paired"]
+    assert closest["ahead"] >= promote.MARGIN      # it is ahead on the money
+    assert closest["t"] < promote.MIN_PAIRED_T     # and it means nothing
 
 
-def test_a_challenger_that_is_clearly_better_takes_over(contest):
+def test_a_challenger_that_is_steadily_better_takes_over(contest):
+    import numpy as np
+
     holding.register("rival", rule={"top_n": 2}, why="testing")
-    settled(holding.CHAMPION, [1.0] * promote.MIN_DECISIONS)
-    settled("rival", [20.0] * promote.MIN_DECISIONS)
+    days = sessions(140)
+    rng = np.random.default_rng(3)
+    moves = rng.normal(0.0, 0.01, 140)
+    marked(holding.CHAMPION, moves, days)
+    marked("rival", moves + 0.0008 + rng.normal(0.0, 0.0015, 140), days)
 
     verdict = promote.apply()
     assert verdict["promote"] == "rival"
+    assert "paired t of" in verdict["why"]
     assert holding.funded() == "rival"
-    # And the reason is in the record, not only in a log.
-    assert "against the champion's" in holding.books()["rival"]["why"] or True
     assert any("fund" in entry for entry in holding._read())
 
 
 def test_it_will_not_promote_twice_in_a_row(contest):
+    import numpy as np
+
     holding.register("rival", rule={"top_n": 2}, why="testing")
-    settled(holding.CHAMPION, [1.0] * promote.MIN_DECISIONS)
-    settled("rival", [20.0] * promote.MIN_DECISIONS)
+    days = sessions(140)
+    rng = np.random.default_rng(4)
+    moves = rng.normal(0.0, 0.01, 140)
+    marked(holding.CHAMPION, moves, days)
+    marked("rival", moves + 0.0008 + rng.normal(0.0, 0.0015, 140), days)
     promote.apply()
 
     holding.register("newcomer", rule={"top_n": 5}, why="testing")
-    settled("newcomer", [40.0] * promote.MIN_DECISIONS)
+    marked("newcomer", moves + 0.002 + rng.normal(0.0, 0.0015, 140), days)
 
     verdict = promote.decide()
     assert verdict["promote"] is None

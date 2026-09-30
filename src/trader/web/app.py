@@ -2,23 +2,22 @@
 
 Everything here is in service of one idea: a signal you cannot interrogate is
 worth nothing. So the page shows the working, not the conclusion -- what data
-went in, what window it covered, what the coordinator measured, what this
-project measured on rows nobody has seen, and how far from a coin flip today's
+went in, what window it covered, what it scored on rows nobody has seen, what
+the controls scored on the same rows, and how far from a coin flip today's
 answer actually is.
 
 Numbers are shown together and never apart:
 
   * accuracy, and the baseline of always guessing the class that dominated
     *training* -- the only baseline anybody had in advance
-  * what HelloWorldAi verified, and what this project measured out of time
-  * the trained model, and the local controls trained on the same rows with
-    the same hyperparameters
+  * the trained model, and the controls trained on the same rows with the same
+    hyperparameters
+  * the return the label describes, and the return an order could actually
+    reach -- which on this panel disagree completely
 
-The last pair is the one that was missing longest. HelloWorldAi holds back a
-random slice and asks "did training work at all" -- a real check, and the reason
-a node cannot fake a result. This project holds back the *last* two years and
-asks "does it work on days that had not happened yet". And the controls ask the
-question neither of those can: would a logistic regression have done the same?
+The controls are the pair that was missing longest, and they ask the question a
+single score cannot: would a logistic regression have done the same? On this
+panel it does, which is most of what the page has to report.
 
 There is no order execution here and no broker credentials anywhere in this
 project. It produces opinions about direction; acting on them is a separate
@@ -46,6 +45,7 @@ from starlette.requests import Request
 
 from .. import auto as auto_mod
 from .. import context as context_mod
+from .. import briefing as briefing_mod
 from .. import challenge as challenge_mod
 from .. import holding as holding_mod
 from .. import promote as promote_mod
@@ -53,8 +53,6 @@ from .. import prices as prices_mod
 from .. import news as news_mod
 from .. import paper as paper_mod
 from .. import pipeline
-from .. import trainer as trainer_mod
-from ..helloworld import Client
 
 logger = logging.getLogger(__name__)
 
@@ -105,12 +103,6 @@ class Question(BaseModel):
     symbol: str | None = None
 
 
-class NewRun(BaseModel):
-    """Where to train. See trainer.py for why "both" is the useful one."""
-
-    backend: str = trainer_mod.BOTH
-
-
 class AutoTrain(BaseModel):
     """How often to wake, and where to train when a session has closed.
 
@@ -121,7 +113,6 @@ class AutoTrain(BaseModel):
     """
 
     interval_minutes: float = auto_mod.DEFAULT_INTERVAL_MINUTES
-    backend: str = trainer_mod.LOCAL
 
 
 def _newest_done():
@@ -131,11 +122,8 @@ def _newest_done():
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    reachable, detail = Client().reachable()
     return templates.TemplateResponse("index.html", {
         "request": request,
-        "coordinator_ok": reachable,
-        "coordinator_detail": detail,
         "watchlist": pipeline.default_watchlist(),
         "v": _static_version(),
     })
@@ -176,15 +164,8 @@ def api_analysis():
             "spec": run.spec,
             "trust": run.trust,
             "evaluation": run.evaluation,
-            # Which trainer produced the headline numbers, the local reference
-            # model when there is one, and what the gap between them means.
-            "backend": run.backend,
-            "primary": run.primary,
-            "local_evaluation": run.local_evaluation,
-            "local_verdict": run.local_verdict,
-            "comparison": run.comparison,
-            # What a model had to beat, measured locally before anything was
-            # sent. Shown beside the trained model rather than under it.
+            # What the model had to beat, measured on the same rows with the
+            # same hyperparameters. Shown beside it rather than under it.
             "controls": run.controls,
             "walk_forward": run.walk_forward,
             "verdict": run.verdict,
@@ -275,6 +256,12 @@ def api_books():
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 
+@app.get("/api/briefing")
+def api_briefing(limit: int = 14):
+    """What it noticed, newest first."""
+    return briefing_mod.read(limit=limit)
+
+
 @app.get("/api/contest")
 def api_contest():
     """The books, what the promotion rule makes of them, and the guard."""
@@ -313,14 +300,10 @@ def api_runs():
             # a run that died look identical for minutes at a time.
             "progress": r.progress,
             "silent_for": round(r.silent_for),
-            "backend": r.backend,
-            "remote_error": r.remote_error,
-            "task_id": r.task_id,
             "watchlist": r.watchlist,
             "horizon": r.horizon,
             "spec": r.spec,
             "dataset": r.dataset,
-            "verification": r.verification,
             "evaluation": r.evaluation,
             "controls": r.controls,
             "walk_forward": r.walk_forward,
@@ -338,11 +321,8 @@ def api_runs():
 
 @app.get("/api/status")
 def api_status():
-    reachable, detail = Client().reachable()
     runs = pipeline.list_runs()
     return {
-        "coordinator_ok": reachable,
-        "coordinator_detail": detail,
         "runs": len(runs),
         "active": sum(1 for r in runs if r.status not in ("done", "failed")),
         "universe": len(pipeline.default_watchlist()),
@@ -350,31 +330,24 @@ def api_status():
 
 
 @app.post("/api/runs")
-def api_start(background: BackgroundTasks, body: NewRun | None = None):
+def api_start(background: BackgroundTasks):
     """Build a dataset and train on it. Returns immediately; the page polls.
 
-    Even a local run goes through the background task rather than blocking the
-    request: assembling a wide panel takes long enough that a browser would
-    give up on it.
+    It goes through a background task rather than blocking the request:
+    assembling a wide panel takes long enough that a browser would give up.
     """
-    backend = (body.backend if body else trainer_mod.BOTH)
-    if backend not in trainer_mod.BACKENDS:
-        return JSONResponse(
-            {"error": f"backend must be one of {list(trainer_mod.BACKENDS)}"},
-            status_code=400)
-
     if not _starting.acquire(blocking=False):
         return JSONResponse(
             {"error": "A run is already being prepared."}, status_code=409)
 
     def build_and_train():
         try:
-            pipeline.start(backend=backend)
+            pipeline.start()
         finally:
             _starting.release()
 
     background.add_task(build_and_train)
-    return {"status": "started", "backend": backend}
+    return {"status": "started"}
 
 
 @app.get("/api/auto")
@@ -386,18 +359,13 @@ def api_auto():
 @app.post("/api/auto/start")
 def api_auto_start(body: AutoTrain | None = None):
     settings = body or AutoTrain()
-    if settings.backend not in trainer_mod.BACKENDS:
-        return JSONResponse(
-            {"error": f"backend must be one of {list(trainer_mod.BACKENDS)}"},
-            status_code=400)
     if settings.interval_minutes < 1:
         return JSONResponse(
             {"error": "an interval below a minute only re-reads the price "
                       "cache faster; a session closes once a day"},
             status_code=400)
 
-    return auto_mod.start(interval_minutes=settings.interval_minutes,
-                          backend=settings.backend)
+    return auto_mod.start(interval_minutes=settings.interval_minutes)
 
 
 @app.post("/api/auto/stop")

@@ -110,14 +110,15 @@ def test_a_new_session_is_trained_on(scheduler, monkeypatch):
 
 
 def test_the_cheap_work_happens_even_on_an_idle_cycle(scheduler):
-    """Collecting a finished model and settling yesterday's paper positions are
-    time-sensitive in a way training is not."""
+    """Collecting a finished model, stepping the books and growing the archive
+    are time-sensitive in a way training is not. Settling the old day-trade
+    ledger is not done at all any more: nothing writes to it."""
     out = auto.cycle(trained_for="2026-09-25")
 
     assert out["skipped"]
     assert scheduler["collected"] == 1
-    assert scheduler["settled"] == 1
-    assert out["settled"] == 2 and out["pending"] == 1
+    assert scheduler["settled"] == 0, "it settled a ledger nothing writes to"
+    assert "news" in out and "guard" in out
 
 
 def test_a_failed_cycle_is_recorded_rather_than_raised(scheduler, monkeypatch):
@@ -147,7 +148,7 @@ def wait_until(predicate, timeout=20.0):
 
 
 def test_it_starts_runs_and_stops(scheduler):
-    auto.start(interval_minutes=0.001, backend="local")
+    auto.start(interval_minutes=0.001)
     assert auto.running()
 
     assert wait_until(lambda: scheduler["trained"] >= 1)
@@ -252,8 +253,7 @@ def client(scheduler, monkeypatch):
 def test_the_page_can_start_and_stop_it(client):
     assert client.get("/api/auto").json()["running"] is False
 
-    started = client.post("/api/auto/start", json={"interval_minutes": 1,
-                                                   "backend": "local"})
+    started = client.post("/api/auto/start", json={"interval_minutes": 1})
     assert started.status_code == 200
     assert started.json()["running"] is True
 
@@ -267,12 +267,6 @@ def test_the_page_refuses_a_pointless_interval(client):
     refused = client.post("/api/auto/start", json={"interval_minutes": 0.1})
     assert refused.status_code == 400
     assert "once a day" in refused.json()["error"]
-    assert auto.running() is False
-
-
-def test_the_page_refuses_an_unknown_backend(client):
-    refused = client.post("/api/auto/start", json={"backend": "gpu-farm"})
-    assert refused.status_code == 400
     assert auto.running() is False
 
 

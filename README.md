@@ -9,11 +9,11 @@ broker credentials, no keys to anything that can spend money.
 ```bash
 python -m venv .venv
 .venv/Scripts/python.exe -m pip install -r requirements.txt
-cp env/.env.example env/.env          # a submitter key, only for the remote trainer
+cp env/.env.example env/.env          # optional: everything has a default
 
-python train.py --backend local       # train and grade, ~1 min, no network
+python train.py                       # train and grade, ~1 min
 python run.py                         # the UI on http://127.0.0.1:8600
-python auto.py                        # the scheduler: collect, settle, review, archive
+python auto.py                        # the scheduler: news, books, contest, briefing
 python search.py board                # what has been tried, and the bar it must clear
 ```
 
@@ -155,14 +155,20 @@ random books and ends above buy-and-hold is *registered as a shadow book*: it
 starts its own forward record, with its own $500, the same commission by
 market, the same review rules. At most three run at once.
 
-**Only the forward record can promote it.** The rule was written before any
-contest ran, which is the only time such a rule can be written honestly:
+**Only the forward record can promote it**, and the record is written daily.
+A book reviewed every sixty sessions closes four decisions a year, so a contest
+judged on decisions needs two years to say anything — while every session is
+already out-of-sample for every book. So each book is **marked every session**,
+and challengers are judged on the *paired daily difference* against the funded
+book: both see the same market on the same days, so what they share cancels and
+what is left is the rule.
 
-- both books have **8 closed decisions** — about two years at a 60-session
-  review, which is the price of evidence that cannot be mined;
-- the challenger is ahead by **5 points of total return**;
-- its share of decisions won is **not worse** — one enormous holding carrying a
-  book that lost most of its decisions is not a better method;
+The rule, written before any contest ran:
+
+- **120 shared sessions** of record, about six months;
+- the challenger **5 points ahead** in total;
+- a **paired t of 2** on the daily difference — a far stronger test than
+  comparing two noisy totals, and the thing that rejects one lucky day;
 - and **no promotion in 180 days**.
 
 A backtest cannot promote anything: clearing one is what got the challenger a
@@ -176,6 +182,25 @@ expecting to make money and has lost money instead. Standing down means nothing
 is funded — and every book keeps recording, because you want to know whether
 the one you stopped would have recovered. Nothing in that path can start
 trading something.
+
+## What it noticed today
+
+Everything above is built for a verdict months or years away. `briefing.py` is
+the output that is useful on the day: a short dated note about what changed,
+appended and never edited, so a week of them is a record of what the system
+believed at the time.
+
+It only says what it measured — the book's plan, a case that has broken, a
+challenger's standing, a name the archive has suddenly filled up with — and
+every line carries the number behind it. There is no language model in it and
+nothing is generated. Silence is the common outcome and a deliberate one: a
+note every morning saying nothing teaches you to stop reading them.
+
+The news spike line is worth singling out, because it is the first thing the
+archive has been good for. The block itself is a year from being a feature, but
+"this name is in eight articles today against two a day lately — four times its
+own normal" needs no history at all, and the collector is already storing the
+items.
 
 ## Why the model itself is not what improves
 
@@ -252,7 +277,7 @@ labels.py     the only forward-looking lines; both windows of a day
 dataset.py    one cut date, carried not re-derived; purge; scaler on train only
    |
 baseline.py   majority, logistic, MLP, walk-forward, noise floor
-trainer.py    two backends producing the same artifact
+trainer.py    fit the network, and pack it so the loader can read it back
 evaluate.py   accuracy against a training-period baseline, turnover costs, and
    |          every statistic corrected for overlap and clustering
 explain.py    the six-hurdle gate, and per-day attribution underneath it
@@ -261,9 +286,11 @@ book.py       a book walked forward in money, and the permutation percentile
 search.py     train / validation / sealed test, a trial ledger, commit-then-open
 holding.py    the books: each a forward record, one of them funded
 challenge.py  the challenger loop -- budgeted, deduped, decision rules only
-promote.py    when a challenger takes over, and when the funded one stands down
-paper.py      the day-trade ledger that came before it
-auto.py       the scheduler: collect, settle, review, archive
+promote.py    the paired daily comparison, promotion, and the drift guard
+briefing.py   what it noticed today, from the stores, written forward
+paper.py      the day-trade ledger that came before holding.py -- read only:
+   |          nothing writes to it, because 238 names on 500 pays 96% a trip
+auto.py       the scheduler: news, books, contest, briefing
 web/          the UI; the decision first, the working folded away
 ```
 
@@ -294,7 +321,7 @@ rather than carried forward, and picked up again when it resumes.
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-339 tests. The look-ahead ones test the property rather than the implementation
+306 tests. The look-ahead ones test the property rather than the implementation
 — features computed on a truncated history must match the full one — and one
 deliberately introduces a centred window to prove the property test can fail.
 
@@ -302,5 +329,6 @@ Most of the rest are regression tests for measured mistakes: the pinned cut
 date, the RSI warm-up, per-trade costs, the training-period baseline, the
 sigmoid-to-softmax conversion, the executable return, the overlap correction,
 the clustered standard error, the neutral-band leak, the paper ledger that
-stopped growing the day it first paid out, and the settlement that filled a
-238-name book from ten of them.
+stopped growing the day it first paid out, the settlement that filled a
+238-name book from ten of them, and the endpoint that went on reading a field
+after the field was deleted.

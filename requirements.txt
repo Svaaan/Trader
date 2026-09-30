@@ -1,8 +1,8 @@
 # What the Trader needs, and nothing else.
 #
-# Deliberately no torch. The model HelloWorldAi returns is a small feedforward
-# network, and its manifest describes the layers explicitly -- Linear, ReLU,
-# Linear -- so running it is a few matrix multiplications. numpy does that in
+# Deliberately no torch. The model is a small feedforward network and its
+# manifest describes the layers explicitly -- Linear, ReLU, Linear -- so
+# running it is a few matrix multiplications. numpy does that in
 # twenty lines you can read, instead of a two-gigabyte dependency and a CUDA
 # version to match. See src/trader/model.py.
 #
@@ -20,11 +20,14 @@ numpy==2.3.4
 # features are silently unavailable for every symbol.
 lxml==6.1.3
 
-# --- talking to HelloWorldAi ---
-httpx==0.28.1
-
-# --- reading the weights it sends back ---
+# --- reading and writing the weights ---
 safetensors==0.6.2
+
+# --- the test client ---
+#
+# Nothing in the project makes an HTTP request any more; starlette's TestClient
+# is built on httpx, so the tests that drive the pages need it.
+httpx==0.28.1
 
 # --- the UI ---
 fastapi==0.115.12

@@ -1,4 +1,4 @@
-"""Running a model HelloWorldAi trained, without torch.
+"""Running a trained model without torch.
 
 The bundle is a zip holding `model.safetensors` and a `config.json` manifest,
 and that manifest lists the layers explicitly:

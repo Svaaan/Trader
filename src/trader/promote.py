@@ -25,6 +25,9 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
+
+import numpy as np
 
 from . import holding as holding_mod
 
@@ -34,6 +37,18 @@ logger = logging.getLogger(__name__)
 # anything. At a sixty-session review that is about two years -- which is the
 # honest price of evidence that cannot be mined, not a target to be shortened.
 MIN_DECISIONS = 8
+
+# How many sessions of shared forward record before two books can be compared.
+# A book reviewed every sixty sessions closes four decisions a year, so judging
+# on decisions alone needs two years to say anything -- while every session is
+# already out-of-sample for every book. A hundred and twenty sessions is about
+# six months, and gives the paired difference below something to stand on.
+MIN_SESSIONS = 120
+
+# And how convincing that difference has to be. Two standard errors on the
+# daily difference between the two books: a far stronger test than comparing
+# two noisy totals, because the market they share cancels out of it.
+MIN_PAIRED_T = 2.0
 
 # How far ahead the challenger has to be, in total return over its own record.
 # Below this the difference is one lucky holding.
@@ -76,6 +91,40 @@ def _record(book_id: str) -> dict:
         "wins": wins,
         "since": closed[0]["opened"] if closed else None,
     }
+
+
+def _daily(book_id: str) -> dict:
+    """The forward equity of one book, session by session."""
+    return {mark["session"]: float(mark["equity"])
+            for mark in holding_mod.marks(book_id)}
+
+
+def paired(challenger_id: str, champion_id: str) -> dict:
+    """How much better one book did than the other, day by day.
+
+    Both see the same market on the same sessions, so most of what moves them
+    is shared and cancels in the difference. What is left is the rule, which is
+    the only thing being compared.
+    """
+    mine, theirs = _daily(challenger_id), _daily(champion_id)
+    sessions = sorted(set(mine) & set(theirs))
+    if len(sessions) < 2:
+        return {"sessions": len(sessions), "mean": 0.0, "t": 0.0, "ahead": 0.0}
+
+    differences = []
+    for before, after in zip(sessions, sessions[1:]):
+        one = mine[after] / mine[before] - 1.0 if mine[before] else 0.0
+        other = theirs[after] / theirs[before] - 1.0 if theirs[before] else 0.0
+        differences.append(one - other)
+
+    series = np.asarray(differences, dtype=float)
+    spread = float(series.std(ddof=1)) if len(series) > 1 else 0.0
+    t = float(series.mean()) / (spread / math.sqrt(len(series))) if spread else 0.0
+    ahead = (mine[sessions[-1]] / mine[sessions[0]]
+             - theirs[sessions[-1]] / theirs[sessions[0]])
+
+    return {"sessions": len(sessions), "mean": float(series.mean()),
+            "t": round(t, 3), "ahead": round(ahead, 6)}
 
 
 def _last_promotion() -> dt.datetime | None:
@@ -172,47 +221,42 @@ def decide(*, now: dt.datetime | None = None) -> dict:
                           f"{waiting} more before another can happen")
         return verdict
 
-    if champion["decisions"] < MIN_DECISIONS:
-        verdict["why"] = (f"the champion has {champion['decisions']} closed "
-                          f"decisions of the {MIN_DECISIONS} needed to compare")
-        return verdict
+    for challenger in challengers:
+        challenger["paired"] = paired(challenger["book_id"], champion_id)
 
-    ready = [c for c in challengers if c["decisions"] >= MIN_DECISIONS]
+    ready = [c for c in challengers if c["paired"]["sessions"] >= MIN_SESSIONS]
     if not ready:
-        best = max(challengers, key=lambda c: c["decisions"])
-        verdict["why"] = (f"the best-placed challenger has {best['decisions']} "
-                          f"closed decisions of the {MIN_DECISIONS} needed")
+        best = max(challengers, key=lambda c: c["paired"]["sessions"])
+        verdict["why"] = (
+            f"the best-placed challenger has {best['paired']['sessions']} "
+            f"sessions of forward record shared with the champion, of the "
+            f"{MIN_SESSIONS} needed to compare")
         return verdict
 
-    # Ahead on the money by a margin, and ahead on the count of decisions won.
-    # Either alone is one lucky holding or a long run of small wins that lost
-    # money overall.
-    # Not *worse* on the share of decisions won, rather than strictly better:
-    # a champion that has won all of them cannot be beaten on that count, and
-    # refusing on it would make the money margin unreachable. What this still
-    # excludes is the case it was written for -- one enormous holding carrying
-    # a book that lost most of its decisions.
+    # Ahead on the money by a margin, and convincing on the paired difference.
+    # Either alone is a coin: a margin with no significance is one lucky
+    # holding, and significance on a margin too small to matter is not worth
+    # the round trip it costs to switch.
     beaten = [c for c in ready
-              if c["return"] >= champion["return"] + MARGIN
-              and c["wins"] / max(c["decisions"], 1)
-              >= champion["wins"] / max(champion["decisions"], 1)]
+              if c["paired"]["ahead"] >= MARGIN
+              and c["paired"]["t"] >= MIN_PAIRED_T]
 
     if not beaten:
-        closest = max(ready, key=lambda c: c["return"])
+        closest = max(ready, key=lambda c: c["paired"]["t"])
+        pair = closest["paired"]
         verdict["why"] = (
-            f"{closest['book_id']} is the closest at {closest['return']:+.1%} "
-            f"against the champion's {champion['return']:+.1%}; it needs "
-            f"{champion['return'] + MARGIN:+.1%} and a better share of decisions won")
+            f"{closest['book_id']} is the closest: {pair['ahead']:+.1%} ahead "
+            f"over {pair['sessions']} shared sessions with a paired t of "
+            f"{pair['t']:+.2f}; it needs {MARGIN:+.0%} and {MIN_PAIRED_T:.0f}")
         return verdict
 
-    winner = max(beaten, key=lambda c: c["return"])
+    winner = max(beaten, key=lambda c: c["paired"]["t"])
+    pair = winner["paired"]
     verdict["promote"] = winner["book_id"]
     verdict["why"] = (
-        f"{winner['book_id']} returned {winner['return']:+.1%} over "
-        f"{winner['decisions']} closed decisions against the champion's "
-        f"{champion['return']:+.1%} over {champion['decisions']}, winning "
-        f"{winner['wins']}/{winner['decisions']} against "
-        f"{champion['wins']}/{champion['decisions']}")
+        f"{winner['book_id']} is {pair['ahead']:+.1%} ahead of the champion "
+        f"over {pair['sessions']} shared sessions, with a paired t of "
+        f"{pair['t']:+.2f} on the daily difference")
     return verdict
 
 

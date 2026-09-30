@@ -1,13 +1,13 @@
-"""The loop, with the coordinator stubbed out.
+"""The loop, end to end, on a synthetic panel.
 
 This module had no tests at all, which is where the two most expensive bugs in
 the project lived: a split re-derived at scoring time instead of carried, and a
 watchlist of ten that trained as nine without saying so. Both are regression
 tests here.
 
-Nothing below touches the network. The client is a stub, prices come from the
-synthetic panel, and the model is built with HelloWorldAi's own bundle format so
-that a format change fails here rather than in production.
+Nothing below touches the network: prices come from the synthetic panel, and
+the model is built in the real bundle format so that a format change fails here
+rather than in production.
 """
 
 import io
@@ -24,28 +24,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from conftest import synthetic_panel, synthetic_prices        # noqa: E402
 from trader import baseline, dataset, labels, model as model_mod, pipeline  # noqa: E402
-
-
-class StubClient:
-    """Records what it was asked to do and answers plausibly."""
-
-    def __init__(self):
-        self.uploaded = None
-        self.submitted = None
-
-    def upload_dataset(self, blob):
-        self.uploaded = blob
-        return "artifact-1"
-
-    def live_nodes(self, **kwargs):
-        return [{"node_id": "node-1"}]
-
-    def pick_node(self):
-        return "node-1"
-
-    def submit(self, **kwargs):
-        self.submitted = kwargs
-        return "task-1"
 
 
 @pytest.fixture
@@ -70,9 +48,9 @@ def panel_prices(monkeypatch):
 def make_bundle(feature_names, seed=0):
     """A real bundle, built from a locally trained network.
 
-    Assembled the way HelloWorldAi assembles one -- Linear/ReLU modules in the
-    manifest, weights as (out, in) -- so this exercises the actual loader
-    rather than a shape invented to satisfy it.
+    Assembled the way `trainer.pack_bundle` assembles one -- Linear/ReLU
+    modules in the manifest, weights as (out, in) -- so this exercises the
+    actual loader rather than a shape invented to satisfy it.
     """
     from safetensors.numpy import save
 
@@ -100,17 +78,13 @@ def make_bundle(feature_names, seed=0):
     return buffer.getvalue()
 
 
-# --- sending ---------------------------------------------------------------
+# --- running one ------------------------------------------------------------
 
 def test_a_run_records_its_cut_date_and_its_controls(runs_dir, panel_prices,
                                                      offline_spec):
-    client = StubClient()
-    run = pipeline.start(list(panel_prices), spec=offline_spec,
-                         client=client, folds=3)
+    run = pipeline.start(list(panel_prices), spec=offline_spec, folds=3)
 
-    assert run.status == "training"
-    assert run.task_id == "task-1"
-    assert client.uploaded, "nothing was sent"
+    assert run.status == "done"
 
     # The split has to be written down, or scoring cannot reproduce it.
     assert run.dataset["cut_date"]
@@ -122,16 +96,16 @@ def test_a_run_records_its_cut_date_and_its_controls(runs_dir, panel_prices,
     assert run.walk_forward["folds_run"] >= 2
 
 
-def test_only_training_rows_are_sent(runs_dir, panel_prices, offline_spec):
-    """The test half never leaves the machine. That is the whole claim."""
-    client = StubClient()
-    run = pipeline.start(list(panel_prices), spec=offline_spec, client=client,
+def test_only_training_rows_are_trained_on(runs_dir, panel_prices, offline_spec):
+    """The test half is never fitted on. That is the whole claim, and it used
+    to be about what left the machine; now nothing leaves it at all."""
+    run = pipeline.start(list(panel_prices), spec=offline_spec,
                          run_controls=False)
 
-    sent = np.load(io.BytesIO(client.uploaded), allow_pickle=False)
-    assert sent["x"].shape[0] == run.dataset["train"]["rows"]
-    assert sent["x"].shape[0] < run.dataset["train"]["rows"] \
-        + run.dataset["test"]["rows"]
+    assert run.dataset["train"]["rows"] > 0
+    assert run.dataset["test"]["rows"] > 0
+    # The split is a cut, not a sample: every row is on one side or the other.
+    assert run.dataset["train"]["to"] < run.dataset["test"]["from"]
 
 
 def test_a_symbol_that_cannot_be_split_is_named_in_the_run(runs_dir,
@@ -145,7 +119,7 @@ def test_a_symbol_that_cannot_be_split_is_named_in_the_run(runs_dir,
                         lambda symbols, **kwargs: {s: frames[s] for s in symbols
                                                    if s in frames})
 
-    run = pipeline.start(list(frames), spec=offline_spec, client=StubClient(),
+    run = pipeline.start(list(frames), spec=offline_spec,
                           run_controls=False)
 
     assert "NEWCOMER" in run.watchlist
@@ -157,7 +131,7 @@ def test_a_failure_is_recorded_rather_than_raised(runs_dir, offline_spec,
                                                  monkeypatch):
     monkeypatch.setattr(pipeline.prices_mod, "load_many",
                         lambda symbols, **kwargs: {})
-    run = pipeline.start(["AAA"], spec=offline_spec, client=StubClient())
+    run = pipeline.start(["AAA"], spec=offline_spec)
 
     assert run.status == "failed"
     assert run.error
@@ -176,7 +150,7 @@ def test_scoring_reuses_the_stored_cut_date(runs_dir, panel_prices,
     which moved by seven weeks and changed the symbol set.
     """
     run = pipeline.start(list(panel_prices), spec=offline_spec,
-                         client=StubClient(), run_controls=False)
+                         run_controls=False)
     stored_cut = run.dataset["cut_date"]
     advertised = run.dataset["test"]["rows"]
 
@@ -194,7 +168,7 @@ def test_a_run_without_a_cut_date_refuses_to_be_scored(runs_dir, panel_prices,
                                                       offline_spec):
     """Better to fail than to grade a model on a split it never saw."""
     run = pipeline.start(list(panel_prices), spec=offline_spec,
-                         client=StubClient(), run_controls=False)
+                         run_controls=False)
     with open(run.bundle_path, "wb") as handle:
         handle.write(make_bundle(run.dataset["feature_names"]))
 
@@ -211,7 +185,7 @@ def test_scoring_grades_only_the_symbols_that_trained(runs_dir, panel_prices,
     what was advertised either -- so they are dropped and the drift is recorded.
     """
     run = pipeline.start(list(panel_prices), spec=offline_spec,
-                         client=StubClient(), run_controls=False)
+                         run_controls=False)
     with open(run.bundle_path, "wb") as handle:
         handle.write(make_bundle(run.dataset["feature_names"]))
 
@@ -238,7 +212,7 @@ def test_todays_signals_go_through_the_same_assembly(runs_dir, panel_prices,
     the same column order, or the numbers are confident nonsense.
     """
     run = pipeline.start(list(panel_prices), spec=offline_spec,
-                         client=StubClient(), run_controls=False)
+                         run_controls=False)
     with open(run.bundle_path, "wb") as handle:
         handle.write(make_bundle(run.dataset["feature_names"]))
 
@@ -255,7 +229,7 @@ def test_an_ungated_model_produces_no_buys(runs_dir, panel_prices,
                                           offline_spec):
     """Every symbol reads 'still collecting data' until the gate opens."""
     run = pipeline.start(list(panel_prices), spec=offline_spec,
-                         client=StubClient(), run_controls=False)
+                         run_controls=False)
     with open(run.bundle_path, "wb") as handle:
         handle.write(make_bundle(run.dataset["feature_names"]))
 
@@ -285,165 +259,14 @@ def test_an_old_run_missing_new_fields_still_loads(runs_dir):
 def test_a_local_run_finishes_without_a_network(runs_dir, panel_prices,
                                                 offline_spec):
     """Nothing to wait for: about half a minute of numpy and it is scored."""
-    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="local",
-                         client=StubClient(), run_controls=False)
+    run = pipeline.start(list(panel_prices), spec=offline_spec,
+                         run_controls=False)
 
     assert run.status == "done"
-    assert run.task_id is None, "a local run should not have submitted anything"
-    assert run.primary == "local"
-    assert run.has_local_model and not run.has_model
+    assert run.has_model
     assert run.evaluation["rows"] > 0
     assert run.signals
 
-
-def test_a_remote_run_does_not_train_locally(runs_dir, panel_prices,
-                                             offline_spec):
-    run = pipeline.start(list(panel_prices), spec=offline_spec,
-                         backend="helloworld", client=StubClient(),
-                         run_controls=False)
-
-    assert run.status == "training"
-    assert run.task_id == "task-1"
-    assert not run.has_local_model
-
-
-def test_both_trains_here_and_submits_the_same_rows(runs_dir, panel_prices,
-                                                    offline_spec):
-    """The local half has to be scored before the remote one lands.
-
-    Otherwise the page is blank for the hour the job spends queued, and a round
-    trip that never returns is indistinguishable from one still running.
-    """
-    client = StubClient()
-    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="both",
-                         client=client, run_controls=False)
-
-    assert run.status == "training"
-    assert run.task_id == "task-1"
-    assert run.has_local_model
-    assert run.primary == "local", "the local model should carry the page"
-    assert run.local_evaluation["rows"] > 0
-    # And both halves got the same hyperparameters.
-    assert client.submitted["steps"] == run.dataset["hyperparameters"]["steps"]
-
-
-def test_when_the_remote_lands_it_becomes_the_subject(runs_dir, panel_prices,
-                                                      offline_spec):
-    from trader import trainer
-
-    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="both",
-                         client=StubClient(), run_controls=False)
-
-    # Stand in for the returned model with the same architecture on the same
-    # rows, differing only in seed -- which is what it should be.
-    splits, _, report = dataset.build_panel(panel_prices, offline_spec)
-    x, y, _ = dataset.combine(splits, report["feature_names"])
-    with open(run.bundle_path, "wb") as handle:
-        handle.write(trainer.train_local(
-            x, y, report["feature_names"],
-            trainer.Hyperparameters(steps=run.dataset["steps"], seed=11)))
-
-    pipeline._process(run)
-
-    assert run.primary == "helloworld"
-    assert run.local_evaluation["rows"] == run.evaluation["rows"]
-    assert run.comparison["gap"] is not None
-
-
-def test_the_comparison_is_scaled_by_the_noise_floor(runs_dir, panel_prices,
-                                                     offline_spec):
-    """"0.6 points" and "eight times what a seed can do" are different claims."""
-    from trader import trainer
-
-    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="both",
-                         client=StubClient(), run_controls=True, folds=3)
-
-    splits, _, report = dataset.build_panel(panel_prices, offline_spec)
-    x, y, _ = dataset.combine(splits, report["feature_names"])
-    with open(run.bundle_path, "wb") as handle:
-        handle.write(trainer.train_local(
-            x, y, report["feature_names"],
-            trainer.Hyperparameters(steps=run.dataset["steps"], seed=11)))
-
-    pipeline._process(run)
-
-    assert run.comparison["noise_floor"] == run.controls["noise_floor"]["spread"]
-    assert "multiples_of_noise" in run.comparison
-    assert run.comparison["reading"]
-
-
-def test_collect_leaves_a_local_run_alone(runs_dir, panel_prices, offline_spec):
-    """There is no task to poll for, and polling would invent one."""
-    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="local",
-                         client=StubClient(), run_controls=False)
-
-    class Exploding:
-        def job(self, task_id):
-            raise AssertionError("a local run must not be polled")
-
-    assert pipeline.collect(run, client=Exploding()).status == "done"
-
-
-def test_an_unknown_backend_is_refused(runs_dir, panel_prices, offline_spec):
-    with pytest.raises(ValueError, match="backend must be"):
-        pipeline.start(list(panel_prices), spec=offline_spec,
-                       backend="somewhere-else", client=StubClient())
-
-
-def test_a_remote_failure_does_not_discard_a_good_local_model(runs_dir,
-                                                              panel_prices,
-                                                              offline_spec):
-    """Measured the hard way: every HelloWorldAi node had been silent for
-    eight to eleven days, the submit returned 503, and a local run that had
-    already trained and scored was thrown away with it."""
-    class Unreachable(StubClient):
-        def live_nodes(self, **kwargs):
-            return []
-
-    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="both",
-                         client=Unreachable(), run_controls=False)
-
-    assert run.status == "done", "a usable local model was discarded"
-    assert run.primary == "local"
-    assert run.has_local_model
-    assert run.evaluation["rows"] > 0
-    assert run.signals
-    # The reason is recorded, and it is not the same field as a failed run.
-    assert "heartbeat" in run.remote_error
-    assert not run.error
-
-
-def test_a_remote_only_run_still_fails_when_the_network_is_down(runs_dir,
-                                                                panel_prices,
-                                                                offline_spec):
-    """There is nothing to fall back to, so it must not pretend otherwise."""
-    class Unreachable(StubClient):
-        def live_nodes(self, **kwargs):
-            return []
-
-    run = pipeline.start(list(panel_prices), spec=offline_spec,
-                         backend="helloworld", client=Unreachable(),
-                         run_controls=False)
-
-    assert run.status == "failed"
-    assert run.error
-
-
-def test_nothing_is_uploaded_when_no_node_is_alive(runs_dir, panel_prices,
-                                                   offline_spec):
-    """The dataset is eighty megabytes on a wide panel."""
-    class Watching(StubClient):
-        def live_nodes(self, **kwargs):
-            return []
-
-    client = Watching()
-    pipeline.start(list(panel_prices), spec=offline_spec, backend="both",
-                   client=client, run_controls=False)
-
-    assert client.uploaded is None, "pushed a dataset at a network with no nodes"
-
-
-# --- saying what it is doing, and admitting when it stopped -----------------
 
 def test_a_run_reports_progress_before_it_has_any_numbers(runs_dir,
                                                           panel_prices,
@@ -463,22 +286,22 @@ def test_a_run_reports_progress_before_it_has_any_numbers(runs_dir,
         return real_save(self, progress)
 
     monkeypatch.setattr(pipeline.Run, "save", watching)
-    pipeline.start(list(panel_prices), spec=offline_spec, backend="local",
-                   client=StubClient(), run_controls=False)
+    pipeline.start(list(panel_prices), spec=offline_spec,
+                   run_controls=False)
 
     stages = [p for p, _ in seen]
     assert any("fetching prices" in s for s in stages)
     assert any("building features" in s for s in stages)
     assert any("training rows" in s for s in stages)
-    assert any("training here" in s for s in stages)
+    assert any("training" in s for s in stages)
     # And the row count is known before the last stage, not only at the end.
     rows_at = [rows for p, rows in seen if "training rows" in p]
     assert rows_at and rows_at[0]
 
 
 def test_every_save_stamps_a_heartbeat(runs_dir, panel_prices, offline_spec):
-    run = pipeline.start(list(panel_prices), spec=offline_spec, backend="local",
-                         client=StubClient(), run_controls=False)
+    run = pipeline.start(list(panel_prices), spec=offline_spec,
+                         run_controls=False)
     assert run.heartbeat
     assert run.silent_for < 60
 
@@ -522,29 +345,12 @@ def test_a_run_that_is_still_working_is_left_alone(runs_dir):
     assert pipeline.list_runs()[0].status == "building"
 
 
-def test_a_submitted_run_is_never_reconciled_away(runs_dir):
-    """It has a job on somebody else's machine; only `collect` decides."""
-    import datetime as dt
-
-    stale = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=2)
-    directory = os.path.join(str(runs_dir), "20260101-000002")
-    os.makedirs(directory)
-    with open(os.path.join(directory, pipeline.STATE_FILE), "w",
-              encoding="utf-8") as handle:
-        json.dump({"run_id": "20260101-000002", "created": "2026-01-01T00:00:00",
-                   "watchlist": ["AAA"], "horizon": 1, "status": "training",
-                   "task_id": "task-abc",
-                   "heartbeat": stale.isoformat(timespec="seconds")}, handle)
-
-    assert pipeline.list_runs()[0].status == "training"
-
-
 def test_the_app_loads_its_own_environment():
-    """Started through uvicorn directly, the page could not reach HelloWorldAi.
+    """Started through uvicorn directly, the page read none of its settings.
 
-    `run.py` read env/.env; a launch config running `uvicorn trader.web.app:app`
-    did not, so every run started from the button failed with "No submitter
-    key" while the identical run from the command line worked.
+    `run.py` loads env/.env; a launch config running `uvicorn trader.web.app:app`
+    did not, so a run started from the button ignored TRADER_UNIVERSE and the
+    cache paths while the identical run from the command line honoured them.
     """
     import importlib
 
@@ -560,7 +366,7 @@ def test_a_feature_that_can_no_longer_be_built_refuses_scoring_by_name(
     block. A run trained on one of them must say so, not fail on a shape
     mismatch three calls later or be scored on a column that was invented."""
     run = pipeline.start(list(panel_prices), spec=offline_spec,
-                         client=StubClient(), run_controls=False)
+                         run_controls=False)
     with open(run.bundle_path, "wb") as handle:
         handle.write(make_bundle(run.dataset["feature_names"]))
 
@@ -578,3 +384,58 @@ def test_a_feature_that_can_no_longer_be_built_refuses_scoring_by_name(
         pipeline._process(run)
     assert lost in str(refused.value)
     assert "2026-07-17" in str(refused.value)
+
+
+# --- the pages, against the Run they actually read -----------------------------
+#
+# Removing the remote trainer removed four fields from Run, and two endpoints
+# went on reading them. Nothing failed: no test had a saved run on disk when it
+# called the pages, so the list comprehension never ran a single iteration and
+# /api/runs returned an empty list instead of raising. In the real data
+# directory it raised AttributeError and the runs page rendered blank.
+#
+# So these two check the join between the pages and the record, which is the
+# seam a field removal breaks and the one nothing else was watching.
+
+def test_every_field_the_pages_read_exists_on_a_run():
+    """A static check, because the dynamic one needs a run and a server."""
+    import ast
+    import dataclasses
+
+    from trader.web import app as web_app
+
+    known = {field.name for field in dataclasses.fields(pipeline.Run)}
+    known |= {name for name in dir(pipeline.Run) if not name.startswith("__")}
+
+    tree = ast.parse(open(web_app.__file__, encoding="utf-8").read())
+    missing = sorted({
+        f"{node.lineno}: {node.value.id}.{node.attr}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id in ("r", "run")
+        and node.attr not in known
+    })
+    assert not missing, f"the pages read fields Run does not have: {missing}"
+
+
+def test_the_pages_serve_a_real_run(runs_dir, panel_prices, offline_spec,
+                                   monkeypatch):
+    """With a run on disk, every read endpoint answers rather than raising."""
+    from starlette.testclient import TestClient
+
+    from trader.web import app as web_app
+
+    run = pipeline.start(list(panel_prices), spec=offline_spec,
+                         run_controls=False)
+    assert run.status == "done"
+
+    client = TestClient(web_app.app)
+
+    listed = client.get("/api/runs")
+    assert listed.status_code == 200
+    assert listed.json()[0]["run_id"] == run.run_id
+
+    analysis = client.get("/api/analysis")
+    assert analysis.status_code == 200
+    assert analysis.json()["run"]["run_id"] == run.run_id

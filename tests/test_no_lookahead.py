@@ -344,7 +344,7 @@ def test_the_scaler_never_sees_the_test_period(panel, offline_spec):
 
 
 def test_pooled_rows_leave_in_date_order(panel, offline_spec):
-    """The coordinator holds back the last 20%; it has to be the last 20%."""
+    """The trainer holds back the last 20%; it has to be the last 20%."""
     splits, _, report = dataset.build_panel(panel, offline_spec)
 
     dates = np.concatenate([s.train_dates.values for s in splits])
@@ -371,24 +371,6 @@ def test_a_constant_feature_does_not_become_infinity():
                             feature_names=["flat", "moving"])
     out = scaler.apply(np.array([[1.0, 2.0], [1.0, 3.0]], dtype=np.float32))
     assert np.isfinite(out).all()
-
-
-def test_the_packed_dataset_is_loadable_without_unpickling(panel, offline_spec):
-    import io
-
-    splits, _, report = dataset.build_panel(panel, offline_spec)
-    x, y, _ = dataset.combine(splits, report["feature_names"])
-    blob = dataset.pack_for_helloworld(x, y)
-
-    loaded = np.load(io.BytesIO(blob), allow_pickle=False)
-    assert loaded["x"].shape[0] == loaded["y"].shape[0]
-    assert loaded["x"].dtype == np.float32
-
-
-def test_it_refuses_to_send_nothing():
-    with pytest.raises(ValueError):
-        dataset.pack_for_helloworld(np.zeros((0, 3), dtype=np.float32),
-                                    np.zeros((0,), dtype=np.int64))
 
 
 def test_the_description_reports_the_baseline_and_what_was_excluded(

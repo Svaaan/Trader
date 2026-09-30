@@ -38,7 +38,7 @@ row and a real number for today, which is not a feature, it is a date stamp.
 block until it clears MIN_HISTORY_DAYS, and says so rather than quietly
 including it.
 
-Start the collector now -- `python watch.py --news` appends on every pass -- and
+Start the collector now -- `python auto.py` appends on every cycle -- and
 the block becomes usable in a year. That is the real cost of doing this
 honestly, and it is worth knowing before building rather than after.
 """

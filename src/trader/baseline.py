@@ -19,11 +19,11 @@ trust gate measures against.
 scaler. If the network does not beat this, the non-linearity is not buying
 anything and the honest description of the result is "a linear model, slowly".
 
-**A local MLP of the same shape.** Same width and depth as the job that goes to
-HelloWorldAi. If the remote model scores meaningfully *worse* than this, the
-problem is in the round trip -- placement, hyperparameters, the holdout it
-carves out -- rather than in the data. That is a question worth being able to
-answer, and before this there was no way to ask it.
+**A second MLP of the same shape, on a different seed.** Same width, depth and
+step count as the model being graded. Two fits of the same architecture on the
+same rows land some distance apart for no reason but initialisation, and that
+distance is the noise floor: an edge smaller than it is a seed, not a signal.
+There is no way to read a single model's edge without it.
 
 And two things the controls make possible that a single model cannot:
 
@@ -171,7 +171,7 @@ def fit_logistic(x: np.ndarray, y: np.ndarray, *, epochs: int = 600,
 
 @dataclasses.dataclass
 class MLP:
-    """The same shape as the job that goes to HelloWorldAi, run here."""
+    """The network the controls fit: the same shape as the model on trial."""
 
     layers: list
     # Where early stopping settled, and what it settled on. Recorded so that a
@@ -249,12 +249,11 @@ def fit_mlp(x: np.ndarray, y: np.ndarray, *, hidden: int = 64, depth: int = 2,
     network dies: see `network_health` for what that means and how it was
     found. Raising it is not a free knob -- check the health report.
 
-    Counted in **gradient steps, not epochs**, because that is how the job
-    submitted to HelloWorldAi is counted -- `steps=4000, batch_size=64`. Passing
-    the same numbers means the local control does the same amount of learning as
-    the remote model rather than an amount that happens to depend on how many
-    symbols are in the panel. Two consequences, both wanted: the comparison is
-    fair, and a run on 240 symbols costs the same as one on 10 instead of
+    Counted in **gradient steps, not epochs** -- `steps=4000, batch_size=64`.
+    A control and the model it is a control for then do the same amount of
+    learning, rather than an amount that happens to depend on how many symbols
+    are in the panel. Two consequences, both wanted: the comparison is fair,
+    and a run on 240 symbols costs the same as one on 10 instead of
     twenty-four times as much. Epoch-counting made the controls take minutes on
     a wide panel, which is long enough that somebody would turn them off.
 
@@ -445,8 +444,8 @@ def run_controls(splits, feature_names, *, hidden: int = 64, depth: int = 2,
                  seeds: int = 3) -> dict:
     """Fit every control on the training half and score it out of time.
 
-    `hidden`, `depth`, `steps` and `batch` should be exactly what is being sent
-    to HelloWorldAi -- pipeline passes them through. A control trained for a
+    `hidden`, `depth`, `steps` and `batch` should be exactly what the model on
+    trial was given -- pipeline passes them through. A control trained for a
     different length than the model it is a control for is not answering the
     question.
 

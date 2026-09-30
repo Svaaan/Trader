@@ -2,7 +2,7 @@
 
     python run.py
 
-Reads env/.env for TRADER_SUBMITTER_KEY and the coordinator address.
+Reads env/.env, then serves the pages on http://127.0.0.1:8600.
 """
 import os
 import sys

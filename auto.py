@@ -2,7 +2,6 @@
 
     python auto.py                          # check every 30 minutes until Ctrl+C
     python auto.py --interval 120           # every two hours
-    python auto.py --backend both           # train here and on HelloWorldAi
     python auto.py --once                   # one cycle, for Task Scheduler or cron
     python auto.py --stop                   # stop a loop running anywhere else
     python auto.py --status                 # what it is doing
@@ -12,9 +11,9 @@ stop and waits for the cycle in flight to finish.
 
 It trains when a session has closed since the last time it trained, and not
 otherwise -- see src/trader/auto.py for why re-running the same configuration on
-unchanged rows is not free. Every cycle collects anything HelloWorldAi has
-finished and settles the paper positions whose session has now happened, which
-is the part that genuinely wants a schedule.
+unchanged rows is not free. The rest of the cycle is the part that genuinely
+wants a schedule and runs every time: collect news, advance the books whose
+session has now happened, step the challenger contest, and write the briefing.
 """
 
 import argparse
@@ -29,7 +28,7 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "env", ".env"))
 
-from trader import auto, trainer, universe                  # noqa: E402
+from trader import auto, universe                           # noqa: E402
 
 logger = logging.getLogger("auto")
 
@@ -43,9 +42,8 @@ def describe(state: dict) -> str:
     did = (f"failed: {last['error']}" if last.get("error")
            else f"trained {last['trained']}" if last.get("trained")
            else last.get("skipped") or "starting")
-    return (f"Auto-training is on ({state.get('backend')}, every "
-            f"{state.get('interval_minutes')} min), {state.get('cycles', 0)} "
-            f"cycle(s) so far. Last: {did}")
+    return (f"Auto-training is on (every {state.get('interval_minutes')} min), "
+            f"{state.get('cycles', 0)} cycle(s) so far. Last: {did}")
 
 
 def main() -> int:
@@ -55,9 +53,6 @@ def main() -> int:
     parser.add_argument("--interval", type=float,
                         default=auto.DEFAULT_INTERVAL_MINUTES,
                         help="minutes between checks (default: %(default)s)")
-    parser.add_argument("--backend", default=trainer.LOCAL,
-                        choices=list(trainer.BACKENDS),
-                        help="where to train (default: %(default)s)")
     parser.add_argument("--universe", default=None,
                         help=f"one of {sorted(universe.TIERS)}")
     parser.add_argument("--once", action="store_true",
@@ -85,14 +80,13 @@ def main() -> int:
     watchlist = universe.resolve(args.universe) if args.universe else None
 
     if args.once:
-        done = auto.cycle(backend=args.backend, watchlist=watchlist,
+        done = auto.cycle(watchlist=watchlist,
                           trained_for=auto.state().get("trained_for"),
                           force=args.force)
         print(json.dumps(done, indent=2))
         return 0
 
-    auto.start(interval_minutes=args.interval, backend=args.backend,
-               watchlist=watchlist)
+    auto.start(interval_minutes=args.interval, watchlist=watchlist)
     print(describe(auto.state()))
     print("Ctrl+C to stop; the cycle in flight finishes first.")
 

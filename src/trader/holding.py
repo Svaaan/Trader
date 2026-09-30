@@ -179,12 +179,35 @@ def _path() -> str:
     return os.path.join(os.path.abspath(STORE_DIR), STORE_FILE)
 
 
+_cache: dict = {}
+
+
 def _read() -> list:
+    """The whole record, parsed once per version of the file.
+
+    Stepping a contest of N books read the file N times per cycle, and every
+    state() inside that read it again. The cache is keyed on what the file
+    actually is -- its size and modification time -- so an append by any
+    process invalidates it, and nothing here can serve a stale record.
+    """
+    path = _path()
     try:
-        with open(_path(), encoding="utf-8") as handle:
-            return [json.loads(line) for line in handle if line.strip()]
+        stat = os.stat(path)
+    except OSError:
+        return []
+
+    signature = (path, stat.st_mtime_ns, stat.st_size)
+    if _cache.get("signature") == signature:
+        return _cache["lines"]
+
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = [json.loads(line) for line in handle if line.strip()]
     except (OSError, ValueError):
         return []
+
+    _cache["signature"], _cache["lines"] = signature, lines
+    return lines
 
 
 def _append(entry: dict, *, book_id: str = CHAMPION) -> dict:
@@ -208,6 +231,7 @@ def state(book_id: str = CHAMPION) -> dict:
     account, so their records are comparable without unpicking a shared one.
     """
     cash, plan, holding, closed, watched = STARTING_CASH, None, None, [], None
+    marked = None
 
     for entry in _lines(book_id):
         if "plan" in entry:
@@ -216,6 +240,8 @@ def state(book_id: str = CHAMPION) -> dict:
             holding = entry["fill"]
             cash = entry["fill"]["cash_after"]
             plan = None
+        elif "mark" in entry:
+            marked = entry["mark"]["session"]
         elif "watch" in entry:
             watched = entry["watch"]
         elif "renew" in entry:
@@ -231,7 +257,63 @@ def state(book_id: str = CHAMPION) -> dict:
             watched = None
 
     return {"cash": cash, "plan": plan, "holding": holding, "closed": closed,
-            "watch": watched}
+            "watch": watched, "marked": marked}
+
+
+def mark(frames: dict, *, book_id: str = CHAMPION, today=None) -> dict | None:
+    """Write down what this book is worth today. Once per session, per book.
+
+    A book reviewed every sixty sessions closes four decisions a year, so a
+    contest judged on closed decisions needs two years to say anything. But
+    every session is already out-of-sample for every book -- the mark is
+    written before the next day exists, which is the same property that makes
+    the rest of this record un-mineable. Marking daily turns four observations
+    a year into two hundred and fifty, and lets the difference between two
+    books be tested while anybody still cares.
+    """
+    current = state(book_id)
+    holding = current["holding"]
+
+    session = None
+    worth = current["cash"]
+    if holding:
+        for bought in holding["bought"]:
+            frame = frames.get(bought["symbol"])
+            if frame is None or not len(frame):
+                return None
+            index = frame.index
+            if today is not None:
+                index = index[index <= pd.Timestamp(today)]
+                if not len(index):
+                    return None
+            session = index[-1] if session is None else min(session, index[-1])
+            worth += bought["shares"] * float(frame["close"].loc[index[-1]])
+    else:
+        # In cash, so the mark rides whatever calendar the others are on.
+        for frame in frames.values():
+            if frame is not None and len(frame):
+                index = frame.index
+                if today is not None:
+                    index = index[index <= pd.Timestamp(today)]
+                if len(index):
+                    session = index[-1] if session is None else session
+                    break
+
+    if session is None:
+        return None
+
+    stamp = pd.Timestamp(session).date().isoformat()
+    if current.get("marked") == stamp:
+        return None
+
+    entry = {"mark": {"session": stamp, "equity": round(worth, 4),
+                      "holding": [b["symbol"] for b in (holding or {}).get("bought", [])]}}
+    return _append(entry, book_id=book_id)["mark"]
+
+
+def marks(book_id: str = CHAMPION) -> list:
+    """The daily worth of one book, oldest first."""
+    return [entry["mark"] for entry in _lines(book_id) if "mark" in entry]
 
 
 def _sessions_between(frames: dict, symbol: str, start, end) -> int:
@@ -461,8 +543,11 @@ def advance_all(frames: dict, *, run=None, today=None) -> dict:
     The champion and the challengers see exactly the same prices and the same
     model on the same day; what differs is only what each does about it.
     """
-    return {book_id: advance(frames, today=today, run=run, book_id=book_id)
-            for book_id in books()}
+    stepped = {}
+    for book_id in books():
+        stepped[book_id] = advance(frames, today=today, run=run, book_id=book_id)
+        mark(frames, book_id=book_id, today=today)
+    return stepped
 
 
 def plan_all(run, *, today=None) -> dict:

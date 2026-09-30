@@ -1,31 +1,18 @@
-"""The whole loop: build a dataset, send it, wait, collect, evaluate, signal.
+"""The whole loop: build a dataset, train on it, score it, and say something.
 
-A *run* is one pass through that, and it lives in a directory under data/runs
-with everything needed to explain itself afterwards: what went in, what came
-back, and how it scored. Nothing is held only in memory, because the interesting
-part happens minutes or hours after the submit and the answer to "what did it do
-and why" has to survive a restart.
+One pass, one machine, synchronous: fetch prices, build features, cut the panel
+once, train here, score on rows the model never saw, run the controls, and hand
+the result to the gate. A run finishes before `start` returns.
 
-Two things happen before anything is sent, and both exist because of what the
-project measured about itself:
+It used to do this twice -- once here and once on a rented GPU through
+HelloWorldAi -- so the two could be compared. That comparison is over: the
+network is 7,233 parameters and a logistic regression matches it, so the round
+trip was paying for a difference that was not there. What is left is the half
+that was doing the work.
 
-**The local controls run first.** A majority-class model, a logistic regression
-and a small MLP trained with exactly the hyperparameters about to be submitted,
-all on the same rows. Nine models were once trained on a GPU across a network
-and compared only against the class balance -- a linear model would have scored
-the same, and nobody could have known. Their scores go into the run so that the
-returned model is always read next to something.
-
-**The cut date is chosen once and written down.** Scoring passes it back rather
-than re-deriving it. Re-deriving it moved the split by seven weeks, graded 87
-rows the run never advertised, and quietly added a symbol to the test set that
-had been missing from training.
-
-The hand-off from HelloWorldAi is a poll, not a callback. The coordinator has no
-way to call back into this project -- and a webhook would mean exposing a port
-from a laptop, which is a worse trade than asking every thirty seconds.
-`collect` is safe to call repeatedly; it picks up whatever has finished since
-the last time and leaves the rest alone.
+**The test half never leaves this machine**, and never did. The split is made
+once, carried, and reused for scoring -- see dataset.py for what re-deriving it
+costs.
 """
 
 from __future__ import annotations
@@ -48,6 +35,7 @@ from . import features as features_mod
 from . import labels as labels_mod
 from . import model as model_mod
 from . import news as news_mod
+from . import briefing as briefing_mod
 from . import challenge as challenge_mod
 from . import holding as holding_mod
 from . import promote as promote_mod
@@ -55,7 +43,6 @@ from . import paper as paper_mod
 from . import prices as prices_mod
 from . import trainer as trainer_mod
 from . import universe as universe_mod
-from .helloworld import Client, HelloWorldError
 
 logger = logging.getLogger(__name__)
 
@@ -103,18 +90,11 @@ def steps_for(rows: int, *, epochs: int = TARGET_EPOCHS,
     and it is why "train for longer" and "loop until it is smarter" have the
     same answer.
 
-    The number still matters for the remote backend, which does its own
-    training and does not stop itself.
-
     Floored, because a very small panel still needs enough steps to converge,
-    and capped so that a very wide one does not queue on somebody's GPU for a
-    day.
-
-    Worth knowing before the first wide submission: this asks for roughly twenty
-    times the old fixed 4,000 on a 240-symbol panel. Locally that costs nothing,
-    because training stops when it stops helping; remotely it is a real request
-    of somebody else's machine, and a coordinator with a per-job ceiling may
-    refuse it. Pass `steps=` explicitly to override.
+    and capped so that a very wide one cannot run away. Early stopping makes
+    the ceiling cheap: on a 240-symbol panel this allows roughly twenty times
+    the old fixed 4,000 and the fit uses a fraction of it. Pass `steps=`
+    explicitly to override.
     """
     return int(min(max(epochs * max(rows, 1) // batch, MIN_STEPS), 200_000))
 
@@ -143,25 +123,12 @@ class Run:
     created: str
     watchlist: list
     horizon: int
-    task_id: Optional[str] = None
     status: str = "building"
-    # Which trainer produced the headline numbers, and which were asked for.
-    backend: str = trainer_mod.HELLOWORLD
-    primary: str = ""
     spec: dict = dataclasses.field(default_factory=dict)
     dataset: dict = dataclasses.field(default_factory=dict)
-    verification: dict = dataclasses.field(default_factory=dict)
     evaluation: dict = dataclasses.field(default_factory=dict)
     controls: dict = dataclasses.field(default_factory=dict)
     walk_forward: dict = dataclasses.field(default_factory=dict)
-    # The local reference model, when one was trained. Kept beside rather than
-    # inside `evaluation`, because the pair is the point -- see trainer.py.
-    local_evaluation: dict = dataclasses.field(default_factory=dict)
-    local_verdict: str = ""
-    comparison: dict = dataclasses.field(default_factory=dict)
-    # Why the remote half did not happen, when the local half still did. Kept
-    # separate from `error`, which means the whole run failed.
-    remote_error: str = ""
     # What it is doing right now, and when it last said so. A run used to save
     # once at creation and then not again until the controls had finished, so
     # for five minutes the page showed "Building dataset" over four zeros --
@@ -218,27 +185,26 @@ class Run:
 
     @property
     def bundle_path(self) -> str:
-        return os.path.join(_run_dir(self.run_id), BUNDLE_FILE)
+        path = os.path.join(_run_dir(self.run_id), BUNDLE_FILE)
+        # Runs from when there were two trainers kept theirs under the other
+        # name; they still load.
+        if not os.path.exists(path) and os.path.exists(self.local_bundle_path):
+            return self.local_bundle_path
+        return path
 
     @property
     def local_bundle_path(self) -> str:
+        """Where runs trained before the remote half was removed kept theirs."""
         return os.path.join(_run_dir(self.run_id), LOCAL_BUNDLE_FILE)
 
     @property
     def has_model(self) -> bool:
-        return os.path.exists(self.bundle_path)
+        return os.path.exists(self.bundle_path) or os.path.exists(
+            self.local_bundle_path)
 
     @property
     def has_local_model(self) -> bool:
         return os.path.exists(self.local_bundle_path)
-
-    @property
-    def wants_remote(self) -> bool:
-        return self.backend in (trainer_mod.HELLOWORLD, trainer_mod.BOTH)
-
-    @property
-    def wants_local(self) -> bool:
-        return self.backend in (trainer_mod.LOCAL, trainer_mod.BOTH)
 
     @property
     def cut_date(self) -> Optional[pd.Timestamp]:
@@ -264,12 +230,9 @@ def reconcile(runs: list) -> list:
     from one that is genuinely working. Measured: restarting the preview server
     mid-run left exactly that, permanently.
 
-    Only runs with no task id are reconciled here. One that reached HelloWorldAi
-    has a job that may well outlive this process, and `collect` is what decides
-    its fate.
     """
     for run in runs:
-        if run.status in ("done", "failed") or run.task_id:
+        if run.status in ("done", "failed"):
             continue
         if run.silent_for <= STALE_RUN_SECONDS:
             continue
@@ -279,7 +242,7 @@ def reconcile(runs: list) -> list:
             f"Abandoned. Nothing was written for "
             f"{run.silent_for / 60:.0f} minutes while it was "
             f"{run.progress or 'starting'}, so the process that was running it "
-            f"is gone. Nothing was submitted anywhere; start another.")
+            f"is gone. Start another.")
         logger.warning("Run %s looks abandoned; marking it failed", run.run_id)
         run.save()
 
@@ -302,21 +265,20 @@ def list_runs() -> list:
     return reconcile(runs)
 
 
-# --- sending ---------------------------------------------------------------
+# --- running one -----------------------------------------------------------
 
 def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
           period: str = "10y", test_fraction: float = 0.2,
           target: str = labels_mod.RELATIVE,
           spec: dataset_mod.Spec | None = None,
-          backend: str = trainer_mod.BOTH,
-          steps: int | None = None, client: Client | None = None,
+          steps: int | None = None,
           run_controls: bool = True, folds: int = 6) -> Run:
-    """Build a dataset from live prices and train a model on it.
+    """Build a dataset from live prices, train on it, and score what comes out.
 
-    The test half never leaves this machine. HelloWorldAi gets the training rows
-    only, so the score this project reports is measured on data no model in the
-    chain has ever seen -- including through the coordinator's own verification,
-    which holds back a random slice of whatever it is given.
+    Synchronous: the run is finished when this returns. Training a 7,233
+    parameter network on a few hundred thousand rows is about a minute of
+    numpy, which is why the remote trainer this used to have was not worth its
+    round trip.
 
     Pass `spec` to choose which feature blocks go in -- switching one off and
     re-running is how its contribution gets measured rather than assumed. The
@@ -326,24 +288,7 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
     A fixed step count is a fixed number of *samples*, which is a shrinking
     number of passes as the panel widens, and an undertrained model looks
     exactly like a model with nothing to learn.
-
-    `backend` chooses where the training happens:
-
-      "helloworld"  upload, submit, poll, download -- the original path
-      "local"       train here in numpy, about half a minute, no network
-      "both"        do both on the same rows and compare them
-
-    "both" is the one worth running. The two get identical rows and identical
-    hyperparameters, so any gap between their scores is a fact about the round
-    trip rather than about the data -- see trainer.py. A local-only run finishes
-    before this function returns; anything involving HelloWorldAi comes back
-    "training" and is picked up by `collect`.
     """
-    if backend not in trainer_mod.BACKENDS:
-        raise ValueError(
-            f"backend must be one of {trainer_mod.BACKENDS}, not {backend!r}")
-
-    client = client or Client()
     symbols = universe_mod.resolve(watchlist) if watchlist else default_watchlist()
 
     run_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -352,8 +297,7 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
 
     run = Run(run_id=run_id,
               created=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-              watchlist=symbols, horizon=horizon, spec=spec.to_dict(),
-              backend=backend)
+              watchlist=symbols, horizon=horizon, spec=spec.to_dict())
     run.save(f"queued: {len(symbols)} symbols")
 
     try:
@@ -401,89 +345,20 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
             hidden=64, depth=2, steps=training_steps, batch=BATCH_SIZE)
         description["hyperparameters"] = hyper.to_dict()
 
-        # --- train here, if asked ------------------------------------------
-        #
-        # Done first, and synchronously. It takes about half a minute, so a
-        # `both` run has a scored model before the submit has finished
-        # uploading -- which means the page has something to show during the
-        # hour the remote job spends queued, and means a broken round trip is
-        # visible as a gap rather than as an absence.
-        if run.wants_local:
-            run.save(f"training here: {training_steps:,} steps at most")
-            bundle = trainer_mod.train_local(
-                x_train, y_train, report["feature_names"], hyper)
-            with open(run.local_bundle_path, "wb") as handle:
-                handle.write(bundle)
-            logger.info("Run %s: trained locally (%d bytes)", run_id, len(bundle))
+        # --- train ---------------------------------------------------------
+        run.save(f"training: {training_steps:,} steps at most")
+        bundle = trainer_mod.train_local(
+            x_train, y_train, report["feature_names"], hyper)
+        with open(run.bundle_path, "wb") as handle:
+            handle.write(bundle)
+        logger.info("Run %s: trained (%d bytes)", run_id, len(bundle))
 
-        # --- and send it, if asked -----------------------------------------
-        #
-        # In its own try. A `both` run that trained here successfully and then
-        # could not reach the coordinator has a finished model, and throwing it
-        # away because somebody else's network is down is the wrong trade --
-        # especially since the remote half is the optional one. Measured the
-        # hard way: every node had been silent for eight to eleven days, the
-        # submit returned 503, and a perfectly good local run was discarded.
-        submitted = False
-        if run.wants_remote:
-            try:
-                run.save("looking for a live HelloWorldAi node")
-                # Ask before uploading. The dataset is eighty megabytes on a
-                # wide panel, and pushing it to a coordinator with nothing
-                # behind it wastes the upload and the time.
-                live = client.live_nodes()
-                if not live:
-                    raise HelloWorldError(
-                        "no node has reported a heartbeat recently, so there "
-                        "is nothing to train on")
-
-                blob = dataset_mod.pack_for_helloworld(x_train, y_train)
-                description["bytes_sent"] = len(blob)
-
-                artifact_id = client.upload_dataset(blob)
-
-                # Choose the machine rather than letting the coordinator choose
-                # on a flag that goes stale -- see Client.pick_node. None falls
-                # back to its placement, which is right when every node is
-                # reporting normally.
-                node_id = client.pick_node()
-                description["node_id"] = node_id
-
-                run.task_id = client.submit(
-                    dataset_id=artifact_id,
-                    model_name=f"trader-{run_id}",
-                    steps=training_steps,
-                    batch_size=BATCH_SIZE,
-                    hidden_dim=64,
-                    depth=2,
-                    node_id=node_id,
-                )
-                submitted = True
-                logger.info("Run %s submitted as %s", run_id, run.task_id)
-
-            except Exception as exc:                    # noqa: BLE001
-                run.remote_error = str(exc)
-                if not run.wants_local:
-                    raise
-                logger.warning(
-                    "Run %s could not reach HelloWorldAi (%s); keeping the "
-                    "local model", run_id, exc)
-
-        if run.wants_local:
-            # Score the local model now. When a remote job is queued this is
-            # what makes the page readable during the wait; when the remote
-            # half failed or was not asked for, it is the run.
-            run.save("scoring out of time")
-            _process(run)
-            run.status = "training" if submitted else "done"
-            run.progress = ("waiting for HelloWorldAi" if submitted
-                            else "finished")
-            if not submitted:
-                record_paper(run)
-                follow_book(run)
-                logger.info("Run %s finished locally: %s", run_id, run.verdict)
-        elif submitted:
-            run.status = "training"
+        run.save("scoring out of time")
+        _process(run)
+        run.status = "done"
+        run.progress = "finished"
+        follow_book(run)
+        logger.info("Run %s finished: %s", run_id, run.verdict)
 
     except Exception as exc:                            # noqa: BLE001
         run.status = "failed"
@@ -496,85 +371,18 @@ def start(watchlist: Sequence[str] | None = None, *, horizon: int = 1,
 
 # --- collecting ------------------------------------------------------------
 
-def collect(run: Run, *, client: Client | None = None) -> Run:
-    """Fetch and process the remote model if the job has finished.
+def collect_all(**_ignored) -> list:
+    """Kept because the page still calls it on its timer.
 
-    Safe to repeat. A run with no remote half has nothing here to wait for --
-    it was finished by `start` -- so it is left alone rather than being polled
-    for a task that does not exist.
+    There is nothing to collect: training happens here and finishes before
+    `start` returns. What this still does is notice a run whose process died
+    mid-build, so the page shows "abandoned" rather than "building" for ever.
     """
-    if run.status in ("done", "failed") or not run.task_id:
-        return run
+    return reconcile(list_runs())
 
-    client = client or Client()
-
-    try:
-        job = client.job(run.task_id)
-    except HelloWorldError as exc:
-        logger.warning("Could not check %s: %s", run.task_id, exc)
-        return run
-
-    if job is None:
-        run.status = "failed"
-        run.error = f"{run.task_id} is not in this key's job list any more"
-        run.save()
-        return run
-
-    run.status = {"pending": "queued", "running": "training"}.get(job.status, job.status)
-    run.verification = job.verification
-
-    if not job.finished:
-        run.save()
-        return run
-
-    if not job.succeeded:
-        run.status = "failed"
-        run.error = (job.raw.get("result") or job.raw.get("error")
-                     or f"the job ended as {job.status}")
-        run.save()
-        return run
-
-    try:
-        blob = client.download_bundle(run.task_id)
-        with open(run.bundle_path, "wb") as handle:
-            handle.write(blob)
-        logger.info("Run %s: model saved (%d bytes)", run.run_id, len(blob))
-
-        _process(run)
-        run.status = "done"
-        record_paper(run)
-        follow_book(run)
-
-    except Exception as exc:                            # noqa: BLE001
-        run.status = "failed"
-        run.error = f"the model came back but could not be used: {exc}"
-        logger.exception("Run %s failed after download", run.run_id)
-
-    run.save()
-    return run
-
-
-def collect_all(*, client: Client | None = None) -> list:
-    """One pass over every unfinished run. What the watcher calls."""
-    client = client or Client()
-    return [collect(run, client=client) for run in list_runs()
-            if run.status not in ("done", "failed")]
-
-
-# --- what to do with a finished model --------------------------------------
 
 def _process(run: Run) -> None:
-    """Score whatever models this run has, out of time, on one rebuild.
-
-    A run can hold two: the one HelloWorldAi returned and the one trained here
-    on the same rows with the same hyperparameters. Both go through the same
-    loader, the same forward pass and the same evaluator, because the only way
-    the comparison between them means anything is if nothing else differs.
-
-    The headline numbers describe the *remote* model when there is one -- it is
-    the thing under test -- and the local one otherwise, so that a `both` run is
-    readable during the hour it spends waiting rather than blank.
-    """
+    """Score the run's model out of time, on one rebuild of its own split."""
     scaler = dataset_mod.Scaler.from_dict(run.dataset["scaler"])
     spec = dataset_mod.Spec.from_dict(run.spec or {})
 
@@ -630,44 +438,18 @@ def _process(run: Run) -> None:
     x_test = test.x
     train_up_share = (run.dataset.get("train") or {}).get("up_share")
 
-    def score(path: str) -> tuple:
-        model = model_mod.load_bundle_file(path)
-        probabilities = model.probabilities(test.x)[:, 1]
-        result = evaluate_mod.evaluate(
-            probabilities, test.y, test.returns, test.dates, test.symbols,
-            executable_returns=test.executable,
-            train_up_share=train_up_share, horizon=test.horizon)
-        return model, result
-
-    # --- the local reference, when there is one ---
-    local_model = None
-    if run.has_local_model:
-        local_model, local_result = score(run.local_bundle_path)
-        run.local_evaluation = local_result.to_dict()
-        run.local_verdict = evaluate_mod.verdict(local_result)
-
-    # --- the model under test ---
-    if run.has_model:
-        model, result = score(run.bundle_path)
-        run.primary = trainer_mod.HELLOWORLD
-    elif local_model is not None:
-        model, result = local_model, local_result
-        run.primary = trainer_mod.LOCAL
-    else:
+    if not run.has_model:
         raise ValueError("this run has no model to score")
+
+    model = model_mod.load_bundle_file(run.bundle_path)
+    probabilities = model.probabilities(test.x)[:, 1]
+    result = evaluate_mod.evaluate(
+        probabilities, test.y, test.returns, test.dates, test.symbols,
+        executable_returns=test.executable,
+        train_up_share=train_up_share, horizon=test.horizon)
 
     run.evaluation = result.to_dict()
     run.verdict = evaluate_mod.verdict(result)
-
-    # --- what the gap between them means -------------------------------------
-    #
-    # Same architecture, same rows, same hyperparameters: the only thing that
-    # should separate them is the seed, and the noise floor is how much that is
-    # worth. Anything larger is the round trip doing something.
-    if run.has_model and run.local_evaluation:
-        run.comparison = trainer_mod.compare(
-            run.local_evaluation, run.evaluation,
-            noise_floor=(run.controls.get("noise_floor") or {}).get("spread"))
 
     # Whether anything below is worth printing. Decided once, from the
     # out-of-time score, the noise floor and the walk-forward.
@@ -759,7 +541,12 @@ def _todays_signals(model, scaler, frames: dict, spec, trust=None) -> list:
 # --- the news store --------------------------------------------------------
 
 def record_paper(run: Run, *, top_n: int | None = None) -> dict | None:
-    """Write what this run intends to do into the forward ledger.
+    """Write what this run intends to do into the day-trade ledger.
+
+    **No longer called.** That ledger records a book of 238 names rebalanced
+    every session, which costs 96% of a 500 account in one round trip and ends
+    at zero on day one -- see broker.py. The committed book in holding.py
+    replaced it. Kept only so the record already written can still be read.
 
     Called once a run is done. Deliberately after scoring and deliberately
     one-way: `paper` is never imported by anything that builds a feature, and
@@ -832,6 +619,16 @@ def promotion() -> dict:
     except Exception as exc:                            # noqa: BLE001
         logger.warning("Could not read the promotion rule: %s", exc)
         return {"promote": None, "why": str(exc)}
+
+
+def write_briefing(watchlist: Sequence[str] | None = None) -> dict | None:
+    """Say what changed today, from the stores. Once a day, and often nothing."""
+    try:
+        symbols = universe_mod.resolve(watchlist) if watchlist else default_watchlist()
+        return briefing_mod.write(symbols)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("Could not write the briefing: %s", exc)
+        return None
 
 
 def guard_book() -> dict:

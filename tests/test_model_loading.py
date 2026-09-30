@@ -1,16 +1,20 @@
-"""Reading a HelloWorldAi bundle without torch, and refusing what it cannot run.
+"""Reading a model bundle without torch, and refusing what it cannot run.
 
 The loader in src/trader/model.py rebuilds the network from the manifest and
 multiplies the matrices itself. That is only safe if it reads the format the
-producer actually writes, so these build a bundle with HelloWorldAi's own
-packing code and load it back.
+producer actually writes -- so these build a bundle with the producer's own
+code and load it back.
 
-Using the real producer is the point. A fixture I wrote by hand would encode my
-belief about the format, and would keep passing after the format changed --
-which is the failure this is meant to catch.
+There used to be a second producer behind a network, and this file checked the
+format against it. It is gone, and `trainer.pack_bundle` is now the only thing
+that writes a bundle. That makes the round trip here tighter rather than looser:
+pack and load are the same repository and must agree exactly, including the
+softmax conversion in the last layer, which is wrong by a factor of two in the
+obvious implementation and does not raise when it is.
 
-If HelloWorldAi is not checked out beside this project the format checks skip,
-and the arithmetic checks still run.
+A fixture written by hand would encode my belief about the format and would
+keep passing after the format changed, so the format checks use the packer and
+only the arithmetic checks build bytes directly.
 """
 
 import io
@@ -25,61 +29,34 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from trader import model as model_mod          # noqa: E402
-
-HELLOWORLD_SRC = os.path.abspath(os.path.join(
-    os.path.dirname(__file__), "..", "..", "HelloWorldAi", "src"))
-
-
-def helloworld_packers():
-    """HelloWorldAi's own manifest and bundle builders, if they are reachable."""
-    if not os.path.isdir(HELLOWORLD_SRC):
-        pytest.skip(f"HelloWorldAi not found at {HELLOWORLD_SRC}")
-    if HELLOWORLD_SRC not in sys.path:
-        sys.path.insert(0, HELLOWORLD_SRC)
-    try:
-        from backend.service.modelBundle import build_bundle
-        from backend.service.modelManifest import build_manifest
-    except Exception as exc:                            # noqa: BLE001
-        pytest.skip(f"HelloWorldAi's packers are not importable: {exc}")
-    return build_manifest, build_bundle
-
-
-def a_trained_state_dict(input_dim=9, hidden=8, output=2, seed=3):
-    """Weights shaped like the ones training produces, in torch's convention.
-
-    Linear weights are (out_features, in_features), which is the transpose of
-    what the multiply wants. Getting that backwards produces a shape error on a
-    square layer and silently wrong numbers on a rectangular one, so the
-    fixture is deliberately not square.
-    """
-    rng = np.random.default_rng(seed)
-    return {
-        "net.0.weight": rng.normal(0, 0.3, (hidden, input_dim)).astype(np.float32),
-        "net.0.bias": rng.normal(0, 0.1, hidden).astype(np.float32),
-        "net.2.weight": rng.normal(0, 0.3, (output, hidden)).astype(np.float32),
-        "net.2.bias": rng.normal(0, 0.1, output).astype(np.float32),
-    }
-
+from trader import trainer as trainer_mod      # noqa: E402
 
 # --- the real format -------------------------------------------------------
 
+def a_trained_network(input_dim=9, hidden=8, seed=3):
+    """Layers in the shape `baseline.fit_mlp` returns them: (in, out), one logit.
+
+    Deliberately not square, so a transpose mistake is a shape error rather
+    than silently wrong numbers.
+    """
+    rng = np.random.default_rng(seed)
+    return [
+        (rng.normal(0, 0.3, (input_dim, hidden)).astype(np.float32),
+         rng.normal(0, 0.1, hidden).astype(np.float32)),
+        (rng.normal(0, 0.3, (hidden, 1)).astype(np.float32),
+         rng.normal(0, 0.1, 1).astype(np.float32)),
+    ]
+
+
 def test_a_real_bundle_loads_and_predicts():
-    build_manifest, build_bundle = helloworld_packers()
-
-    spec = {"architecture": "mlp", "input_dim": 9, "hidden_dim": 8,
-            "depth": 1, "output_dim": 2}
-    state = a_trained_state_dict()
-
-    manifest = build_manifest(spec, state, model_name="trader-test",
-                              class_names=["down", "up"],
-                              feature_names=[f"f{i}" for i in range(9)])
-    blob = build_bundle(state, manifest, None)
+    names = [f"f{i}" for i in range(9)]
+    blob = trainer_mod.pack_bundle(a_trained_network(), names)
 
     loaded = model_mod.load_bundle(blob)
 
     assert loaded.input_dim == 9
     assert loaded.class_names == ["down", "up"]
-    assert loaded.feature_names == [f"f{i}" for i in range(9)]
+    assert loaded.feature_names == names
 
     probabilities = loaded.probabilities(np.zeros((4, 9), dtype=np.float32))
     assert probabilities.shape == (4, 2)
@@ -89,12 +66,8 @@ def test_a_real_bundle_loads_and_predicts():
 
 def test_the_bundle_still_holds_what_the_loader_looks_for():
     """A rename on the producer side should fail here, not in production."""
-    build_manifest, build_bundle = helloworld_packers()
-
-    spec = {"architecture": "mlp", "input_dim": 9, "hidden_dim": 8,
-            "depth": 1, "output_dim": 2}
-    state = a_trained_state_dict()
-    blob = build_bundle(state, build_manifest(spec, state), None)
+    blob = trainer_mod.pack_bundle(a_trained_network(),
+                                   [f"f{i}" for i in range(9)])
 
     names = set(zipfile.ZipFile(io.BytesIO(blob)).namelist())
     assert model_mod.WEIGHTS_NAME in names

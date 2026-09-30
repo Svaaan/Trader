@@ -515,7 +515,7 @@ def combine(splits: Sequence[Split],
     # Sorted by date, not stacked by symbol.
     #
     # Training does not care -- batches are drawn at random, so the order of the
-    # rows makes no difference to what is learned. The coordinator's holdout
+    # rows makes no difference to what is learned. The trainer's own holdout
     # does care. Telling it the rows are in time order and then handing it all
     # of Apple followed by all of SAP means "hold back the last 20%" holds back
     # the tail of the last company rather than the most recent period, which is
@@ -587,23 +587,6 @@ def test_matrix(splits: Sequence[Split], scaler: Scaler) -> TestSet:
         symbols=symbols[order],
         horizon=horizons.pop(),
     )
-
-
-def pack_for_helloworld(x: np.ndarray, y: np.ndarray) -> bytes:
-    """The .npz shape HelloWorldAi's artifact loader accepts.
-
-    Its loader refuses anything it would have to unpickle, which rules out a
-    CSV or an object array -- the arrays go in as plain numeric types under the
-    names it expects.
-    """
-    if x.shape[0] != y.shape[0]:
-        raise ValueError(f"{x.shape[0]} feature rows against {y.shape[0]} labels")
-    if x.shape[0] == 0:
-        raise ValueError("refusing to send an empty dataset")
-
-    buffer = io.BytesIO()
-    np.savez(buffer, x=x.astype(np.float32), y=y.astype(np.int64))
-    return buffer.getvalue()
 
 
 def describe(splits: Sequence[Split], scaler: Scaler, spec: Spec,

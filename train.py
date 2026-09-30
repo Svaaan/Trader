@@ -1,22 +1,17 @@
-"""Train a model, here or on HelloWorldAi or both.
+"""Train a model and grade it.
 
-    python train.py                       # both: train here and submit, then compare
-    python train.py --backend local       # here only, ~30s, no network
-    python train.py --backend helloworld  # submit only, the original path
-    python train.py --universe core       # ten symbols, for iterating
-    python train.py --target absolute     # the other target
-    python train.py --no-controls         # skip the baselines and walk-forward
+    python train.py                     # the wide universe, about a minute
+    python train.py --universe core     # ten symbols, for iterating
+    python train.py --target absolute   # the other target
+    python train.py --no-controls       # skip the baselines and walk-forward
 
-`--backend both` is the one worth running. The same rows and the same
-hyperparameters go to both trainers, so any gap between their scores is a fact
-about the round trip rather than about the data. The local half finishes in
-about half a minute and is scored immediately, so there is something to read
-while the remote job queues; when it lands, `watch.py` or the UI picks it up and
-the comparison appears.
+Everything happens here and now: fetch prices, build features, cut the panel
+once, train, score on rows the model never saw, run the controls, and print
+what the gate makes of it. The run is finished when the command returns.
 
-Training here needs no GPU and no network. The model is 7,233 parameters and the
-full step count is about twenty-six seconds of numpy -- a 3070 is idle at that
-size, which is worth knowing before wiring one up.
+There used to be a second trainer behind a network. It is gone: the network is
+7,233 parameters, a logistic regression matches it, and the round trip was
+paying for a difference that was not there.
 """
 
 import argparse
@@ -30,7 +25,7 @@ from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "env", ".env"))
 
-from trader import labels, pipeline, trainer, universe      # noqa: E402
+from trader import labels, pipeline, universe               # noqa: E402
 
 logger = logging.getLogger("train")
 
@@ -39,7 +34,7 @@ def report(run) -> None:
     """What happened, in the order it is worth reading."""
     data = run.dataset or {}
 
-    print(f"\nRun {run.run_id}  [{run.backend}]  status: {run.status}")
+    print(f"\nRun {run.run_id}  status: {run.status}")
     if run.error:
         print(f"  error: {run.error}")
         return
@@ -56,21 +51,19 @@ def report(run) -> None:
     if controls.get("majority"):
         print("\n  what it had to beat:")
         for key, label in (("majority", "majority"), ("logistic", "logistic"),
-                           ("local_mlp", "local MLP")):
+                           ("local_mlp", "a second MLP")):
             result = controls.get(key)
             if result:
-                print(f"    {label:<12} accuracy {result['accuracy']:.4f}  "
+                print(f"    {label:<13} accuracy {result['accuracy']:.4f}  "
                       f"edge {result['edge']:+.4f}")
         floor = controls.get("noise_floor") or {}
         if floor.get("spread") is not None:
-            print(f"    seed spread  {floor['spread']:.4f}  "
+            print(f"    seed spread   {floor['spread']:.4f}  "
                   f"(an edge below this is a seed, not a signal)")
 
-    for label, evaluation in (("local", run.local_evaluation),
-                              ("helloworld", run.evaluation)):
-        if not evaluation or (label == "helloworld" and run.primary != "helloworld"):
-            continue
-        print(f"\n  {label} model:")
+    evaluation = run.evaluation or {}
+    if evaluation:
+        print(f"\n  scored on days it never saw:")
         print(f"    accuracy {evaluation['accuracy']:.4f} against "
               f"{evaluation['baseline_accuracy']:.4f}  "
               f"edge {evaluation['edge']:+.4f}")
@@ -90,25 +83,15 @@ def report(run) -> None:
             print(f"    execution gap {evaluation['execution_gap']:+.2f} sharpe,"
                   f" lost to the overnight move")
 
-    if run.comparison:
-        print(f"\n  the two backends: {run.comparison['reading']}")
-
     if run.trust:
         state = "OPEN" if run.trust.get("trusted") else "SHUT"
         print(f"\n  gate {state}: {run.trust.get('reason')}")
-
-    if run.status == "training":
-        print("\n  The remote job is queued. `python watch.py` collects it, "
-              "or leave the UI open.")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--backend", default=trainer.BOTH,
-                        choices=list(trainer.BACKENDS),
-                        help="where to train (default: both)")
     parser.add_argument("--universe", default=None,
                         help=f"one of {sorted(universe.TIERS)} "
                              f"(default: $TRADER_UNIVERSE or wide)")
@@ -130,7 +113,6 @@ def main() -> int:
 
     run = pipeline.start(
         args.universe,
-        backend=args.backend,
         target=args.target,
         horizon=args.horizon,
         steps=args.steps,
