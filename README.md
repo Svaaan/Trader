@@ -221,6 +221,29 @@ So the scheduler's job is no longer training. It is **accumulating the two
 things that cannot be bought later**: the forward paper record, and the news
 archive.
 
+## Reading the archive before it is a feature
+
+The block needs a year. That is not a reason to leave two thousand stored items
+unread, so `attention.py` reads them under one rule: **it says what it measured,
+and it refuses the comparison when the archive cannot support it.**
+
+Two filters do most of the work, and both were written after looking at what the
+first version produced:
+
+- **A shared root ticker is one company.** The first run suggested four names,
+  every one of them already tracked under another listing -- GSK against GSK.L,
+  FER against FER.MC.
+- **A name seen in only one company's coverage is probably that company.**
+  Cross-listings that do not share a root, like MRSH beside MMC, appear in
+  exactly one firm's stories. Turning up in two or more separate names' coverage
+  is what promotes a mention to a suggestion.
+
+And one refusal. Counted by capture time the whole archive happened on three
+days, because that is when the collector ran -- so every symbol it reaches for
+the first time reads as a tenfold spike, ten items being the provider's page
+size. **Features count captures; readings count publications**, and nothing that
+reads publications can reach the model.
+
 ## The news archive
 
 The block is inert until it has a year of history, and `news.readiness`
@@ -265,6 +288,13 @@ next open, drawn from the run's own stored series. They start together at 1.0
 and end 9 points apart. The others put the edge beside its own noise floor,
 show accuracy climbing with confidence while the tradeable return does not, and
 give every walk-forward window both ways.
+
+**News** reads the archive that the model is not allowed to touch for another
+year. It groups coverage by market, joins the loudest names to what their price
+did, and pulls the explicit company mentions out of the headlines -- roughly a
+quarter of them carry one, because the wires write "(LSE:AAL)". Mentions that
+resolve to something untracked become suggestions; exchanges that resolve to a
+market with no tracked names at all become a larger one.
 
 **Record** is what cannot be re-run: the forward book, the contest, and all 32
 trials in the order they were asked, with the committed one marked.
@@ -313,6 +343,7 @@ holding.py    the books: each a forward record, one of them funded
 challenge.py  the challenger loop -- budgeted, deduped, decision rules only
 promote.py    the paired daily comparison, promotion, and the drift guard
 briefing.py   what it noticed today, from the stores, written forward
+attention.py  what the archive is loud about, and what it is missing
 paper.py      the day-trade ledger that came before holding.py -- read only:
    |          nothing writes to it, because 238 names on 500 pays 96% a trip
 auto.py       the scheduler: news, books, contest, briefing
@@ -346,7 +377,7 @@ rather than carried forward, and picked up again when it resumes.
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-317 tests. The look-ahead ones test the property rather than the implementation
+335 tests. The look-ahead ones test the property rather than the implementation
 — features computed on a truncated history must match the full one — and one
 deliberately introduces a centred window to prove the property test can fail.
 
@@ -356,5 +387,8 @@ sigmoid-to-softmax conversion, the executable return, the overlap correction,
 the clustered standard error, the neutral-band leak, the paper ledger that
 stopped growing the day it first paid out, the settlement that filled a
 238-name book from ten of them, the endpoint that went on reading a field after
-the field was deleted, and the fill that debited its commission but not the
-money it spent — which marked a $500 book at $991 the next session.
+the field was deleted, the fill that debited its commission but not the money
+it spent — which marked a $500 book at $991 the next session — and the
+scheduler loop that ended its own thread on the first unexpected exception
+while the page went on reporting that it was running, and the news spike that
+fired for five names because the collector had just met them.

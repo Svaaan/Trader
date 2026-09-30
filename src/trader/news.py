@@ -252,6 +252,42 @@ def build(symbol: str, index: pd.DatetimeIndex) -> pd.DataFrame:
     return out.replace([np.inf, -np.inf], 0.0).fillna(0.0)
 
 
+def published_at(item: dict) -> dt.datetime | None:
+    """When the provider says it was published, for reading only.
+
+    `build` counts by `captured_utc` and must keep doing so: a publication time
+    can be revised, and a feature that reads one is a feature that can be told
+    about a story after the fact. That argument does not apply to anything that
+    cannot reach the model, and for those the capture time is actively wrong --
+    this store was filled by three collector passes, so counted by capture the
+    whole archive happened on three days, and every symbol the collector visits
+    for the first time looks like a ten-fold news spike because ten items is
+    the provider's page size.
+
+    So: features count captures, readings count publications, and the two are
+    separate functions so that nobody has to remember which is which.
+    """
+    raw = item.get("published_utc")
+    if not raw:
+        return None
+    try:
+        moment = dt.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=dt.timezone.utc)
+
+
+def published_spread(symbol: str) -> int:
+    """How many distinct days this symbol's stored items were published over.
+
+    A "three times its own normal" claim needs a normal, and a symbol whose
+    items all landed in one week has no normal yet however many there are.
+    """
+    days = {when.date() for when in
+            (published_at(item) for item in _read(symbol)) if when}
+    return len(days)
+
+
 def recent(symbol: str, limit: int = 8) -> list:
     """The newest stored items, for the reading panel rather than the model."""
     stored = _read(symbol)

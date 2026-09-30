@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Trader — News</title>
+    <link rel="stylesheet" href="/static/trader.css?v={{ v }}">
+</head>
+
+<body>
+    <header class="top">
+        <div class="brand">Trader <span>news</span></div>
+        <nav class="nav">
+            <a href="/">Today</a>
+            <a href="/news" class="is-here">News</a>
+            <a href="/analysis">Evidence</a>
+            <a href="/pnl">Record</a>
+        </nav>
+        <div class="top-actions">
+            <button type="button" class="btn" id="collect">Collect now</button>
+        </div>
+    </header>
+
+    <main>
+        {# Drawn by news.js from /api/attention. Everything on this page is
+           computed from the news store and the price cache; nothing on it can
+           reach a feature, a label or a score, and there is a test that says
+           so. It is reading, not evidence. #}
+        <div id="news">
+            <p class="empty">Loading…</p>
+        </div>
+    </main>
+
+    <script type="importmap">
+    {"imports": {"ui": "/static/ui.js?v={{ v }}"}}
+    </script>
+    <script type="module" src="/static/news.js?v={{ v }}"></script>
+</body>
+
+</html>

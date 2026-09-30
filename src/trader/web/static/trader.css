@@ -498,6 +498,76 @@ tbody tr:hover td { background: var(--panel-2); }
   font-size: 13.5px;
 }
 
+/* --- the archive ---------------------------------------------------------- */
+
+.attn + .attn { margin-top: 1.1rem; padding-top: 1.1rem; border-top: 1px solid var(--line); }
+
+.attn-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.6rem;
+}
+
+.attn-symbol {
+  font-family: var(--mono);
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.attn-market { color: var(--faint); font-size: 12.5px; }
+
+.attn-count {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 12.5px;
+  color: var(--muted);
+}
+
+.attn-move {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* Headlines are scraped text written by strangers. They are rendered as text
+   nodes and never as markup, here and everywhere else in this project. */
+.attn-headline {
+  margin: 0.45rem 0 0;
+  color: var(--muted);
+  font-size: 13.5px;
+  line-height: 1.5;
+}
+
+.sources { list-style: none; margin: 0.9rem 0 0; padding: 0; display: grid; gap: 0.55rem; }
+
+.sources li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  padding-left: 0.85rem;
+  border-left: 2px solid var(--line-mid);
+  font-size: 13.5px;
+}
+
+.sources-meta {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+/* The archive's own lines, keyed to what kind of claim each one is. */
+.ledger li.is-suggestion::before { background: var(--forward); }
+.ledger li.is-market-gap::before { background: var(--forward); }
+.ledger li.is-name::before { background: var(--cool); }
+.ledger li.is-market::before { background: var(--line-strong); }
+.ledger li.is-suggestion-weak::before,
+.ledger li.is-quiet::before { background: var(--line-strong); }
+
 /* --- folds, tags, states -------------------------------------------------- */
 
 .fold {

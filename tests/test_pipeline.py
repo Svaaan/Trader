@@ -520,3 +520,38 @@ def test_the_trial_ledger_is_served_in_the_order_it_was_written(monkeypatch,
     body = TestClient(web_app.app).get("/api/trials").json()
     assert body["total"] == 3
     assert [t["trial"] for t in body["trials"]] == [3, 2, 1]
+
+
+def test_nothing_still_reads_a_field_that_was_removed():
+    """The removal of the remote trainer took four fields off `Run`.
+
+    Two endpoints went on reading them, and so did the scheduler -- where it
+    killed the auto-train thread on the first cycle while the page carried on
+    reporting that the scheduler was running. The structural check above only
+    looked at the web app, which is why the scheduler's copy survived it.
+
+    So this names the removed fields and checks the whole tree. It is a
+    different test from the structural one on purpose: that one catches a
+    mistyped field on `Run` today, this one catches the specific names that
+    were deleted and must never come back by accident.
+    """
+    import dataclasses
+    import pathlib
+
+    gone = {"local_evaluation", "local_verdict", "comparison", "primary",
+            "remote_error", "task_id", "verification", "has_local_model",
+            "wants_remote", "wants_local", "backend"}
+
+    live = {f.name for f in dataclasses.fields(pipeline.Run)}
+    assert not (gone & live), "a supposedly removed field is back on Run"
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    offences = []
+    for path in list(root.glob("*.py")) + list((root / "src").rglob("*.py")):
+        for number, line in enumerate(
+                path.read_text(encoding="utf-8").splitlines(), start=1):
+            for name in gone:
+                if f".{name}" in line or f'"{name}"' in line:
+                    offences.append(f"{path.relative_to(root)}:{number}  {name}")
+
+    assert not offences, "these still reference removed fields:\n" + "\n".join(offences)

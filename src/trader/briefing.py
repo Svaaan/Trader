@@ -53,6 +53,13 @@ NEWS_SPIKE = 3.0
 NEWS_WINDOW_DAYS = 30
 MIN_ITEMS_FOR_SPIKE = 3
 
+# A symbol needs this many distinct publication days on record before "three
+# times its own normal" means anything. Without it every symbol the collector
+# reaches for the first time reads as a ten-fold spike, because ten items is
+# the provider's page size and they all arrive at once -- which is exactly what
+# this line was doing for five names before the guard existed.
+MIN_SPREAD_DAYS = 10
+
 # Nothing below this many sessions of shared record is worth reporting as a
 # standing in the contest; it would read as a league table of noise.
 MIN_CONTEST_SESSIONS = 20
@@ -98,13 +105,16 @@ def news_spikes(symbols, *, now: dt.datetime | None = None) -> list:
         if len(items) < MIN_ITEMS_FOR_SPIKE:
             continue
 
-        seen = []
-        for item in items:
-            try:
-                seen.append(dt.datetime.fromisoformat(
-                    item["captured_utc"].replace("Z", "+00:00")))
-            except (KeyError, TypeError, ValueError):
-                continue
+        # Publication time, not capture time. This store was filled by a handful
+        # of collector passes, so counted by capture the entire archive happened
+        # on three days and every first visit is a ten-fold spike. A spike is a
+        # claim about when news happened, and nothing here reaches the model, so
+        # the provider's timestamp is both the honest field and a safe one.
+        if news_mod.published_spread(symbol) < MIN_SPREAD_DAYS:
+            continue
+
+        seen = [when for when in
+                (news_mod.published_at(item) for item in items) if when]
 
         recent = [when for when in seen if when >= window]
         if len(recent) < MIN_ITEMS_FOR_SPIKE:

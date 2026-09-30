@@ -43,6 +43,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from starlette.requests import Request
 
+from .. import attention as attention_mod
 from .. import auto as auto_mod
 from .. import context as context_mod
 from .. import briefing as briefing_mod
@@ -278,6 +279,40 @@ def api_decision():
         "signals": reasons,
         "briefing": briefing_mod.read(limit=1),
     }
+
+
+@app.get("/news", response_class=HTMLResponse)
+def news_page(request: Request):
+    """What the archive is loud about, and what it thinks is missing.
+
+    Its own page because it answers a question the model is structurally
+    unable to ask. The news block refuses to become a feature until it has a
+    year of history, so for a year the archive is an input to nothing -- this
+    is the page that reads it anyway, and says plainly that it is reading.
+    """
+    return templates.TemplateResponse("news.html",
+                                      {"request": request, "v": _static_version()})
+
+
+@app.get("/api/attention")
+def api_attention():
+    """The archive's own opinion, with the evidence under every line."""
+    run = _newest_done()
+    symbols = (run.watchlist if run else None) or pipeline.default_watchlist()
+
+    try:
+        # The price join is only interesting for the handful of names that are
+        # actually loud, so the shortlist is drawn first and prices fetched for
+        # those -- rather than loading a few hundred frames to use eight.
+        shortlist = attention_mod.loudest(symbols)
+        frames = {}
+        if shortlist:
+            frames = prices_mod.load_many(
+                [row["symbol"] for row in shortlist], period="3mo")
+        return attention_mod.opinion(symbols, frames)
+    except Exception as exc:                            # noqa: BLE001
+        logger.exception("Could not read the archive")
+        return JSONResponse({"error": str(exc)}, status_code=500)
 
 
 @app.get("/api/trials")

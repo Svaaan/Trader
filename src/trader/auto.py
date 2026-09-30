@@ -276,7 +276,7 @@ def cycle(*, watchlist=None, trained_for: str | None = None,
     out["trained"] = run.run_id
     out["status"] = run.status
     out["trained_for"] = session
-    evaluation = run.local_evaluation or run.evaluation or {}
+    evaluation = run.evaluation or {}
     if evaluation:
         out["edge"] = evaluation.get("edge")
         out["executable_tstat"] = evaluation.get("executable_tstat")
@@ -310,8 +310,16 @@ def _wait(seconds: float) -> bool:
 
 def _loop(*, interval_minutes: float, watchlist) -> None:
     while not _asked_to_stop():
-        done = cycle(watchlist=watchlist,
-                     trained_for=_read().get("trained_for"))
+        try:
+            done = cycle(watchlist=watchlist,
+                         trained_for=_read().get("trained_for"))
+        except Exception as exc:                        # noqa: BLE001
+            # One bad cycle is not a reason to stop scheduling. The loop used
+            # to let anything unexpected escape, which ended the thread while
+            # the page went on saying the scheduler was running -- so a bug
+            # here looked exactly like a quiet market.
+            logger.exception("Cycle failed; the scheduler continues")
+            done = {"at": _now(), "error": f"cycle: {exc}", "trained": None}
 
         with _state_lock:
             current = _read()

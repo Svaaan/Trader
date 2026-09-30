@@ -336,3 +336,38 @@ def test_the_cycle_asks_the_challenger_loop_and_reads_the_rule(scheduler,
 
     assert out["challenger"]["asked"] == "top 2, every 40"
     assert out["promotion"] == {"promote": None, "why": "not enough decisions"}
+
+
+# --- one bad cycle is not a reason to stop scheduling -------------------------
+
+def test_a_cycle_that_raises_does_not_kill_the_scheduler(scheduler, monkeypatch):
+    """The loop used to let anything unexpected escape and end the thread.
+
+    It happened for real: the cycle read a field that had been deleted with the
+    remote trainer, the auto-train thread died on its first pass, and the page
+    went on reporting that the scheduler was running. A bug looked exactly like
+    a quiet market, which is the worst way for this to fail.
+    """
+    blown = {"count": 0}
+    real = auto.cycle
+
+    def explode(**kwargs):
+        blown["count"] += 1
+        if blown["count"] <= 2:
+            raise AttributeError("'Run' object has no attribute 'whatever'")
+        return real(**kwargs)
+
+    monkeypatch.setattr(auto, "cycle", explode)
+
+    auto.start(interval_minutes=0.001)
+    assert wait_until(lambda: blown["count"] >= 3, timeout=20.0), \
+        "the loop stopped at the first exception"
+
+    state = auto.state()
+    assert auto.running(), "the scheduler should still be up"
+    assert any("whatever" in (entry.get("error") or "")
+               for entry in state.get("history", [])), \
+        "the failure was swallowed instead of recorded"
+
+    auto.stop(wait=5)
+    assert not auto._thread.is_alive()
