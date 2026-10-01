@@ -34,8 +34,11 @@ from . import explain as explain_mod
 from . import features as features_mod
 from . import labels as labels_mod
 from . import model as model_mod
+from . import names as names_mod
 from . import news as news_mod
 from . import briefing as briefing_mod
+from . import attention as attention_mod
+from . import chat as chat_mod
 from . import challenge as challenge_mod
 from . import holding as holding_mod
 from . import promote as promote_mod
@@ -628,6 +631,51 @@ def write_briefing(watchlist: Sequence[str] | None = None) -> dict | None:
         return briefing_mod.write(symbols)
     except Exception as exc:                            # noqa: BLE001
         logger.warning("Could not write the briefing: %s", exc)
+        return None
+
+
+def learn_names(watchlist: Sequence[str] | None = None) -> dict:
+    """Ask what a few more tickers are called. Bounded, and runs before speak.
+
+    Before this, the names the page printed came out of a language model's
+    memory, which is a fine source right up until the ticker is obscure. A
+    name beside its ticker in the material is something a reader can check.
+    """
+    try:
+        symbols = universe_mod.resolve(watchlist) if watchlist else default_watchlist()
+        # The names that actually appear on the page come first: the universe
+        # is large and mostly silent, while a suggestion is a name somebody is
+        # being invited to go and look at.
+        wanted = list(names_mod.missing(symbols))
+        try:
+            opinion = attention_mod.opinion(symbols)
+            front = [row["symbol"] for row in opinion.get("loudest") or []]
+            front += [row["symbol"] for row in opinion.get("suggestions") or []]
+            for gap in opinion.get("unwatched_markets") or []:
+                front += gap.get("names") or []
+            wanted = [s for s in front if s in set(names_mod.missing(front))] + wanted
+        except Exception:                               # noqa: BLE001
+            pass
+        return names_mod.learn(dict.fromkeys(wanted))
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("Could not learn names: %s", exc)
+        return {"asked": 0, "learned": 0}
+
+
+def speak(watchlist: Sequence[str] | None = None) -> dict | None:
+    """Let it say something, if the archive moved since it last spoke.
+
+    Runs every cycle rather than once a day, because the point of this one is
+    that somebody busy can read back what happened while they were. It is
+    silent unless the findings changed, and silent entirely when no model is
+    answering -- see chat.py for why both of those matter more than the
+    feature does.
+    """
+    try:
+        symbols = universe_mod.resolve(watchlist) if watchlist else default_watchlist()
+        return chat_mod.on_cycle(symbols)
+    except Exception as exc:                            # noqa: BLE001
+        logger.warning("Could not write a note: %s", exc)
         return None
 
 

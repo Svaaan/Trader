@@ -241,6 +241,16 @@ def cycle(*, watchlist=None, trained_for: str | None = None,
     out["guard"] = pipeline_mod.guard_book()
     note = pipeline_mod.write_briefing(watchlist)
     out["briefing"] = len(note["lines"]) if note else 0
+
+    # A few more company names, so that anything written below can read them
+    # off the material rather than recall them. Bounded per cycle.
+    out["names"] = pipeline_mod.learn_names(watchlist)
+
+    # And the running commentary, which differs from the briefing in that it
+    # is allowed to speak several times a day -- but only when the archive has
+    # actually moved. Silent with no model running, silent on a quiet cycle.
+    said = pipeline_mod.speak(watchlist)
+    out["said"] = said["text"] if said else None
     out["challenger"] = pipeline_mod.challenge_step(watchlist)
     verdict = pipeline_mod.promotion()
     out["promotion"] = {"promote": verdict.get("promote"),

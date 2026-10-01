@@ -46,8 +46,35 @@ function reading(body) {
   });
   panel.appendChild(list);
   panel.appendChild(el("p", "note", body.caveat));
+
+  // Filled in by loadProse() once a model answers, if one does. The slot
+  // exists either way so the measured page never reflows around it.
+  const slot = el("div", "prose-slot");
+  slot.id = "prose";
+  panel.appendChild(slot);
+
   section.appendChild(panel);
   return section;
+}
+
+// The reading arrives after the findings, because it is about them and because
+// a local model on a busy card takes a few seconds. Nothing on the page waits
+// for it, and nothing on the page is missing if it never comes.
+async function loadProse() {
+  const slot = document.getElementById("prose");
+  if (!slot) return;
+
+  const body = await getJSON("/api/attention/prose");
+  if (!body || body.error || !body.generated) return;
+
+  slot.replaceChildren();
+  slot.appendChild(el("p", "prose-text", body.text));
+
+  const where = body.backend || {};
+  slot.appendChild(el("p", "prose-by",
+    `Read back by ${where.model || "a model"}`
+    + (where.kind === "local" ? " running on this machine" : "")
+    + `. ${body.note}`));
 }
 
 // --- where the attention is ---------------------------------------------------
@@ -289,6 +316,8 @@ async function refresh() {
     marketSection(body),
     storeSection(body),
   ].filter(Boolean));
+
+  loadProse();
 }
 
 document.getElementById("collect")?.addEventListener("click", async (event) => {

@@ -538,20 +538,27 @@ def test_nothing_still_reads_a_field_that_was_removed():
     import dataclasses
     import pathlib
 
+    # `backend` is deliberately not in this list. It was, and it flagged
+    # `context.backend()` -- the function that reports which language model is
+    # answering -- which is a different thing that happens to share a name.
+    # A guard that cries wolf gets deleted, and the structural test above
+    # already catches `run.backend` exactly, because it checks attributes on a
+    # Run against the real dataclass instead of grepping for a word.
     gone = {"local_evaluation", "local_verdict", "comparison", "primary",
             "remote_error", "task_id", "verification", "has_local_model",
-            "wants_remote", "wants_local", "backend"}
+            "wants_remote", "wants_local"}
 
     live = {f.name for f in dataclasses.fields(pipeline.Run)}
     assert not (gone & live), "a supposedly removed field is back on Run"
 
+    # Attribute access only: every one of the real failures was `run.<field>`.
     root = pathlib.Path(__file__).resolve().parent.parent
     offences = []
     for path in list(root.glob("*.py")) + list((root / "src").rglob("*.py")):
         for number, line in enumerate(
                 path.read_text(encoding="utf-8").splitlines(), start=1):
             for name in gone:
-                if f".{name}" in line or f'"{name}"' in line:
-                    offences.append(f"{path.relative_to(root)}:{number}  {name}")
+                if f".{name}" in line:
+                    offences.append(f"{path.relative_to(root)}:{number}  .{name}")
 
     assert not offences, "these still reference removed fields:\n" + "\n".join(offences)

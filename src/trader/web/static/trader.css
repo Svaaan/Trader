@@ -568,6 +568,85 @@ tbody tr:hover td { background: var(--panel-2); }
 .ledger li.is-suggestion-weak::before,
 .ledger li.is-quiet::before { background: var(--line-strong); }
 
+/* The reading, set apart from the findings it describes -- it is the one thing
+   on the page that was written rather than measured, and it should look it. */
+.prose-slot:empty { display: none; }
+
+.prose-slot {
+  margin-top: 1.25rem;
+  padding: 1rem 1.15rem;
+  border-left: 2px solid var(--cool);
+  border-radius: 0 var(--r-sm) var(--r-sm) 0;
+  background: var(--cool-dim);
+}
+
+.prose-text { margin: 0; font-size: 14.5px; line-height: 1.7; }
+
+.prose-by {
+  margin: 0.7rem 0 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--faint);
+}
+
+/* --- the desk ------------------------------------------------------------- */
+
+.ask { display: flex; gap: 0.6rem; }
+
+.ask-field {
+  flex: 1;
+  min-width: 0;
+  padding: 0.7rem 0.9rem;
+  border: 1px solid var(--line-mid);
+  border-radius: var(--r-sm);
+  background: var(--panel);
+  color: var(--text);
+  font: 14px/1.5 var(--sans);
+}
+
+.ask-field::placeholder { color: var(--faint); }
+.ask-field:focus { border-color: var(--cool); outline: none; }
+.ask-field:disabled { opacity: 0.5; }
+
+.transcript { display: grid; gap: 1px; background: var(--line);
+              border: 1px solid var(--line); border-radius: var(--r);
+              overflow: hidden; }
+
+.said { padding: 1.1rem 1.25rem; background: var(--panel); }
+
+/* A question reads as the reader's own voice, so it is set apart from the
+   lines the machine wrote. */
+.said.is-question { background: var(--bg-lift); }
+.said.is-note { border-left: 2px solid var(--forward); }
+.said.is-answer { border-left: 2px solid var(--cool); }
+
+.said-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-bottom: 0.5rem;
+}
+
+.said-when, .said-model {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--faint);
+}
+
+.said-model { margin-left: auto; }
+.said-text { margin: 0; font-size: 14.5px; line-height: 1.65; }
+.said.is-question .said-text { color: var(--muted); font-style: italic; }
+
+.said-why {
+  margin: 0.55rem 0 0;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--faint);
+}
+
 /* --- folds, tags, states -------------------------------------------------- */
 
 .fold {

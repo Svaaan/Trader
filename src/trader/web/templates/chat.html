@@ -4,27 +4,27 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Trader — Evidence</title>
+    <title>Trader — Desk</title>
     <link rel="stylesheet" href="/static/trader.css?v={{ v }}">
 </head>
 
 <body>
     <header class="top">
-        <div class="brand">Trader <span>evidence</span></div>
+        <div class="brand">Trader <span>desk</span></div>
         <nav class="nav">
             <a href="/">Today</a>
             <a href="/news">News</a>
-            <a href="/chat">Desk</a>
-            <a href="/analysis" class="is-here">Evidence</a>
+            <a href="/chat" class="is-here">Desk</a>
+            <a href="/analysis">Evidence</a>
             <a href="/pnl">Record</a>
         </nav>
     </header>
 
     <main>
-        {# Drawn by evidence.js. The charts read the run's own stored series
-           rather than re-deriving anything from a mean, so a figure quoted in
-           a caption and the line above it come from the same numbers. #}
-        <div id="evidence">
+        {# Drawn by chat.js. The transcript is append-only on disk, so what it
+           said last week is still here and can be checked against what the
+           stores said at the time. #}
+        <div id="chat">
             <p class="empty">Loading…</p>
         </div>
     </main>
@@ -32,7 +32,7 @@
     <script type="importmap">
     {"imports": {"ui": "/static/ui.js?v={{ v }}"}}
     </script>
-    <script type="module" src="/static/evidence.js?v={{ v }}"></script>
+    <script type="module" src="/static/chat.js?v={{ v }}"></script>
 </body>
 
 </html>

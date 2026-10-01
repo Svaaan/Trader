@@ -315,7 +315,12 @@ def mentions(symbols, *, now: dt.datetime | None = None) -> dict:
                 suffix = EXCHANGES.get(code)
                 if suffix is None:
                     continue
-                mapped = f"{ticker}{suffix}"
+                # Share classes: the wires write "TECK.B", the price provider
+                # spells it "TECK-B", and the universe already follows the
+                # second convention (VOLV-B.ST, NOVO-B.CO). Left as written,
+                # the suggestion resolved to TECK.B.TO, which is not a symbol
+                # anybody can look up -- a suggestion nobody can act on.
+                mapped = f"{ticker.replace('.', '-')}{suffix}"
                 entry = found.setdefault(mapped, {
                     "symbol": mapped, "exchange": code,
                     "market": MARKETS.get(suffix, suffix.lstrip(".")),

@@ -47,6 +47,7 @@ from .. import attention as attention_mod
 from .. import auto as auto_mod
 from .. import context as context_mod
 from .. import briefing as briefing_mod
+from .. import chat as chat_mod
 from .. import challenge as challenge_mod
 from .. import holding as holding_mod
 from .. import promote as promote_mod
@@ -312,6 +313,67 @@ def api_attention():
         return attention_mod.opinion(symbols, frames)
     except Exception as exc:                            # noqa: BLE001
         logger.exception("Could not read the archive")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/chat", response_class=HTMLResponse)
+def chat_page(request: Request):
+    """The transcript: what it said unprompted, and what it was asked."""
+    return templates.TemplateResponse("chat.html",
+                                      {"request": request, "v": _static_version()})
+
+
+@app.get("/api/chat")
+def api_chat(limit: int = 50):
+    """The transcript, newest first, plus whether anything can speak."""
+    return {"feed": chat_mod.feed(limit=limit),
+            "backend": context_mod.backend()}
+
+
+class Question(BaseModel):
+    question: str
+    symbol: str | None = None
+
+
+@app.post("/api/chat")
+def api_chat_ask(asked: Question):
+    """Ask it something. Recorded either way, answered if a model is running."""
+    try:
+        return chat_mod.ask(asked.question, symbol=asked.symbol,
+                            run=_newest_done())
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:                            # noqa: BLE001
+        logger.exception("Could not answer")
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+@app.get("/api/attention/prose")
+def api_attention_prose():
+    """One paragraph about the archive, written by whichever model answers.
+
+    The findings are recomputed here rather than accepted from the caller.
+    Taking them over the wire would mean the browser chooses what goes into
+    the prompt, and a page that can be asked to put arbitrary text in front of
+    a model is a page with a prompt-injection hole in it.
+
+    Served separately from /api/attention so the measured page renders
+    immediately and the reading arrives when it arrives -- a local model on a
+    busy card can take a few seconds, and none of the substance waits on it.
+    """
+    run = _newest_done()
+    symbols = (run.watchlist if run else None) or pipeline.default_watchlist()
+
+    try:
+        shortlist = attention_mod.loudest(symbols)
+        frames = {}
+        if shortlist:
+            frames = prices_mod.load_many(
+                [row["symbol"] for row in shortlist], period="3mo")
+        return context_mod.read_archive(
+            attention_mod.opinion(symbols, frames))
+    except Exception as exc:                            # noqa: BLE001
+        logger.exception("Could not write the archive reading")
         return JSONResponse({"error": str(exc)}, status_code=500)
 
 

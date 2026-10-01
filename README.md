@@ -244,6 +244,48 @@ the first time reads as a tenfold spike, ten items being the provider's page
 size. **Features count captures; readings count publications**, and nothing that
 reads publications can reach the model.
 
+## The model that reads it
+
+The reading layer takes two backends, tried in order: **a model running on
+this machine**, then a hosted one. Neither is required -- with no local server
+and no API key the pages stay measured, which is the substance anyway.
+
+```bash
+ollama serve                          # anything 7-9B at Q4 fits an 8GB card
+ollama pull qwen2.5:7b-instruct
+```
+
+Local first because it is free, private, and well inside what an 8B model does
+reliably: every fact is computed first and handed over in the prompt, so its
+whole job is to restate measured findings in a paragraph. It is never given
+the raw store to summarise, temperature is 0.2, and it is asked to quote the
+number beside each claim so a reader can check it against the figures above.
+
+Override with `TRADER_LLM_LOCAL` (default `http://127.0.0.1:11434`) and
+`TRADER_LLM_LOCAL_MODEL`.
+
+## The desk
+
+`/chat` is a transcript, not a chat session. Two kinds of line go into one
+append-only file in the order they happened: what it said **unprompted**, when
+a scheduler cycle found the archive had moved, and what it said **because you
+asked**. Nothing is edited, so what it believed last Tuesday can be held
+against what the stores held at the time.
+
+It is silent when nothing changed, and silent entirely when no model is
+running. A feed that speaks every cycle teaches you to stop reading it, so the
+archive merely gaining items is context rather than news.
+
+**The arithmetic is not the model's job.** `chat.changed` diffs two snapshots
+and hands over finished sentences -- "VOLV-B.ST: 3 articles now, down from 6 at
+the last line" -- and the model is told to restate them and never to recompute.
+
+That function exists because a 7B asked to compare two numbers it had read in
+different places wrote *"1526 articles, up from 1527"*: a fall reported as a
+rise. A feed whose whole job is to say what changed cannot be wrong about the
+direction of a change, so the comparison happens in code that has tests on it
+and the model is left with the writing.
+
 ## The news archive
 
 The block is inert until it has a year of history, and `news.readiness`
@@ -377,7 +419,7 @@ rather than carried forward, and picked up again when it resumes.
 .venv/Scripts/python.exe -m pytest tests/ -q
 ```
 
-335 tests. The look-ahead ones test the property rather than the implementation
+364 tests. The look-ahead ones test the property rather than the implementation
 — features computed on a truncated history must match the full one — and one
 deliberately introduces a centred window to prove the property test can fail.
 
